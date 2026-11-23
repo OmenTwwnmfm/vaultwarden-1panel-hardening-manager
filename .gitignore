@@ -1,0 +1,19 @@
+# 本地配置与秘密
+*.conf
+!scripts/*.conf.example
+.env
+
+# 运行产物
+snapshots/
+reports/
+*.log
+report-*.json
+plan-*.json
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 本地路线图，不上传
+TODO.md

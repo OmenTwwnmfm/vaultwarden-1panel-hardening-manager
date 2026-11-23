@@ -1,0 +1,8 @@
+/var/log/vaultwarden-hardening.log {
+    weekly
+    rotate 8
+    compress
+    missingok
+    notifempty
+    create 600 root root
+}

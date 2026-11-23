@@ -1,0 +1,21 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with: { fetch-depth: 0 }
+      - name: shellcheck
+        run: shellcheck -x run.sh scripts/*.sh scripts/checks/*.sh tests/*.sh
+      - name: shfmt
+        run: |
+          curl -fsSL -o shfmt https://github.com/mvdan/sh/releases/download/v3.8.0/shfmt_v3.8.0_linux_amd64 && chmod +x shfmt
+          ./shfmt -d -i 2 -ci run.sh scripts tests || true
+      - name: tests
+        run: for t in tests/test-*.sh; do echo "== $t"; bash "$t"; done && python3 tests/test-report-schema.py
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+      - name: release policy
+        run: bash tests/test-release-policy.sh

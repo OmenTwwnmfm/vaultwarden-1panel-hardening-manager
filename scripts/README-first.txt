@@ -1,0 +1,3 @@
+本目录脚本由 vhm 调用，请勿直接以 root 执行单个脚本。
+入口：sudo bash ./run.sh 或 sudo vhm
+后台副本：/usr/local/lib/vaultwarden-hardening/scripts（由 [22] 同步）

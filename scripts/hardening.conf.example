@@ -1,0 +1,17 @@
+# /etc/vaultwarden-hardening.conf （root 所有，chmod 600）
+# 留空则自动识别；若已安装 vbm，会只读复用 /etc/vaultwarden-backup.conf 中的实例
+VW_DATA_DIR=""
+VW_CONTAINER=""
+# 对外域名（不含协议），用于读取 /api/config 版本
+VW_DOMAIN=""
+# 外部探测 URL：返回 /admin 是否公网可达（本机自检无法证明）
+EXTERNAL_PROBE_URL=""
+
+# 通知（仅在出现新的 fail 时发送；失败不影响结果）
+NOTIFY_TELEGRAM_TOKEN=""
+NOTIFY_TELEGRAM_CHAT=""
+NOTIFY_NTFY_URL=""
+NOTIFY_WEBHOOK_URL=""
+
+# 巡检周期（systemd OnCalendar 语法）
+WATCH_ONCALENDAR="daily"

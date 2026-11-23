@@ -1,0 +1,5 @@
+# shellcheck 全局配置（CI 与本地共用）
+# SC2016：单引号中的 $ 是有意的（docker -f 模板、sed 表达式、测试桩脚本）
+# SC2119：vw_sensitive_paths 的参数可选，默认使用 VW_DATA_DIR
+# SC1091：/etc/os-release 只在目标主机存在
+disable=SC2016,SC2119,SC1091
