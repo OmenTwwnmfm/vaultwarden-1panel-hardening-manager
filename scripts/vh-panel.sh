@@ -22,8 +22,6 @@ panel_listen_mode() { # 当前监听方式：ipv6（[::]，同时接受 IPv4）/
   if grep -q '^\[::\]:' <<<"$l"; then echo ipv6; elif grep -q '^0\.0\.0\.0:' <<<"$l"; then echo ipv4; elif [[ -n $l ]]; then echo specific; else echo unknown; fi
 }
 
-reset_supported() { 1pctl reset 2>&1 | grep -Eq "^[[:space:]]+$1[[:space:]]"; }
-
 show_status() {
   need_panel
   title "1Panel 面板状态"
@@ -190,14 +188,19 @@ reset_menu() {
   log_warn "以下操作会降低面板安全性，只在被面板挡在外面（忘记安全入口、换了 IP、两步验证设备丢失等）时使用。"
   log_warn "重置无法回滚。恢复访问后请立即在 1Panel →「面板设置」→「安全」中重新设置。"
   echo
-  local items=() i=0 it
+  local avail items=() i=0 it
+  avail=" $(reset_available) "
   for it in "${RESET_ITEMS[@]}"; do
-    reset_supported "$it" || continue
-    items+=("$it")
+    [[ $avail == *" $it "* ]] && items+=("$it")
+  done
+  if ((${#items[@]} == 0)); then
+    log_warn "没能从 1pctl reset 的帮助中识别出子命令，下面按 1Panel v2 列出；不支持的项执行时会报错，不会造成修改"
+    items=("${RESET_ITEMS[@]}")
+  fi
+  for it in "${items[@]}"; do
     i=$((i + 1))
     printf '  [%d] %-9s %s\n' "$i" "$it" "$(reset_desc "$it")"
   done
-  ((${#items[@]})) || { log_err "当前 1Panel 版本的 1pctl 不支持 reset 子命令"; return 1; }
   echo "  [0] 返回"
   local c ans
   read -r -p "请选择：" c || return 0

@@ -136,10 +136,10 @@ add_key() {
   fi
   rm -f -- "$tmp"
   load_keys
-  if printf '%s\n' "${KEY_FP[@]}" | grep -Fxq "$fp"; then
-    log_info "该密钥已存在（$fp）"
-    return 0
-  fi
+  local k
+  for k in "${KEY_FP[@]}"; do
+    [[ $k == "$fp" ]] && { log_info "该密钥已存在（$fp）"; return 0; }
+  done
   confirm_yes "添加密钥 $fp 到 root 的授权列表？" || return 0
   change_begin "添加 root 登录密钥 $fp"
   install -d -m 700 "$(dirname "$ROOT_KEYS")"
@@ -330,9 +330,8 @@ ga_installed() { [[ -e /lib/x86_64-linux-gnu/security/pam_google_authenticator.s
 
 ga_install() {
   ga_installed && command -v google-authenticator >/dev/null 2>&1 && return 0
-  command -v apt-get >/dev/null 2>&1 || { log_err "未找到 apt-get，请手动安装 libpam-google-authenticator"; return 1; }
   confirm_yes "需要安装 libpam-google-authenticator（动态口令模块），现在安装？" || return 1
-  DEBIAN_FRONTEND=noninteractive apt-get install -y libpam-google-authenticator || { log_err "安装失败"; return 1; }
+  apt_install libpam-google-authenticator || return 1
 }
 
 totp_check() { # totp_check 密钥文件；从标准输入读取 6 位动态口令

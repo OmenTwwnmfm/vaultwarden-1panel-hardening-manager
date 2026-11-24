@@ -47,6 +47,40 @@ title() { printf '\n%s========== %s ==========%s\n' "$C_B" "$*" "$C_0"; }
 
 need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "需要 root 权限，请使用 sudo vhm"; }
 
+# 各脚本都开启了 pipefail。「命令 | grep -q」中 grep 找到匹配会提前退出，前面的命令若还在输出就会收到
+# SIGPIPE（退出码 141），整条管道被判为失败。需要按输出做判断时，先把输出存进变量再匹配。
+out_match() { # out_match 扩展正则 命令...：命令的标准输出是否匹配
+  local re=$1 out
+  shift
+  out=$("$@" 2>/dev/null) || true
+  grep -Eq -- "$re" <<<"$out"
+}
+
+apt_host() { # 第一个软件源的域名
+  { cat /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true; } |
+    grep -Eo 'https?://[^/[:space:]]+' | sed -n '1s#^https\{0,1\}://##p'
+}
+
+# apt_install 包...：失败时先 apt-get update 再重试；仍失败则检查是否是 DNS 问题并给出提示
+apt_install() {
+  command -v apt-get >/dev/null 2>&1 || { log_err "未找到 apt-get，请手动安装：$*"; return 1; }
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" && return 0
+  log_warn "安装失败，先更新软件源索引（apt-get update）再重试……"
+  DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" && return 0
+  local host
+  host=$(apt_host)
+  if [[ -n $host ]] && ! getent hosts "$host" >/dev/null 2>&1; then
+    log_err "无法解析软件源域名 $host：这台 VPS 当前的 DNS 不可用，所以装不了软件包（没有做任何修改）"
+    echo "  1. 确认网络通：ping -c1 1.1.1.1" >&2
+    echo "  2. 查看 DNS：resolvectl status（或 cat /etc/resolv.conf）" >&2
+    echo "  3. 修复示例：在 /etc/systemd/resolved.conf 的 [Resolve] 下设置 DNS=1.1.1.1 8.8.8.8，然后 systemctl restart systemd-resolved" >&2
+    echo "  修好后执行 getent hosts $host 能看到 IP，再回来重试。" >&2
+  else
+    log_err "安装 $* 失败（没有做任何修改），请查看上面 apt 的输出"
+  fi
+  return 1
+}
+
 # ---------- 交互 ----------
 pause() { [[ -t 0 ]] || return 0; read -r -p $'\n按 Enter 返回菜单... ' _ || true; }
 
@@ -145,11 +179,12 @@ detect_instance() {
   [[ -n $want ]] && from_vbm=$want
   local ids=()
   mapfile -t ids < <(docker ps -a --format '{{.ID}}' 2>/dev/null)
-  local cands=() id src name
+  local cands=() id src name img
   for id in "${ids[@]}"; do
     src=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$id" 2>/dev/null)
     [[ -n "$src" ]] || continue
-    docker inspect -f '{{.Config.Image}}' "$id" | grep -qi vaultwarden || continue
+    img=$(docker inspect -f '{{.Config.Image}}' "$id" 2>/dev/null)
+    [[ ${img,,} == *vaultwarden* ]] || continue
     name=$(docker inspect -f '{{.Name}}' "$id")
     name=${name#/}
     cands+=("$name|$src")
@@ -580,23 +615,23 @@ ssh_reload() {
 }
 
 tfa_pam_on() { grep -Eq '^[[:space:]]*auth[[:space:]]+required[[:space:]]+pam_google_authenticator\.so' "$PAM_SSHD" 2>/dev/null; }
-tfa_enabled() { tfa_pam_on && sshd_get authenticationmethods | grep -q 'publickey,keyboard-interactive'; }
+tfa_enabled() { tfa_pam_on && [[ $(sshd_get authenticationmethods) == *publickey,keyboard-interactive* ]]; }
 
 # ---------- 防火墙 / Fail2Ban / sysctl ----------
 # 防火墙规则由 1Panel 管理，vhm 只读识别。1Panel（iptables）使用 1PANEL_BASIC_BEFORE / 1PANEL_BASIC /
 # 1PANEL_BASIC_AFTER 三条链挂在 INPUT 上，放行规则在 1PANEL_BASIC，末尾链默认丢弃其余 TCP/UDP。
 fw_type() {
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+  if command -v ufw >/dev/null 2>&1 && out_match 'Status: active' ufw status; then
     echo ufw
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     echo firewalld
-  elif command -v iptables >/dev/null 2>&1 && iptables -w -S INPUT 2>/dev/null | grep -q -- '-j 1PANEL_BASIC'; then
+  elif command -v iptables >/dev/null 2>&1 && out_match '-j 1PANEL_BASIC' iptables -w -S INPUT; then
     echo 1panel-iptables
-  elif command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -qi '1panel'; then
+  elif command -v nft >/dev/null 2>&1 && out_match '1panel|1PANEL' nft list ruleset; then
     echo 1panel-nftables
-  elif command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -Eq 'hook input .*policy drop'; then
+  elif command -v nft >/dev/null 2>&1 && out_match 'hook input .*policy drop' nft list ruleset; then
     echo nftables
-  elif command -v iptables >/dev/null 2>&1 && iptables -w -S INPUT 2>/dev/null | grep -q '^-P INPUT DROP'; then
+  elif command -v iptables >/dev/null 2>&1 && out_match '^-P INPUT DROP' iptables -w -S INPUT; then
     echo iptables
   else
     echo none
@@ -624,11 +659,11 @@ port_scope() {
       if [[ -z $rules ]]; then echo none; elif grep -q 'ALLOW.*Anywhere' <<<"$rules"; then echo all; else echo limited; fi
       ;;
     firewalld)
-      if firewall-cmd --list-ports 2>/dev/null | tr ' ' '\n' | grep -qx "$p/$proto"; then
+      if out_match "(^| )$p/$proto( |$)" firewall-cmd --list-ports; then
         echo all
-      elif [[ $p == 22 && $proto == tcp ]] && firewall-cmd --list-services 2>/dev/null | grep -qw ssh; then
+      elif [[ $p == 22 && $proto == tcp ]] && out_match '(^| )ssh( |$)' firewall-cmd --list-services; then
         echo all
-      elif firewall-cmd --list-rich-rules 2>/dev/null | grep -q "port=\"$p\" protocol=\"$proto\""; then
+      elif out_match "port=\"$p\" protocol=\"$proto\"" firewall-cmd --list-rich-rules; then
         echo limited
       else
         echo none
@@ -676,13 +711,17 @@ wait_port_allowed() {
 
 # 1Panel v2 的 Docker 端口访问控制（docker_guard）：nftables 表 nft_1panel_docker 或 iptables 链 1PANEL_DOCKER*
 docker_guard_on() {
-  { command -v nft >/dev/null 2>&1 && nft list tables 2>/dev/null | grep -q nft_1panel_docker; } ||
-    { command -v iptables >/dev/null 2>&1 && iptables -w -S 2>/dev/null | grep -q '1PANEL_DOCKER'; }
+  { command -v nft >/dev/null 2>&1 && out_match nft_1panel_docker nft list tables; } ||
+    { command -v iptables >/dev/null 2>&1 && out_match 1PANEL_DOCKER iptables -w -S; }
 }
 
 # ---------- 1Panel ----------
 panel_installed() { command -v 1pctl >/dev/null 2>&1; }
-panel_version() { timeout 20 1pctl version 2>/dev/null | grep -Eo 'v[0-9]+\.[0-9]+\.[0-9]+[^[:space:]]*' | head -n1; }
+panel_version() {
+  local out
+  out=$(timeout 20 1pctl version 2>/dev/null) || true
+  grep -m1 -Eo 'v[0-9]+\.[0-9]+\.[0-9]+[^[:space:]]*' <<<"$out"
+}
 panel_units() { # v2 为 1panel-core / 1panel-agent，v1 为 1panel
   local u
   for u in 1panel-core 1panel-agent 1panel; do
@@ -695,7 +734,17 @@ panel_active() {
   u=$(panel_units | head -n1)
   [[ -n $u ]] && systemctl is-active --quiet "$u"
 }
-panel_url() { timeout 20 1pctl user-info 2>/dev/null | grep -Eo 'https?://[^[:space:]]+' | head -n1; }
+panel_url() {
+  local out
+  out=$(timeout 20 1pctl user-info 2>/dev/null) || true
+  grep -m1 -Eo 'https?://[^[:space:]]+' <<<"$out"
+}
+# 当前 1pctl reset 帮助中列出的子命令（空格分隔）。1pctl reset 不带参数时由 1panel 打印帮助
+reset_available() {
+  local out
+  out=$(timeout 20 1pctl reset 2>&1) || true
+  sed 's/\x1b\[[0-9;]*m//g' <<<"$out" | awk '/^[[:space:]]+[a-z]+[[:space:]]/ { printf "%s ", $1 }'
+}
 panel_port_of() { sed -nE 's#^https?://[^/]*:([0-9]+)(/.*)?$#\1#p' <<<"$1"; }
 panel_entrance_of() { sed -nE 's#^https?://[^/]*:[0-9]+/?([^[:space:]]*)$#\1#p' <<<"$1"; }
 panel_wait_port() { # 最多等待 40 秒，直到端口在监听

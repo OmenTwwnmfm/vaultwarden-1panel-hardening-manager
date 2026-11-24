@@ -46,7 +46,7 @@ auto_updates() {
     1)
       confirm_yes "安装并启用 unattended-upgrades？" || return 0
       if ! dpkg -s unattended-upgrades >/dev/null 2>&1; then
-        DEBIAN_FRONTEND=noninteractive apt-get install -y unattended-upgrades || { log_err "安装失败"; return 1; }
+        apt_install unattended-upgrades || return 1
       fi
       change_begin "启用自动安全更新"
       au_write 1 || { change_rollback "$CHG_ID"; return 1; }

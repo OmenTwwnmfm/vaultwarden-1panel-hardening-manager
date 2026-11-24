@@ -89,7 +89,7 @@ ensure_argon2() {
   command -v argon2 >/dev/null 2>&1 && return 0
   command -v apt-get >/dev/null 2>&1 || { log_err "需要 argon2 命令，请手动安装"; return 1; }
   confirm_yes "生成哈希需要安装 argon2 软件包，现在安装？" || return 1
-  DEBIAN_FRONTEND=noninteractive apt-get install -y argon2 >/dev/null || { log_err "安装 argon2 失败"; return 1; }
+  apt_install argon2 || return 1
 }
 
 set_admin_token() {

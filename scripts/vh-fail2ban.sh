@@ -26,7 +26,7 @@ setup() {
   if ! command -v fail2ban-client >/dev/null 2>&1; then
     command -v apt-get >/dev/null 2>&1 || { log_err "未找到 apt-get，请手动安装 fail2ban"; return 1; }
     confirm_yes "未安装 Fail2Ban，现在安装？" || return 0
-    DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban || { log_err "安装失败"; return 1; }
+    apt_install fail2ban || return 1
     [[ $(log_backend) == systemd ]] && ! python3 -c 'import systemd' 2>/dev/null &&
       DEBIAN_FRONTEND=noninteractive apt-get install -y python3-systemd >/dev/null 2>&1
   fi

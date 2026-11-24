@@ -13,7 +13,7 @@ yn() { if "$@" >/dev/null 2>&1; then echo 是; else echo 否; fi; }
   echo "### 系统"
   echo "- 系统：$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}")"
   echo "- 内核：$(uname -r)"
-  echo "- systemd：$(systemctl --version 2>/dev/null | head -n1 || echo 不可用)"
+  echo "- systemd：$(systemctl --version 2>/dev/null | sed -n 1p)"
   echo "- Docker：$(docker version -f '{{.Server.Version}}' 2>/dev/null || echo 不可用)"
   echo "- 1Panel：$([[ -d /opt/1panel ]] && echo 已检测 || echo 未检测)"
   echo "- vbm：$(vbm_installed && echo 已安装 || echo 未安装)"
@@ -40,9 +40,17 @@ yn() { if "$@" >/dev/null 2>&1; then echo 是; else echo 否; fi; }
     echo "- 服务：$(for u in $(panel_units); do printf '%s=%s ' "$u" "$(systemctl is-active "$u" 2>/dev/null)"; done)"
     purl=$(panel_url)
     echo "- 面板端口：$(panel_port_of "$purl") · 协议：${purl%%:*} · 安全入口：$([[ -n $(panel_entrance_of "$purl") ]] && echo 已设置 || echo 未设置)"
-    echo "- reset 子命令：$(1pctl reset 2>&1 | awk '/^  [a-z]+ /{ printf "%s ", $1 }')"
+    echo "- reset 子命令：$(reset_available)"
   else
     echo "- 未安装（找不到 1pctl）"
+  fi
+  echo
+  echo "### 软件源"
+  ahost=$(apt_host)
+  if [[ -n $ahost ]]; then
+    echo "- 软件源：$ahost · DNS 解析：$(getent hosts "$ahost" >/dev/null 2>&1 && echo 正常 || echo 失败)"
+  else
+    echo "- 软件源：未识别"
   fi
   echo
   echo "### Vaultwarden"
