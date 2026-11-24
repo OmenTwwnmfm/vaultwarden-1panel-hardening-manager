@@ -56,28 +56,57 @@ out_match() { # out_match 扩展正则 命令...：命令的标准输出是否�
   grep -Eq -- "$re" <<<"$out"
 }
 
-apt_host() { # 第一个软件源的域名
-  { cat /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true; } |
-    grep -Eo 'https?://[^/[:space:]]+' | sed -n '1s#^https\{0,1\}://##p'
+# 软件源域名（跳过注释行；兼容 sources.list 与 deb822 的 .sources，去掉账号和端口）
+apt_host() {
+  local f
+  for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    [[ -r $f ]] && grep -Ev '^[[:space:]]*#' "$f"
+  done 2>/dev/null | grep -Eo 'https?://[^/[:space:]]+' | sed -E -n '1{s#^https?://([^@/]*@)?##;s#:[0-9]+$##;p}'
 }
 
-# apt_install 包...：失败时先 apt-get update 再重试；仍失败则检查是否是 DNS 问题并给出提示
+apt_user_resolves() { # apt 下载时使用的 _apt 用户能否解析该域名
+  id _apt >/dev/null 2>&1 || return 0
+  runuser -u _apt -- getent hosts "$1" >/dev/null 2>&1
+}
+
+# apt_install 包...：失败时先 apt-get update 再重试；仍失败则判断原因：
+# - root 也解析不了软件源域名 → DNS 不可用，给出修复步骤
+# - root 能解析而 _apt 用户不能 → apt 沙箱读不到 DNS 配置，改用 root 身份下载再试一次
 apt_install() {
   command -v apt-get >/dev/null 2>&1 || { log_err "未找到 apt-get，请手动安装：$*"; return 1; }
-  DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" && return 0
+  local DEBIAN_FRONTEND=noninteractive host proxy rc
+  export DEBIAN_FRONTEND
+  apt-get install -y "$@" && return 0
   log_warn "安装失败，先更新软件源索引（apt-get update）再重试……"
-  DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" && return 0
-  local host
+  apt-get update && apt-get install -y "$@" && return 0
   host=$(apt_host)
-  if [[ -n $host ]] && ! getent hosts "$host" >/dev/null 2>&1; then
+  proxy=$(apt-config dump 2>/dev/null | grep -Ei '^Acquire::(https?|ftp)::Proxy ' || true)
+  [[ -n $proxy ]] && log_warn "apt 配置了代理（$proxy），请确认代理可用"
+  if [[ -z $host ]]; then
+    log_err "安装 $* 失败（没有做任何修改），请查看上面 apt 的输出"
+    return 1
+  fi
+  if ! getent hosts "$host" >/dev/null 2>&1; then
     log_err "无法解析软件源域名 $host：这台 VPS 当前的 DNS 不可用，所以装不了软件包（没有做任何修改）"
     echo "  1. 确认网络通：ping -c1 1.1.1.1" >&2
     echo "  2. 查看 DNS：resolvectl status（或 cat /etc/resolv.conf）" >&2
     echo "  3. 修复示例：在 /etc/systemd/resolved.conf 的 [Resolve] 下设置 DNS=1.1.1.1 8.8.8.8，然后 systemctl restart systemd-resolved" >&2
     echo "  修好后执行 getent hosts $host 能看到 IP，再回来重试。" >&2
-  else
-    log_err "安装 $* 失败（没有做任何修改），请查看上面 apt 的输出"
+    return 1
   fi
+  if ! apt_user_resolves "$host"; then
+    log_warn "root 能解析 $host，但 apt 下载时使用的 _apt 用户不能（常见原因：/etc/resolv.conf 或其指向的文件对其他用户不可读）"
+    echo "  /etc/resolv.conf → $(readlink -f /etc/resolv.conf 2>/dev/null)（权限 $(stat -L -c '%a %U:%G' /etc/resolv.conf 2>/dev/null)）" >&2
+    log_info "改用 root 身份下载，再试一次……"
+    rc=0
+    { apt-get -o APT::Sandbox::User=root update && apt-get -o APT::Sandbox::User=root install -y "$@"; } || rc=$?
+    if ((rc == 0)); then
+      log_ok "已安装 $*"
+      log_warn "建议修复 DNS 配置文件权限，例如：chmod 644 $(readlink -f /etc/resolv.conf 2>/dev/null || echo /etc/resolv.conf)"
+      return 0
+    fi
+  fi
+  log_err "安装 $* 失败（没有做任何修改）。root 能解析 $host，问题可能在代理、防火墙出站规则或软件源本身，请查看上面 apt 的输出"
   return 1
 }
 

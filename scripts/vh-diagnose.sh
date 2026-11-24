@@ -49,6 +49,8 @@ yn() { if "$@" >/dev/null 2>&1; then echo 是; else echo 否; fi; }
   ahost=$(apt_host)
   if [[ -n $ahost ]]; then
     echo "- 软件源：$ahost · DNS 解析：$(getent hosts "$ahost" >/dev/null 2>&1 && echo 正常 || echo 失败)"
+    echo "- apt 下载用户（_apt）解析：$(apt_user_resolves "$ahost" && echo 正常 || echo 失败)"
+    echo "- /etc/resolv.conf：$(readlink -f /etc/resolv.conf 2>/dev/null)（$(stat -L -c '%a' /etc/resolv.conf 2>/dev/null)）"
   else
     echo "- 软件源：未识别"
   fi

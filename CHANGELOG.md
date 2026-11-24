@@ -10,7 +10,8 @@
 - 新菜单：顶部状态面板（SSH 端口 / 2FA / 密码登录、防火墙、Fail2Ban、Vaultwarden 注册与后台），按 7 个大类分组，样式与 vbm 一致。
 - `[02]` VPS 安全体检（只读）：端口、防火墙、Docker 绕过防火墙、SSH、Fail2Ban、系统账户、自动更新、内核参数、1Panel、Vaultwarden、vbm 备份；按 正常 / 注意 / 危险 标出并附处理建议。
 - SSH：状态、登录密钥管理（拒绝删除唯一密钥或当前会话的密钥）、修改端口（先双端口监听，确认后关闭旧端口，同步 Fail2Ban）、登录记录与失败 IP 排行。
-- SSH 2FA：密钥 + 动态口令（`libpam-google-authenticator`），仅 root，不留 `nullok`；绑定时先校验一次口令并生成 5 个应急码；支持重新绑定、查看应急码、关闭。
+- SSH 2FA：密钥 + 动态口令（`libpam-google-authenticator`），仅 root，不留 `nullok`；绑定时在终端显示二维码（附手动输入密钥），先校验一次口令并生成 5 个应急码；支持重新显示二维码、重新绑定、查看应急码、关闭。
+- 软件包安装失败时自动 `apt-get update` 重试，并区分「DNS 不可用」与「apt 下载用户读不到 DNS 配置」两种情况给出处理方法。
 - 所有 SSH 修改带 5 分钟防锁死保护：`sshd -t` 与生效值校验，systemd 定时器到时未确认自动回滚，当前会话不断开。
 - Fail2Ban：安装、SSH 防护配置（`jail.d/vhm-sshd.local`，自动识别端口与日志后端，白名单默认填入当前 IP）、状态、封禁列表、解封。
 - 防火墙交给 1Panel 管理：体检识别 1Panel 的 iptables / nftables 防火墙以及 ufw、firewalld，按「对所有 IP 开放 / 只对指定 IP 放行 / 被拦截」列出监听端口；Docker 端口暴露检查并入体检，检测到 1Panel v2 的 Docker 端口访问控制时降为提示。

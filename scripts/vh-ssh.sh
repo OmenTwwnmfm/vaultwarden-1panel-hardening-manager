@@ -8,6 +8,76 @@ source "$VH_DIR/vh-common.sh"
 
 PAM_GA_LINE='auth required pam_google_authenticator.so'
 PAM_MARK='#vhm# '
+GA_ISSUER=VPS-SSH
+
+# 终端二维码：优先用 qrencode 命令；没有时通过 ctypes 直接调用 libqrencode
+# （安装 libpam-google-authenticator 时会一并安装 libqrencode4）。内容经环境变量传入，不出现在命令行
+QR_PY=$(
+  cat <<'PY'
+import ctypes, ctypes.util, os, sys
+text = os.environ["VH_QR_TEXT"].encode()
+lib = None
+for cand in [ctypes.util.find_library("qrencode"), "libqrencode.so.4", "libqrencode.so.3", "libqrencode.so"]:
+    if not cand:
+        continue
+    try:
+        lib = ctypes.CDLL(cand)
+        break
+    except OSError:
+        pass
+if lib is None:
+    sys.exit(1)
+class QRcode(ctypes.Structure):
+    _fields_ = [("version", ctypes.c_int), ("width", ctypes.c_int), ("data", ctypes.POINTER(ctypes.c_ubyte))]
+lib.QRcode_encodeString.restype = ctypes.POINTER(QRcode)
+lib.QRcode_encodeString.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+lib.QRcode_free.argtypes = [ctypes.POINTER(QRcode)]
+qr = lib.QRcode_encodeString(text, 0, 1, 2, 1)  # 版本自动、纠错 M、8 位模式、区分大小写
+if not qr:
+    sys.exit(1)
+w, d = qr.contents.width, qr.contents.data
+def dark(x, y):
+    return 0 <= x < w and 0 <= y < w and d[y * w + x] & 1
+rows = []
+for y in range(-2, w + 2, 2):  # 每行字符表示上下两个模块，四周留 2 格空白
+    rows.append("".join(" " if dark(x, y) and dark(x, y + 1) else "\u2584" if dark(x, y) else "\u2580" if dark(x, y + 1) else "\u2588"
+                        for x in range(-2, w + 2)))
+lib.QRcode_free(qr)
+sys.stdout.buffer.write(("\n".join(rows) + "\n").encode("utf-8"))
+PY
+)
+
+ga_label() { echo "root@$(hostname)"; }
+
+ga_uri() { # ga_uri 密钥文件：输出 otpauth:// 链接
+  python3 - "$1" "$GA_ISSUER" "$(ga_label)" <<'PY'
+import sys, urllib.parse
+with open(sys.argv[1], encoding="ascii") as fh:
+    seed = fh.readline().strip()
+issuer, label = sys.argv[2], sys.argv[3]
+q = urllib.parse.quote
+print(f"otpauth://totp/{q(issuer)}:{q(label)}?secret={seed}&issuer={q(issuer)}&algorithm=SHA1&digits=6&period=30")
+PY
+}
+
+# ga_show_qr 密钥文件：在终端显示绑定二维码、手动输入用的密钥和 otpauth 链接
+ga_show_qr() {
+  local uri seed
+  uri=$(ga_uri "$1") || { log_err "无法读取动态口令密钥文件 $1"; return 1; }
+  seed=$(head -n1 "$1")
+  echo "请用手机验证器（Google Authenticator、Microsoft Authenticator、2FAS、Bitwarden 等）扫描下面的二维码："
+  echo
+  if command -v qrencode >/dev/null 2>&1; then
+    printf '%s' "$uri" | qrencode -t ANSIUTF8 -m 2
+  elif ! VH_QR_TEXT="$uri" python3 -c "$QR_PY"; then
+    log_warn "无法在终端显示二维码（找不到 libqrencode），请用下面的密钥手动添加"
+  fi
+  echo
+  echo "扫不出来时（窗口太小、浅色背景终端），把窗口拉大后重试，或在验证器中选择「输入设置密钥」手动添加："
+  echo "    账号：$(ga_label)    类型：基于时间（TOTP，6 位，30 秒）"
+  echo "    密钥：$(sed 's/.\{4\}/& /g' <<<"$seed")"
+  echo "    链接：$uri"
+}
 
 # ---------- 通用 ----------
 server_ip() {
@@ -356,13 +426,16 @@ ga_bind_new() {
   local f="$GA_FILE.vhm-new" code i
   rm -f -- "$f"
   time_synced || log_warn "系统时间未同步，动态口令可能校验失败（timedatectl set-ntp true）"
-  echo "请用手机验证器（Google Authenticator、Microsoft Authenticator、2FAS 等）扫描下面的二维码：" >&2
-  if ! google-authenticator -t -d -f -r 3 -R 30 -w 3 -e 5 -Q UTF8 -s "$f" \
-    -i "VPS-SSH" -l "root@$(hostname)" >&2; then
-    log_err "生成动态口令密钥失败"
+  local out
+  if ! out=$(google-authenticator -t -d -f -r 3 -R 30 -w 3 -e 5 -Q NONE -s "$f" \
+    -i "$GA_ISSUER" -l "$(ga_label)" 2>&1); then
+    log_err "生成动态口令密钥失败：$(tail -n 3 <<<"$out" | redact)"
     rm -f -- "$f"
     return 1
   fi
+  unset out
+  ga_show_qr "$f" >&2 || { rm -f -- "$f"; return 1; }
+  echo >&2
   for i in 1 2 3; do
     read -r -p "输入验证器上显示的 6 位动态口令: " code || break
     if [[ $code =~ ^[0-9]{6}$ ]] && totp_check "$f" <<<"$code"; then
@@ -503,6 +576,17 @@ tfa_codes() {
   sed 's/^/    /' <<<"$codes"
 }
 
+tfa_qr() {
+  [[ -f $GA_FILE ]] || { log_warn "root 尚未绑定动态口令，请先用 [06] 启用 2FA"; return 0; }
+  log_warn "二维码和密钥就等于你的动态口令。请确认周围没人看屏幕，终端也没有在录屏或记录会话日志"
+  confirm_yes "显示 root 的动态口令二维码？" || return 0
+  echo
+  ga_show_qr "$GA_FILE"
+  echo
+  echo "可以用它在新手机或第二个验证器上添加同一个账号，原来手机上的口令仍然有效。"
+  echo "如果担心密钥已经泄露，请改用「重新绑定」，旧的二维码和应急码会全部失效。"
+}
+
 tfa_disable() {
   tfa_enabled || tfa_pam_on || { log_info "2FA 未启用"; return 0; }
   echo "关闭后 root 只需 SSH 密钥即可登录，密码登录保持关闭。动态口令绑定文件会保留，以后可直接重新启用。"
@@ -524,16 +608,18 @@ tfa_manage() {
   title "2FA 管理"
   if tfa_enabled; then log_ok "2FA 已启用"; else log_info "2FA 未启用（启用请用 [06]）"; fi
   echo
-  echo "  [1] 重新绑定（换手机 / 密钥泄露 / 应急码用完）"
-  echo "  [2] 查看剩余应急码"
-  echo "  [3] 关闭 2FA"
+  echo "  [1] 显示绑定二维码（在新手机 / 第二个验证器上添加同一账号）"
+  echo "  [2] 重新绑定（换新密钥：密钥泄露 / 应急码用完）"
+  echo "  [3] 查看剩余应急码"
+  echo "  [4] 关闭 2FA"
   echo "  [0] 返回"
   local c
   read -r -p "请选择：" c || return 0
   case $c in
-    1) tfa_rebind ;;
-    2) tfa_codes ;;
-    3) tfa_disable ;;
+    1) tfa_qr ;;
+    2) tfa_rebind ;;
+    3) tfa_codes ;;
+    4) tfa_disable ;;
   esac
 }
 
