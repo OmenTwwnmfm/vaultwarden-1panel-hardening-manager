@@ -637,7 +637,8 @@ sshd_eff() {
   mkdir -p /run/sshd 2>/dev/null
   out=$("$SSHD_BIN" -T -C user=root,host=vhm-check,addr=203.0.113.1 2>/dev/null) || out=""
   [[ -n $out ]] || out=$("$SSHD_BIN" -T 2>/dev/null) || out=""
-  [[ -n $out ]] && printf '%s\n' "$out"
+  # OpenSSH 10.x 的 sshd -T 输出配置名用驼峰（Port、PasswordAuthentication），旧版是全小写；统一转成小写
+  [[ -n $out ]] && awk '{ $1 = tolower($1); print }' <<<"$out"
 }
 sshd_eff_err() { mkdir -p /run/sshd 2>/dev/null; "$SSHD_BIN" -T 2>&1 >/dev/null | tail -n 3; }
 
