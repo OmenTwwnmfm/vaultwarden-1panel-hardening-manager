@@ -268,7 +268,7 @@ show_status() {
   local eff
   eff=$(sshd_eff)
   if [[ -z $eff ]]; then
-    log_err "无法读取 sshd 生效配置（sshd -T 失败）：$(sshd_test)"
+    log_err "无法读取 sshd 生效配置（$SSHD_BIN -T 失败）：$(sshd_eff_err)"
     return 1
   fi
   get() { awk -v k="$1" '$1 == k { $1 = ""; sub(/^ /, ""); print }' <<<"$eff" | paste -sd' '; }
@@ -427,8 +427,11 @@ ga_bind_new() {
   rm -f -- "$f"
   time_synced || log_warn "系统时间未同步，动态口令可能校验失败（timedatectl set-ntp true）"
   local out
-  if ! out=$(google-authenticator -t -d -f -r 3 -R 30 -w 3 -e 5 -Q NONE -s "$f" \
-    -i "$GA_ISSUER" -l "$(ga_label)" 2>&1); then
+  # -C：不在这里要求输入验证码（vhm 随后自己校验）。新版 google-authenticator 默认会提示
+  # 「Enter code from app」，而输出被捕获后提示不可见，程序会一直等待输入，看起来像卡住。
+  # </dev/null 保证即使将来又多出交互提问，也会立即失败而不是挂起。
+  if ! out=$(google-authenticator -t -d -f -C -r 3 -R 30 -w 3 -e 5 -Q NONE -s "$f" \
+    -i "$GA_ISSUER" -l "$(ga_label)" </dev/null 2>&1) || [[ ! -s $f ]]; then
     log_err "生成动态口令密钥失败：$(tail -n 3 <<<"$out" | redact)"
     rm -f -- "$f"
     return 1

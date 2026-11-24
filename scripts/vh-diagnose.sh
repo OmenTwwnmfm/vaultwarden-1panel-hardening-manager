@@ -21,6 +21,7 @@ yn() { if "$@" >/dev/null 2>&1; then echo 是; else echo 否; fi; }
   echo
   echo "### SSH"
   echo "- sshd -t：$(sshd_test >/dev/null 2>&1 && echo 通过 || echo 未通过)"
+  echo "- sshd 程序：$SSHD_BIN · sshd -T：$([[ -n $(sshd_eff) ]] && echo 正常 || echo "失败：$(sshd_eff_err)")"
   echo "- 服务：$(ssh_service) · socket 激活：$(yn ssh_socket_used)"
   for k in port passwordauthentication pubkeyauthentication permitrootlogin kbdinteractiveauthentication usepam authenticationmethods; do
     echo "- $k：$(sshd_get "$k" | paste -sd' ')"

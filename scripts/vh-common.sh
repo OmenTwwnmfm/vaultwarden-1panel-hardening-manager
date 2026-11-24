@@ -102,7 +102,13 @@ apt_install() {
     { apt-get -o APT::Sandbox::User=root update && apt-get -o APT::Sandbox::User=root install -y "$@"; } || rc=$?
     if ((rc == 0)); then
       log_ok "已安装 $*"
-      log_warn "建议修复 DNS 配置文件权限，例如：chmod 644 $(readlink -f /etc/resolv.conf 2>/dev/null || echo /etc/resolv.conf)"
+      local rf
+      rf=$(readlink -f /etc/resolv.conf 2>/dev/null || echo /etc/resolv.conf)
+      if [[ $(stat -L -c '%a' "$rf" 2>/dev/null) =~ [4-7]$ ]]; then
+        log_info "$rf 权限正常，_apt 解析失败可能由 AppArmor 或按用户限制的出站规则造成；可用 runuser -u _apt -- getent hosts $host 排查"
+      else
+        log_warn "建议修复 DNS 配置文件权限：chmod 644 $rf"
+      fi
       return 0
     fi
   fi
@@ -621,9 +627,19 @@ guard_wait_confirm() {
 }
 
 # ---------- SSH ----------
-SSHD_BIN=${SSHD_BIN:-$(command -v sshd 2>/dev/null || echo /usr/sbin/sshd)}
+if [[ -z ${SSHD_BIN:-} ]]; then
+  if [[ -x /usr/sbin/sshd ]]; then SSHD_BIN=/usr/sbin/sshd; else SSHD_BIN=$(command -v sshd 2>/dev/null || echo /usr/sbin/sshd); fi
+fi
 sshd_test() { mkdir -p /run/sshd 2>/dev/null; "$SSHD_BIN" -t 2>&1; }
-sshd_eff() { mkdir -p /run/sshd 2>/dev/null; "$SSHD_BIN" -T -C user=root,host=vhm-check,addr=203.0.113.1 2>/dev/null; }
+# 生效配置：优先按「root 从外网登录」的条件计算（让 Match 块生效）；不支持 -C 时退回 sshd -T
+sshd_eff() {
+  local out
+  mkdir -p /run/sshd 2>/dev/null
+  out=$("$SSHD_BIN" -T -C user=root,host=vhm-check,addr=203.0.113.1 2>/dev/null) || out=""
+  [[ -n $out ]] || out=$("$SSHD_BIN" -T 2>/dev/null) || out=""
+  [[ -n $out ]] && printf '%s\n' "$out"
+}
+sshd_eff_err() { mkdir -p /run/sshd 2>/dev/null; "$SSHD_BIN" -T 2>&1 >/dev/null | tail -n 3; }
 sshd_get() { sshd_eff | awk -v k="$1" '$1 == k { $1 = ""; sub(/^ /, ""); print }'; }
 ssh_service() { if systemctl cat ssh.service >/dev/null 2>&1; then echo ssh; else echo sshd; fi; }
 ssh_socket_used() { systemctl is-enabled --quiet ssh.socket 2>/dev/null || systemctl is-active --quiet ssh.socket 2>/dev/null; }
