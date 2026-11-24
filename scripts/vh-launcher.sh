@@ -7,37 +7,61 @@ source "$VH_DIR/vh-common.sh"
 
 check_deps() {
   local missing=() c
-  for c in docker flock sed awk stat sha256sum python3 curl; do
+  for c in flock sed awk stat python3 ssh-keygen systemctl; do
     command -v "$c" >/dev/null 2>&1 || missing+=("$c")
   done
-  command -v systemctl >/dev/null 2>&1 || log_warn "未检测到 systemd，定时巡检不可用"
-  command -v ss >/dev/null 2>&1 || log_warn "未检测到 ss（iproute2），P-01 面板端口检查将不准确"
-  command -v git >/dev/null 2>&1 || log_warn "未检测到 git，[23] 源码更新不可用"
-  [[ -d /opt/1panel ]] || log_warn "未检测到 /opt/1panel，1Panel 相关检查将标记为 unknown"
+  [[ -x $SSHD_BIN ]] || missing+=(sshd)
+  command -v docker >/dev/null 2>&1 || log_warn "未检测到 docker，Vaultwarden 与 Docker 相关功能不可用"
+  command -v ss >/dev/null 2>&1 || log_warn "未检测到 ss（iproute2），端口检查不可用"
+  command -v systemd-run >/dev/null 2>&1 || log_warn "未检测到 systemd-run，SSH 相关修改无法启用防锁死保护，将被拒绝"
+  command -v curl >/dev/null 2>&1 || log_warn "未检测到 curl，Docker 端口实测不可用"
+  command -v git >/dev/null 2>&1 || log_warn "未检测到 git，[22] 源码更新不可用"
   if ((${#missing[@]})); then
     log_err "缺少依赖：${missing[*]}"
-    echo "  Debian/Ubuntu: apt-get install -y util-linux coreutils python3 curl iproute2" >&2
+    echo "  Debian/Ubuntu: apt-get install -y util-linux coreutils python3 openssh-server openssh-client iproute2 curl" >&2
     return 1
   fi
   log_ok "依赖齐全"
 }
 
+usage() {
+  cat <<EOF
+vhm $VH_VERSION — VPS & Vaultwarden (1Panel) 加固管理器
+
+用法: sudo vhm [子命令]
+  （无参数）            进入交互菜单
+  checkup              VPS 安全体检（只读）
+  ports                端口与放行规则一览（只读）
+  ssh-status           SSH 状态（只读）
+  vw-status            Vaultwarden 状态（只读）
+  vw-users             Vaultwarden 用户列表（只读）
+  changes              列出变更记录
+  rollback <变更ID>    回滚一条变更
+  diagnose             脱敏诊断报告
+  deps                 依赖检查
+  version              显示版本
+
+所有修改操作只在交互菜单中提供，执行前需要输入 yes 确认。
+EOF
+}
+
 case "${1:-menu}" in
   --version | version) echo "vhm $VH_VERSION" ;;
   deps) check_deps ;;
-  menu) need_root; exec bash "$VH_DIR/vh-manager.sh" ;;
-  audit) shift; exec bash "$VH_DIR/vh-audit.sh" "$@" ;;
-  plan) shift; exec bash "$VH_DIR/vh-plan.sh" "$@" ;;
-  apply) shift; need_root; exec bash "$VH_DIR/vh-apply.sh" "$@" ;;
-  rollback) shift; need_root; exec bash "$VH_DIR/vh-rollback.sh" "$@" ;;
-  report) shift; exec bash "$VH_DIR/vh-report.sh" "$@" ;;
-  watch) shift; exec bash "$VH_DIR/vh-watch.sh" "$@" ;;
-  diagnose) shift; exec bash "$VH_DIR/vh-diagnose.sh" "$@" ;;
-  -h | --help | help)
-    cat <<EOF
-vhm $VH_VERSION — Vaultwarden (1Panel) 加固管理器
-用法: vhm [menu|audit|plan|apply|rollback|report|watch|diagnose|deps|version]
-EOF
+  menu)
+    need_root
+    [[ -t 0 ]] || die "这是交互式菜单，请在 SSH 终端中运行"
+    vh_legacy_cleanup
+    exec bash "$VH_DIR/vh-manager.sh"
     ;;
-  *) die "未知子命令：$1（vhm help 查看用法）" ;;
+  checkup) need_root; exec bash "$VH_DIR/vh-checkup.sh" full ;;
+  ports) need_root; exec bash "$VH_DIR/vh-checkup.sh" ports ;;
+  ssh-status) need_root; exec bash "$VH_DIR/vh-ssh.sh" status ;;
+  vw-status) need_root; exec bash "$VH_DIR/vh-vaultwarden.sh" status ;;
+  vw-users) need_root; exec bash "$VH_DIR/vh-vaultwarden.sh" users ;;
+  changes) need_root; exec bash "$VH_DIR/vh-changes.sh" list ;;
+  rollback) need_root; shift; exec bash "$VH_DIR/vh-changes.sh" rollback "${1:-}" ;;
+  diagnose) shift; exec bash "$VH_DIR/vh-diagnose.sh" "$@" ;;
+  -h | --help | help) usage ;;
+  *) usage >&2; exit 1 ;;
 esac

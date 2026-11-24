@@ -1,68 +1,207 @@
 #!/usr/bin/env bash
-# 交互菜单：仅做分发，编号自 v0.1.0 起冻结
-set -Eeuo pipefail
+# 交互菜单：顶部状态面板 + 分类菜单，只负责分发到各功能脚本
+set -Euo pipefail
 VH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=scripts/vh-common.sh
 source "$VH_DIR/vh-common.sh"
 
-run() { bash "$VH_DIR/$1" "${@:2}" || log_warn "操作结束（退出码 $?）"; }
+run() {
+  local rc=0
+  bash "$VH_DIR/$1" "${@:2}" || rc=$?
+  ((rc == 0 || rc == 1)) || log_warn "操作结束（退出码 $rc）"
+  pause
+}
 
 first_setup() {
+  install -d -m 700 "$VH_STATE" "$VH_CHANGES"
   if [[ -f "$VH_CONF" ]]; then
-    log_info "已存在 $VH_CONF，将仅重新识别实例"
+    log_info "已存在 $VH_CONF，将重新识别 Vaultwarden 实例"
   else
     install -m 600 -o root -g root "$VH_DIR/hardening.conf.example" "$VH_CONF"
     log_ok "已生成 $VH_CONF"
   fi
-  install -d -m 700 "$VH_STATE" "$VH_STATE/snapshots" "$VH_STATE/reports"
-  if detect_instance; then
+  bash "$VH_DIR/vh-launcher.sh" deps || true
+  vh_legacy_cleanup
+  VW_DATA_DIR="" VW_CONTAINER=""
+  if detect_instance "$(conf_get VW_DATA_DIR || true)"; then
+    kv_set "$VH_CONF" VW_DATA_DIR "$VW_DATA_DIR" && kv_set "$VH_CONF" VW_CONTAINER "$VW_CONTAINER"
     log_ok "实例：$VW_CONTAINER  数据目录：$VW_DATA_DIR"
-    sed -i -E "s|^VW_DATA_DIR=.*|VW_DATA_DIR=\"$VW_DATA_DIR\"|; s|^VW_CONTAINER=.*|VW_CONTAINER=\"$VW_CONTAINER\"|" "$VH_CONF"
+  else
+    log_warn "未能确定 Vaultwarden 实例；SSH、Fail2Ban、体检等功能不受影响"
+  fi
+  if vbm_installed; then
+    log_ok "已检测到 vbm：修改 Vaultwarden 设置前会自动调用它做完整备份"
+  else
+    log_warn "未检测到 vbm（vaultwarden-1panel-backup-manager），建议先安装再修改 Vaultwarden 设置"
+  fi
+  pause
+}
+
+update_source() {
+  local root
+  root="$(cd "$VH_DIR/.." && pwd -P)"
+  command -v git >/dev/null 2>&1 || { log_err "未安装 git"; pause; return; }
+  if ! git -C "$root" diff --quiet || ! git -C "$root" diff --cached --quiet; then
+    log_warn "源码目录有未提交的修改，未更新：$root"
+    pause
+    return
+  fi
+  local before after
+  before=$(git -C "$root" rev-parse HEAD)
+  if git -C "$root" fetch -q origin main && git -C "$root" merge -q --ff-only origin/main; then
+    after=$(git -C "$root" rev-parse HEAD)
+    if [[ $before == "$after" ]]; then
+      log_ok "已是最新版本（v$VH_VERSION）"
+      pause
+    else
+      log_ok "已更新到 v$(cat "$root/VERSION")，重新进入菜单"
+      pause
+      exec bash "$VH_DIR/vh-launcher.sh" menu
+    fi
+  else
+    log_warn "无法从 GitHub 快进更新（网络问题或本地分支已分叉）"
+    pause
   fi
 }
 
-menu() {
-  cat <<EOF
+# 状态面板：每项都容错，读不到就显示「未知」
+status_args() {
+  local port tfa pa fw f2b vw="未识别"
+  port=$(sshd_get port 2>/dev/null | head -n1)
+  if tfa_enabled 2>/dev/null; then tfa="已启用"; else tfa="未启用"; fi
+  pa=$(sshd_get passwordauthentication 2>/dev/null)
+  case $pa in yes) pa="开" ;; no) pa="关" ;; *) pa="未知" ;; esac
+  fw=$(fw_type 2>/dev/null)
+  [[ $fw == none ]] && fw="未启用" || fw="$fw 已启用"
+  if systemctl is-active --quiet fail2ban 2>/dev/null; then
+    f2b="运行中（封禁 $(f2b_banned || echo ?)）"
+  elif command -v fail2ban-client >/dev/null 2>&1; then
+    f2b="未运行"
+  else
+    f2b="未安装"
+  fi
+  if load_instance >/dev/null 2>&1; then
+    local sig adm
+    sig=$(vw_eff signups_allowed SIGNUPS_ALLOWED true)
+    [[ $sig == false ]] && sig="注册关" || sig="注册开"
+    case $(vw_admin_state) in
+      off) adm="后台关" ;;
+      argon2) adm="后台开（哈希令牌）" ;;
+      plain) adm="后台开（明文令牌）" ;;
+      notoken) adm="后台免令牌（危险）" ;;
+    esac
+    vw="$sig · $adm"
+  fi
+  printf '%s\n' "$VH_VERSION" "SSH 端口：${port:-未知} · 2FA：$tfa · 密码登录：$pa" \
+    "防火墙：$fw · Fail2Ban：$f2b" "Vaultwarden：$vw"
+}
 
-==== vhm $VH_VERSION · Vaultwarden (1Panel) 加固管理器 ====
- 初始化  [01] 首次配置/重新识别实例   [02] 环境与依赖检查
- 审计    [03] 全量只读审计  [04] 按域审计  [05] 查看上次报告  [06] 导出报告
- 加固    [07] 生成计划  [08] 查看差异  [09] 应用计划  [10] 回滚快照  [11] 管理快照
- 指引    [12] 1Panel 面板  [13] OpenResty 片段  [14] Vaultwarden 参数  [15] 主机/SSH
- 自动化  [16] 安装/修改定时巡检  [17] 状态  [18] 暂停  [19] 恢复  [20] 通知配置
- 维护    [21] 脱敏诊断  [22] 同步后台脚本  [23] 检查源码更新
-         [00] 退出
-EOF
+render_menu() {
+  local args=()
+  mapfile -t args < <(status_args)
+  python3 - "${args[@]}" <<'PYMENU'
+import sys
+import unicodedata
+
+version, *status = sys.argv[1:]
+W = 70
+
+def width(s):
+    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in ("F", "W") else 1 for c in s)
+
+def pad(s, align="left"):
+    while width(s) > W:
+        s = s[:-1]
+    n = W - width(s)
+    if align == "center":
+        return " " * (n // 2) + s + " " * (n - n // 2)
+    return s + " " * n
+
+def row(s="", align="left"):
+    if s and align == "left":
+        s = "  " + s
+    print("│" + pad(s, align) + "│")
+
+def sep():
+    print("├" + "─" * W + "┤")
+
+print("╭" + "─" * W + "╮")
+row("VPS & Vaultwarden Hardening Manager", "center")
+row(f"v{version} · 1Panel Edition · Ubuntu / Debian", "center")
+row("Powered by OmenTwwnmfm", "center")
+row()
+for line in status:
+    row(line, "center")
+sep()
+sections = [
+    ("01 · 快速操作", [
+        "[01] 首次配置 / 识别 Vaultwarden 实例",
+        "[02] VPS 安全体检"]),
+    ("02 · SSH 登录安全", [
+        "[03] SSH 状态（端口、登录方式、2FA、当前会话）",
+        "[04] 管理登录密钥（列出 / 添加 / 删除）",
+        "[05] 修改 SSH 端口",
+        "[06] 安装 / 启用 2FA（密钥 + 动态口令）",
+        "[07] 2FA 管理（重新绑定 / 应急码 / 关闭）",
+        "[08] 登录记录（成功、失败、来源 IP）"]),
+    ("03 · 防火墙与端口（只读）", [
+        "[09] 端口与放行规则一览",
+        "[10] Docker 端口暴露检查"]),
+    ("04 · Fail2Ban", [
+        "[11] 安装 / 修改 SSH 防护配置",
+        "[12] 状态、封禁列表、解封 IP"]),
+    ("05 · Vaultwarden", [
+        "[13] 状态总览（注册、邀请、后台、版本）",
+        "[14] 开启 / 关闭注册",
+        "[15] 后台 ADMIN（开启 / 更换令牌 / 关闭）",
+        "[16] 用户列表",
+        "[17] 安全选项（密码提示、Send、紧急访问等）"]),
+    ("06 · 系统加固", [
+        "[18] 自动安全更新",
+        "[19] 内核网络参数加固"]),
+    ("07 · 系统维护", [
+        "[20] 变更记录与回滚",
+        "[21] 生成脱敏诊断报告",
+        "[22] 检查 / 更新项目源码"]),
+]
+for title, items in sections:
+    row(title)
+    for item in items:
+        row("    " + item)
+    sep()
+row("[00] 退出")
+print("╰" + "─" * W + "╯")
+PYMENU
 }
 
 while true; do
-  menu
+  [[ -t 1 ]] && clear
+  render_menu
   read -r -p "请选择：" c || exit 0
   case "$c" in
     0 | 00) exit 0 ;;
     01 | 1) first_setup ;;
-    02 | 2) bash "$VH_DIR/vh-launcher.sh" deps || true ;;
-    03 | 3) run vh-audit.sh ;;
-    04 | 4) read -r -p "域（panel/exposure/app/container/host/data/supply）：" d; run vh-audit.sh --domain "$d" ;;
-    05 | 5) run vh-report.sh show ;;
-    06 | 6) run vh-report.sh export ;;
-    07 | 7) run vh-plan.sh ;;
-    08 | 8) run vh-plan.sh --diff ;;
-    09 | 9) run vh-apply.sh ;;
-    10) run vh-rollback.sh ;;
-    11) run vh-rollback.sh --list ;;
-    12) run vh-guide.sh panel ;;
-    13) run vh-guide.sh openresty ;;
-    14) run vh-guide.sh vaultwarden ;;
-    15) run vh-guide.sh host ;;
-    16) run vh-watch.sh install ;;
-    17) run vh-watch.sh status ;;
-    18) run vh-watch.sh pause ;;
-    19) run vh-watch.sh resume ;;
-    20) run vh-watch.sh notify-test ;;
+    02 | 2) run vh-checkup.sh full ;;
+    03 | 3) run vh-ssh.sh status ;;
+    04 | 4) run vh-ssh.sh keys ;;
+    05 | 5) run vh-ssh.sh port ;;
+    06 | 6) run vh-ssh.sh 2fa-enable ;;
+    07 | 7) run vh-ssh.sh 2fa-manage ;;
+    08 | 8) run vh-ssh.sh logins ;;
+    09 | 9) run vh-checkup.sh ports ;;
+    10) run vh-checkup.sh docker ;;
+    11) run vh-fail2ban.sh setup ;;
+    12) run vh-fail2ban.sh manage ;;
+    13) run vh-vaultwarden.sh status ;;
+    14) run vh-vaultwarden.sh signups ;;
+    15) run vh-vaultwarden.sh admin ;;
+    16) run vh-vaultwarden.sh users ;;
+    17) run vh-vaultwarden.sh options ;;
+    18) run vh-system.sh auto-updates ;;
+    19) run vh-system.sh sysctl ;;
+    20) run vh-changes.sh menu ;;
     21) run vh-diagnose.sh ;;
-    22) run vh-watch.sh install --sync-only ;;
-    23) (cd "$VH_DIR/.." && git diff --quiet && git fetch -q origin main && git merge --ff-only origin/main) || log_warn "工作区不干净或无法快进，未更新" ;;
-    *) log_warn "无效选项：$c" ;;
+    22) update_source ;;
+    *) log_warn "无效选项：$c"; sleep 1 ;;
   esac
 done

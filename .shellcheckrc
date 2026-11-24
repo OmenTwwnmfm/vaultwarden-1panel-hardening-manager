@@ -2,4 +2,6 @@
 # SC2016：单引号中的 $ 是有意的（docker -f 模板、sed 表达式、测试桩脚本）
 # SC2119：vw_sensitive_paths 的参数可选，默认使用 VW_DATA_DIR
 # SC1091：/etc/os-release 只在目标主机存在
-disable=SC2016,SC2119,SC1091
+# SC2015：「A && B || { 失败处理 }」是有意的写法，失败分支只处理 A 或 B 失败
+# SC2012/SC2001：ls 只用于展示文件名、sed 用于逐行缩进，均为可读性选择
+disable=SC2016,SC2119,SC1091,SC2015,SC2012,SC2001
