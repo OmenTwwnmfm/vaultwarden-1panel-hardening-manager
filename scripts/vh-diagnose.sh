@@ -30,8 +30,20 @@ yn() { if "$@" >/dev/null 2>&1; then echo 是; else echo 否; fi; }
   echo "- drop-in 目录中的文件：$(ls "$(dirname "$SSHD_DROPIN")" 2>/dev/null | paste -sd' ')"
   echo
   echo "### 防火墙 / Fail2Ban"
-  echo "- 防火墙：$(fw_type)"
+  echo "- 防火墙：$(fw_label)"
+  echo "- 1Panel Docker 端口访问控制：$(docker_guard_on && echo 已启用 || echo 未检测到)"
   echo "- Fail2Ban：$(systemctl is-active fail2ban 2>/dev/null || echo 未安装) · jail：$([[ -f $F2B_JAIL ]] && echo "$F2B_JAIL" || echo 无)"
+  echo
+  echo "### 1Panel"
+  if panel_installed; then
+    echo "- 版本：$(panel_version || echo 未知)"
+    echo "- 服务：$(for u in $(panel_units); do printf '%s=%s ' "$u" "$(systemctl is-active "$u" 2>/dev/null)"; done)"
+    purl=$(panel_url)
+    echo "- 面板端口：$(panel_port_of "$purl") · 协议：${purl%%:*} · 安全入口：$([[ -n $(panel_entrance_of "$purl") ]] && echo 已设置 || echo 未设置)"
+    echo "- reset 子命令：$(1pctl reset 2>&1 | awk '/^  [a-z]+ /{ printf "%s ", $1 }')"
+  else
+    echo "- 未安装（找不到 1pctl）"
+  fi
   echo
   echo "### Vaultwarden"
   if load_instance 2>/dev/null; then

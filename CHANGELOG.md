@@ -4,7 +4,7 @@
 
 ## [0.2.0] - 2026-11-24
 
-**不兼容变更**：从「只审计、给指引」改为「VPS + Vaultwarden 加固工具」，菜单重新编号为 `[01]–[22]`，旧子命令全部移除。
+**不兼容变更**：从「只审计、给指引」改为「VPS + Vaultwarden 加固工具」，菜单重新编号为 `[01]–[26]`，旧子命令全部移除。
 
 ### Added
 - 新菜单：顶部状态面板（SSH 端口 / 2FA / 密码登录、防火墙、Fail2Ban、Vaultwarden 注册与后台），按 7 个大类分组，样式与 vbm 一致。
@@ -13,12 +13,13 @@
 - SSH 2FA：密钥 + 动态口令（`libpam-google-authenticator`），仅 root，不留 `nullok`；绑定时先校验一次口令并生成 5 个应急码；支持重新绑定、查看应急码、关闭。
 - 所有 SSH 修改带 5 分钟防锁死保护：`sshd -t` 与生效值校验，systemd 定时器到时未确认自动回滚，当前会话不断开。
 - Fail2Ban：安装、SSH 防护配置（`jail.d/vhm-sshd.local`，自动识别端口与日志后端，白名单默认填入当前 IP）、状态、封禁列表、解封。
-- `[09]` 端口与放行规则一览、`[10]` Docker 端口暴露检查（只读，修复在 1Panel 中取消「端口外部访问」）。
+- 防火墙交给 1Panel 管理：体检识别 1Panel 的 iptables / nftables 防火墙以及 ufw、firewalld，按「对所有 IP 开放 / 只对指定 IP 放行 / 被拦截」列出监听端口；Docker 端口暴露检查并入体检，检测到 1Panel v2 的 Docker 端口访问控制时降为提示。
+- 1Panel 面板（`[09]`–`[14]`，通过 `1pctl`，按 v2.5 实现）：面板状态、修改面板端口（检查占用与放行，可回滚）、修改用户名 / 密码、切换 IPv4 / IPv6 监听（可回滚）、启动 / 停止 / 重启、应急重置（安全入口、授权 IP、域名、HTTPS、两步验证、通行密钥，需输入项目名确认）。
 - Vaultwarden：状态总览、开关开放注册 / 邀请注册、后台 ADMIN（argon2id 哈希令牌或关闭）、用户列表（只读打开数据库）、安全选项（密码提示、Send、紧急访问、组织创建、图标服务）。设置写入数据目录的 `config.json`。
 - 修改 Vaultwarden 前自动调用 vbm 完整备份，本地校验、服务恢复、远端核验全部通过才继续；修改期间持有 vbm 锁避免定时备份介入；重启后健康检查失败自动恢复。
 - 系统加固：自动安全更新（unattended-upgrades）、内核网络参数（`/etc/sysctl.d/90-vhm-hardening.conf`）。
-- `[20]` 变更记录与回滚：每次修改前保存原文件，可按条回滚。
-- 测试：`test-change-rollback`、`test-vw-config`；`test-menu-interaction` 改为校验分发分支与子命令。
+- `[24]` 变更记录与回滚：每次修改前保存原文件，可按条回滚；可删除指定记录（支持多选和范围）、删除已回滚的记录、只保留最近 N 条，并显示占用空间。自动保留最近 50 条以及 90 天内的记录，防锁死保护中的记录不会被删除。
+- 测试：`test-change-rollback`、`test-change-prune`、`test-vw-config`；`test-menu-interaction` 改为校验分发分支与子命令。
 
 ### Removed
 - 审计 / 计划 / 应用 / 回滚快照流程、A–D 评级、JSON 报告、指引菜单、定时巡检与通知、`EXTERNAL_PROBE_URL`。

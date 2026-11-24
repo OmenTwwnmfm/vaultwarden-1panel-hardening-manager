@@ -56,7 +56,7 @@ setup() {
   change_track "$F2B_JAIL" || return 1
   install -d -m 755 "$(dirname "$F2B_JAIL")"
   cat >"$F2B_JAIL" <<EOF
-# 由 vhm 管理，可在 vhm [20] 中回滚
+# 由 vhm 管理，可在 vhm [24] 中回滚
 [sshd]
 enabled = true
 port = ${port:-22}
@@ -85,12 +85,12 @@ EOF
 
 manage() {
   title "Fail2Ban 状态"
-  command -v fail2ban-client >/dev/null 2>&1 || { log_warn "未安装 Fail2Ban，请先使用 [11]"; return 0; }
+  command -v fail2ban-client >/dev/null 2>&1 || { log_warn "未安装 Fail2Ban，请先使用 [15]"; return 0; }
   systemctl is-active --quiet fail2ban || { log_warn "Fail2Ban 未运行：systemctl status fail2ban"; return 0; }
   fail2ban-client status 2>/dev/null | sed 's/^/  /'
   echo
   if ! fail2ban-client status sshd >/dev/null 2>&1; then
-    log_warn "没有 sshd 防护，请使用 [11] 配置"
+    log_warn "没有 sshd 防护，请使用 [15] 配置"
     return 0
   fi
   fail2ban-client status sshd 2>/dev/null | sed 's/^/  /'

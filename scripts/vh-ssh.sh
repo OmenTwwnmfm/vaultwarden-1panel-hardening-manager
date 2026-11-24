@@ -35,7 +35,7 @@ dropin_del() {
 }
 dropin_add() {
   install -d -m 755 "$(dirname "$SSHD_DROPIN")"
-  [[ -f $SSHD_DROPIN ]] || printf '# 由 vhm 管理，请勿手动修改；可在 vhm [20] 中回滚\n' >"$SSHD_DROPIN"
+  [[ -f $SSHD_DROPIN ]] || printf '# 由 vhm 管理，请勿手动修改；可在 vhm [24] 中回滚\n' >"$SSHD_DROPIN"
   printf '%s %s\n' "$1" "$2" >>"$SSHD_DROPIN"
   chmod 600 "$SSHD_DROPIN"
 }
@@ -173,7 +173,7 @@ del_key() {
   change_track "$ROOT_KEYS" || return 1
   sed -i "${KEY_LINE[$i]}d" "$ROOT_KEYS"
   change_status applied
-  log_ok "已删除（可在 [20] 回滚）"
+  log_ok "已删除（可在 [24] 回滚）"
 }
 
 keys_menu() {
@@ -254,41 +254,11 @@ show_logins() {
     grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9a-f]*:[0-9a-f:]+:[0-9a-f]+' | sort | uniq -c | sort -rn | head -n 15 |
     awk '{ printf "  %6d 次  %s\n", $1, $2 }'
   echo
-  echo "提示：经常成功登录的固定 IP 可以加入 Fail2Ban 白名单（[11]）。"
+  echo "提示：经常成功登录的固定 IP 可以加入 Fail2Ban 白名单（[15]）。"
 }
 
 # ---------- 端口 ----------
-port_allowed() { # 0=已放行 1=未放行 2=无法判断
-  local p=$1
-  case $(fw_type) in
-    none) return 0 ;;
-    ufw) ufw status 2>/dev/null | grep -Eq "^$p(/tcp)?([[:space:]]|\(v6\)).*ALLOW" ;;
-    firewalld) firewall-cmd --list-ports 2>/dev/null | tr ' ' '\n' | grep -Eq "^$p/tcp$" ||
-      { [[ $p == 22 ]] && firewall-cmd --list-services 2>/dev/null | grep -qw ssh; } ;;
-    *) return 2 ;;
-  esac
-}
-
-wait_port_allowed() {
-  local p=$1 rc a
-  while true; do
-    rc=0
-    port_allowed "$p" || rc=$?
-    case $rc in
-      0) log_ok "防火墙已放行 $p/tcp"; return 0 ;;
-      2)
-        log_warn "当前防火墙是 $(fw_type)，无法自动判断 $p/tcp 是否已放行"
-        confirm_yes "确认已放行 $p/tcp？" && return 0
-        return 1
-        ;;
-    esac
-    log_warn "防火墙尚未放行 $p/tcp。请到 1Panel →「主机」→「防火墙」→「创建规则」，放行端口 $p，协议 TCP。"
-    echo "云服务器还要在服务商控制台的安全组里放行。"
-    read -r -p "放行后按 Enter 重新检查，输入 q 取消: " a || return 1
-    [[ $a == q || $a == Q ]] && return 1
-  done
-}
-
+# 防火墙放行检查（port_allowed / wait_port_allowed）在 vh-common.sh 中，与 1Panel 面板端口共用
 socket_sync_ports() { # Ubuntu 22.10+ 的 ssh.socket：没有 sshd-socket-generator 时由 vhm 写 ListenStream
   ssh_socket_used || return 0
   local g
@@ -344,7 +314,7 @@ change_port() {
   set_ports "$new" || { change_rollback "$CHG_ID"; return 1; }
   if [[ -f $F2B_JAIL ]]; then
     change_track "$F2B_JAIL" && sed -i -E "s/^port[[:space:]]*=.*/port = $new/" "$F2B_JAIL" && f2b_reload ||
-      log_warn "Fail2Ban 端口同步失败，请在 [11] 重新保存配置"
+      log_warn "Fail2Ban 端口同步失败，请在 [15] 重新保存配置"
   fi
   if ! ssh_reload; then
     log_err "关闭旧端口失败，正在回滚"

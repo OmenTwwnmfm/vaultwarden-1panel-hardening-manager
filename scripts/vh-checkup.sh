@@ -21,67 +21,52 @@ chk() { # chk ok|warn|bad 标题 说明 [建议]
 
 public_addr() { [[ $1 == 0.0.0.0 || $1 == '*' || $1 == '[::]' || $1 == :: || $1 == '' ]]; }
 
-# ---------- 端口与放行规则 ----------
-listen_table() {
-  title "监听端口"
-  command -v ss >/dev/null 2>&1 || { log_warn "未安装 ss（iproute2），无法列出端口"; return 0; }
-  printf '  %-5s %-28s %-8s %s\n' 协议 地址 范围 进程
-  ss -H -tulpn 2>/dev/null | awk '{ print $1, $5, $7 }' | sort -u -k2 | while read -r proto addr proc; do
-    local host=${addr%:*} scope
-    proc=$(sed -nE 's/.*\(\("([^"]+)".*/\1/p' <<<"$proc")
-    if [[ $host == 127.* || $host == '[::1]' || $host == *%lo ]]; then scope=本机; elif public_addr "$host"; then scope=所有地址; else scope=指定地址; fi
-    printf '  %-5s %-28s %-8s %s\n' "$proto" "$addr" "$scope" "${proc:--}"
-  done
-}
-
-fw_rules() {
-  title "防火墙放行规则"
-  local fw
-  fw=$(fw_type)
-  case $fw in
-    ufw)
-      ufw status verbose 2>/dev/null | sed -n '/^Default/p'
-      ufw status 2>/dev/null | sed -n '/^To/,$p' | sed 's/^/  /'
-      ;;
-    firewalld)
-      firewall-cmd --list-all 2>/dev/null | sed 's/^/  /'
-      ;;
-    nftables) nft list ruleset 2>/dev/null | grep -E 'hook input|dport|saddr' | sed 's/^[[:space:]]*/  /' | head -n 40 ;;
-    iptables) iptables -S INPUT 2>/dev/null | sed 's/^/  /' | head -n 40 ;;
-    none) echo "  未检测到启用的主机防火墙" ;;
-  esac
-  [[ -d /opt/1panel && $fw != none ]] && echo "  （端口规则请在 1Panel →「主机」→「防火墙」中修改）"
-}
-
+# ---------- 端口暴露 ----------
+# 防火墙规则由 1Panel 管理，这里只看「监听在所有地址上的端口」在防火墙中是否对所有 IP 放行
 check_ports() {
   title "端口暴露"
-  local fw proto addr host port proc pub=()
+  local fw proto addr host port proc open=() limited=() blocked=()
   fw=$(fw_type)
   if [[ $fw == none ]]; then
     chk bad "主机防火墙" "未启用，所有监听在所有地址上的端口都对公网开放" "在 1Panel →「主机」→「防火墙」启用，并只放行需要的端口"
   else
-    chk ok "主机防火墙" "$fw 已启用"
+    chk ok "主机防火墙" "$(fw_label "$fw") 已启用"
   fi
   command -v ss >/dev/null 2>&1 || return 0
   while read -r proto addr proc; do
     host=${addr%:*} port=${addr##*:}
     public_addr "$host" || continue
     proc=$(sed -nE 's/.*\(\("([^"]+)".*/\1/p' <<<"$proc")
-    pub+=("$port/${proto}(${proc:-?})")
-  done < <(ss -H -tulpn 2>/dev/null | awk '{ print $1, $5, $7 }' | sort -u)
-  if ((${#pub[@]})); then
-    chk warn "监听所有地址的端口" "$(printf '%s ' "${pub[@]}" | sort -u)" "逐个确认是否需要对外；不需要的改为只监听 127.0.0.1，或在防火墙中只放行指定 IP"
+    proto=${proto/tcp*/tcp} proto=${proto/udp*/udp}
+    case $(port_scope "$port" "$proto") in
+      all) open+=("$port/$proto(${proc:-?})") ;;
+      limited) limited+=("$port/$proto(${proc:-?})") ;;
+      none) blocked+=("$port/$proto") ;;
+      *) open+=("$port/$proto(${proc:-?})?") ;;
+    esac
+  done < <(ss -H -tulpn 2>/dev/null | awk '{ p = $5; sub(/.*:/, "", p); if (!seen[$1 FS p]++) print $1, $5, $7 }')
+  if ((${#open[@]})); then
+    chk warn "对所有 IP 开放的端口" "${open[*]}" "逐个确认是否需要对外；面板、数据库等管理端口建议在 1Panel 防火墙中只放行你的 IP（? 表示无法判断放行范围）"
   else
-    chk ok "监听所有地址的端口" "无"
+    chk ok "对所有 IP 开放的端口" "无"
   fi
+  ((${#limited[@]})) && chk ok "只对指定 IP 放行" "${limited[*]}"
+  ((${#blocked[@]})) && chk ok "监听但被防火墙拦截" "${blocked[*]}"
+  return 0
 }
 
 # ---------- Docker 暴露 ----------
+# Docker 发布的端口走 FORWARD 链，不经过 INPUT，所以 ufw / firewalld / 1Panel 的普通放行规则拦不住。
+# 1Panel v2 的 Docker 端口访问控制（nft_1panel_docker / 1PANEL_DOCKER）可以拦截，检测到时降为提示。
 check_docker() {
   title "Docker 端口暴露"
   command -v docker >/dev/null 2>&1 || { chk ok "Docker" "未安装"; return 0; }
-  local name binds b ip found=0 seen
+  local name binds b ip found=0 seen guard=0 level=bad
   ip=$(hostname -I 2>/dev/null | awk '{ print $1 }')
+  if docker_guard_on; then
+    guard=1 level=warn
+    echo "  已检测到 1Panel 的 Docker 端口访问控制，以下端口是否可达以 1Panel 中的规则为准。"
+  fi
   while IFS='|' read -r name binds; do
     seen=" "
     for b in $binds; do
@@ -95,11 +80,17 @@ check_docker() {
       found=1
       local proof=""
       if [[ -n $ip ]] && curl -s -o /dev/null -m 3 "http://$ip:$port/" 2>/dev/null; then proof="，本机通过 $ip:$port 实测可访问"; fi
-      chk bad "容器 $name" "端口 $port 发布在所有地址上$proof；Docker 会绕过 ufw/firewalld，防火墙拦不住" \
-        "在 1Panel →「容器」或「已安装应用」→ 参数中取消「端口外部访问」，改为只监听 127.0.0.1，由 OpenResty 反代"
+      if ((guard)); then
+        chk "$level" "容器 $name" "端口 $port 发布在所有地址上$proof" \
+          "不需要直接对外的，在 1Panel →「已安装应用」→ 参数中取消「端口外部访问」，由 OpenResty 反代"
+      else
+        chk "$level" "容器 $name" "端口 $port 发布在所有地址上$proof；Docker 会绕过主机防火墙，1Panel 防火墙里关掉也拦不住" \
+          "在 1Panel →「已安装应用」→ 参数中取消「端口外部访问」，改为只监听 127.0.0.1，由 OpenResty 反代"
+      fi
     done
   done < <(docker ps --format '{{.Names}}|{{.Ports}}' 2>/dev/null | sed 's/, / /g')
   ((found)) || chk ok "容器端口" "没有容器把端口发布在所有地址上"
+  return 0
 }
 
 # ---------- SSH ----------
@@ -135,11 +126,11 @@ check_ssh() {
 check_f2b() {
   title "Fail2Ban"
   if ! command -v fail2ban-client >/dev/null 2>&1; then
-    chk warn "Fail2Ban" "未安装" "在 [11] 安装并配置 SSH 防护"
+    chk warn "Fail2Ban" "未安装" "在 [15] 安装并配置 SSH 防护"
   elif ! systemctl is-active --quiet fail2ban; then
-    chk bad "Fail2Ban" "已安装但未运行" "systemctl enable --now fail2ban，或在 [11] 重新配置"
+    chk bad "Fail2Ban" "已安装但未运行" "systemctl enable --now fail2ban，或在 [15] 重新配置"
   elif ! fail2ban-client status sshd >/dev/null 2>&1; then
-    chk warn "Fail2Ban" "运行中，但没有 sshd 防护" "在 [11] 配置"
+    chk warn "Fail2Ban" "运行中，但没有 sshd 防护" "在 [15] 配置"
   else
     chk ok "Fail2Ban" "sshd 防护运行中，当前封禁 $(f2b_banned) 个 IP"
   fi
@@ -156,7 +147,7 @@ check_system() {
   if [[ $(apt-config dump 2>/dev/null | sed -nE 's/^APT::Periodic::Unattended-Upgrade "([0-9]+)";/\1/p') =~ ^[1-9] ]] && systemctl is-enabled --quiet unattended-upgrades 2>/dev/null; then
     chk ok "自动安全更新" "已启用"
   else
-    chk warn "自动安全更新" "未启用" "在 [18] 启用"
+    chk warn "自动安全更新" "未启用" "在 [22] 启用"
   fi
   local bad=() k want v
   for k in net.ipv4.tcp_syncookies=1 net.ipv4.conf.all.rp_filter=1 net.ipv4.conf.all.accept_redirects=0 net.ipv4.conf.all.send_redirects=0 net.ipv4.conf.all.accept_source_route=0; do
@@ -165,28 +156,32 @@ check_system() {
     [[ $k == *rp_filter && $v == 2 ]] && continue
     [[ $v == "$want" ]] || bad+=("$k=$v")
   done
-  if ((${#bad[@]})); then chk warn "内核网络参数" "${bad[*]}" "在 [19] 加固"; else chk ok "内核网络参数" "已加固"; fi
+  if ((${#bad[@]})); then chk warn "内核网络参数" "${bad[*]}" "在 [23] 加固"; else chk ok "内核网络参数" "已加固"; fi
   if [[ -f /var/run/reboot-required ]]; then chk warn "重启" "有更新需要重启才能生效" "择机重启 VPS"; fi
 }
 
 # ---------- 1Panel ----------
 check_panel() {
-  [[ -d /opt/1panel ]] || command -v 1pctl >/dev/null 2>&1 || return 0
+  panel_installed || return 0
   title "1Panel 面板"
-  local info port entrance
-  info=$(1pctl user-info 2>/dev/null || true)
-  if [[ -z $info ]]; then
+  local url port entrance
+  url=$(panel_url)
+  if [[ -z $url ]]; then
     chk warn "1Panel" "无法读取 1pctl user-info" "确认 1pctl 可用"
     return 0
   fi
-  port=$(sed -nE 's/.*(端口|port)[^0-9]*([0-9]+).*/\2/Ip' <<<"$info" | head -n1)
-  entrance=$(sed -nE 's/.*(安全入口|entrance)[:：][[:space:]]*(.*)/\2/Ip' <<<"$info" | head -n1)
-  if [[ -n $port ]] && ss -ltnH 2>/dev/null | awk '{ print $4 }' | grep -Eq "^(0\.0\.0\.0|\*|\[::\]):$port$"; then
-    chk warn "面板端口" "$port 监听所有地址" "在 1Panel 防火墙中只对你的 IP 放行面板端口"
-  else
-    chk ok "面板端口" "${port:-?}"
-  fi
+  port=$(panel_port_of "$url")
+  entrance=$(panel_entrance_of "$url")
+  if panel_active; then chk ok "面板服务" "运行中（$(panel_version || echo 版本未知)）"; else chk warn "面板服务" "未运行" "在 [13] 启动"; fi
+  case $(port_scope "${port:-0}") in
+    all) chk warn "面板端口" "$port 对所有 IP 放行" "在 1Panel 防火墙中只放行你的 IP，或在「面板设置」→「安全」设置授权 IP" ;;
+    limited) chk ok "面板端口" "$port 只对指定 IP 放行" ;;
+    none) chk ok "面板端口" "$port（防火墙中没有单独的放行规则）" ;;
+    *) chk ok "面板端口" "${port:-?}" ;;
+  esac
+  [[ $port == 10086 || $port == 8888 ]] && chk warn "面板端口" "$port 是常见默认端口" "在 [10] 修改"
   if [[ -z $entrance ]]; then chk bad "安全入口" "未设置" "1Panel →「面板设置」→「安全」设置安全入口"; else chk ok "安全入口" "已设置"; fi
+  if [[ $url == https://* ]]; then chk ok "面板 HTTPS" "已启用"; else chk warn "面板 HTTPS" "未启用，登录密码以明文传输" "1Panel →「面板设置」→「安全」启用面板 SSL"; fi
   echo "  两步验证（MFA）无法自动读取，请在 1Panel →「面板设置」→「安全」确认已开启。"
 }
 
@@ -200,12 +195,12 @@ check_vw() {
   echo "  实例：$VW_CONTAINER（$VW_DATA_DIR）"
   local sig domain
   sig=$(vw_eff signups_allowed SIGNUPS_ALLOWED true)
-  if [[ $sig == false ]]; then chk ok "开放注册" "已关闭"; else chk bad "开放注册" "已开启，任何人都能注册" "在 [14] 关闭"; fi
+  if [[ $sig == false ]]; then chk ok "开放注册" "已关闭"; else chk bad "开放注册" "已开启，任何人都能注册" "在 [18] 关闭"; fi
   case $(vw_admin_state) in
     off) chk ok "后台 /admin" "已关闭" ;;
-    argon2) chk warn "后台 /admin" "已开启（argon2 哈希令牌）" "不用时在 [15] 关闭，或在 OpenResty 中限制 /admin 的来源 IP" ;;
-    plain) chk bad "后台 /admin" "已开启，令牌为明文保存" "在 [15] 更换为 argon2 哈希令牌" ;;
-    notoken) chk bad "后台 /admin" "免令牌访问（DISABLE_ADMIN_TOKEN=true）" "在 [15] 关闭或设置令牌" ;;
+    argon2) chk warn "后台 /admin" "已开启（argon2 哈希令牌）" "不用时在 [19] 关闭，或在 OpenResty 中限制 /admin 的来源 IP" ;;
+    plain) chk bad "后台 /admin" "已开启，令牌为明文保存" "在 [19] 更换为 argon2 哈希令牌" ;;
+    notoken) chk bad "后台 /admin" "免令牌访问（DISABLE_ADMIN_TOKEN=true）" "在 [19] 关闭或设置令牌" ;;
   esac
   domain=$(vw_eff domain DOMAIN "")
   if [[ $domain == https://* ]]; then chk ok "DOMAIN" "$domain"; else chk bad "DOMAIN" "${domain:-未设置}（非 https）" "1Panel 网站中为该域名启用 HTTPS，并在应用参数中设置 https:// 域名"; fi
@@ -247,11 +242,7 @@ case ${1:-full} in
     check_vw
     summary
     ;;
-  ports)
-    listen_table
-    fw_rules
-    check_ports
-    ;;
+  ports) check_ports ;;
   docker) check_docker ;;
   *) die "未知参数：$1" ;;
 esac

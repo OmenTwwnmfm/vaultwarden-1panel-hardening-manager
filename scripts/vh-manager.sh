@@ -27,7 +27,12 @@ first_setup() {
     kv_set "$VH_CONF" VW_DATA_DIR "$VW_DATA_DIR" && kv_set "$VH_CONF" VW_CONTAINER "$VW_CONTAINER"
     log_ok "实例：$VW_CONTAINER  数据目录：$VW_DATA_DIR"
   else
-    log_warn "未能确定 Vaultwarden 实例；SSH、Fail2Ban、体检等功能不受影响"
+    log_warn "未能确定 Vaultwarden 实例；SSH、1Panel、Fail2Ban、体检等功能不受影响"
+  fi
+  if panel_installed; then
+    log_ok "已检测到 1Panel $(panel_version || true)；防火墙：$(fw_label)"
+  else
+    log_warn "未检测到 1pctl，1Panel 面板相关功能不可用"
   fi
   if vbm_installed; then
     log_ok "已检测到 vbm：修改 Vaultwarden 设置前会自动调用它做完整备份"
@@ -66,19 +71,22 @@ update_source() {
 
 # 状态面板：每项都容错，读不到就显示「未知」
 status_args() {
-  local port tfa pa fw f2b vw="未识别"
+  local port tfa pa f2b vw="未识别" panel="未安装"
   port=$(sshd_get port 2>/dev/null | head -n1)
   if tfa_enabled 2>/dev/null; then tfa="已启用"; else tfa="未启用"; fi
   pa=$(sshd_get passwordauthentication 2>/dev/null)
   case $pa in yes) pa="开" ;; no) pa="关" ;; *) pa="未知" ;; esac
-  fw=$(fw_type 2>/dev/null)
-  [[ $fw == none ]] && fw="未启用" || fw="$fw 已启用"
   if systemctl is-active --quiet fail2ban 2>/dev/null; then
     f2b="运行中（封禁 $(f2b_banned || echo ?)）"
   elif command -v fail2ban-client >/dev/null 2>&1; then
     f2b="未运行"
   else
     f2b="未安装"
+  fi
+  if panel_installed; then
+    local pp
+    pp=$(panel_port_of "$(panel_url)")
+    if panel_active; then panel="运行中 · 端口 ${pp:-?}"; else panel="未运行"; fi
   fi
   if load_instance >/dev/null 2>&1; then
     local sig adm
@@ -93,7 +101,7 @@ status_args() {
     vw="$sig · $adm"
   fi
   printf '%s\n' "$VH_VERSION" "SSH 端口：${port:-未知} · 2FA：$tfa · 密码登录：$pa" \
-    "防火墙：$fw · Fail2Ban：$f2b" "Vaultwarden：$vw"
+    "1Panel：$panel · 防火墙：$(fw_label)" "Fail2Ban：$f2b · Vaultwarden：$vw"
 }
 
 render_menu() {
@@ -136,7 +144,7 @@ sep()
 sections = [
     ("01 · 快速操作", [
         "[01] 首次配置 / 识别 Vaultwarden 实例",
-        "[02] VPS 安全体检"]),
+        "[02] VPS 安全体检（含 Docker 端口暴露）"]),
     ("02 · SSH 登录安全", [
         "[03] SSH 状态（端口、登录方式、2FA、当前会话）",
         "[04] 管理登录密钥（列出 / 添加 / 删除）",
@@ -144,25 +152,29 @@ sections = [
         "[06] 安装 / 启用 2FA（密钥 + 动态口令）",
         "[07] 2FA 管理（重新绑定 / 应急码 / 关闭）",
         "[08] 登录记录（成功、失败、来源 IP）"]),
-    ("03 · 防火墙与端口（只读）", [
-        "[09] 端口与放行规则一览",
-        "[10] Docker 端口暴露检查"]),
+    ("03 · 1Panel 面板", [
+        "[09] 面板状态（版本、端口、安全入口、放行范围）",
+        "[10] 修改面板端口",
+        "[11] 修改面板用户名 / 密码",
+        "[12] 切换监听地址（IPv4 / IPv6）",
+        "[13] 启动 / 停止 / 重启 1Panel",
+        "[14] 应急重置（安全入口、授权 IP、两步验证等）"]),
     ("04 · Fail2Ban", [
-        "[11] 安装 / 修改 SSH 防护配置",
-        "[12] 状态、封禁列表、解封 IP"]),
+        "[15] 安装 / 修改 SSH 防护配置",
+        "[16] 状态、封禁列表、解封 IP"]),
     ("05 · Vaultwarden", [
-        "[13] 状态总览（注册、邀请、后台、版本）",
-        "[14] 开启 / 关闭注册",
-        "[15] 后台 ADMIN（开启 / 更换令牌 / 关闭）",
-        "[16] 用户列表",
-        "[17] 安全选项（密码提示、Send、紧急访问等）"]),
+        "[17] 状态总览（注册、邀请、后台、版本）",
+        "[18] 开启 / 关闭注册",
+        "[19] 后台 ADMIN（开启 / 更换令牌 / 关闭）",
+        "[20] 用户列表",
+        "[21] 安全选项（密码提示、Send、紧急访问等）"]),
     ("06 · 系统加固", [
-        "[18] 自动安全更新",
-        "[19] 内核网络参数加固"]),
+        "[22] 自动安全更新",
+        "[23] 内核网络参数加固"]),
     ("07 · 系统维护", [
-        "[20] 变更记录与回滚",
-        "[21] 生成脱敏诊断报告",
-        "[22] 检查 / 更新项目源码"]),
+        "[24] 变更记录与回滚（含删除记录）",
+        "[25] 生成脱敏诊断报告",
+        "[26] 检查 / 更新项目源码"]),
 ]
 for title, items in sections:
     row(title)
@@ -188,20 +200,24 @@ while true; do
     06 | 6) run vh-ssh.sh 2fa-enable ;;
     07 | 7) run vh-ssh.sh 2fa-manage ;;
     08 | 8) run vh-ssh.sh logins ;;
-    09 | 9) run vh-checkup.sh ports ;;
-    10) run vh-checkup.sh docker ;;
-    11) run vh-fail2ban.sh setup ;;
-    12) run vh-fail2ban.sh manage ;;
-    13) run vh-vaultwarden.sh status ;;
-    14) run vh-vaultwarden.sh signups ;;
-    15) run vh-vaultwarden.sh admin ;;
-    16) run vh-vaultwarden.sh users ;;
-    17) run vh-vaultwarden.sh options ;;
-    18) run vh-system.sh auto-updates ;;
-    19) run vh-system.sh sysctl ;;
-    20) run vh-changes.sh menu ;;
-    21) run vh-diagnose.sh ;;
-    22) update_source ;;
+    09 | 9) run vh-panel.sh status ;;
+    10) run vh-panel.sh port ;;
+    11) run vh-panel.sh account ;;
+    12) run vh-panel.sh listen ;;
+    13) run vh-panel.sh service ;;
+    14) run vh-panel.sh reset ;;
+    15) run vh-fail2ban.sh setup ;;
+    16) run vh-fail2ban.sh manage ;;
+    17) run vh-vaultwarden.sh status ;;
+    18) run vh-vaultwarden.sh signups ;;
+    19) run vh-vaultwarden.sh admin ;;
+    20) run vh-vaultwarden.sh users ;;
+    21) run vh-vaultwarden.sh options ;;
+    22) run vh-system.sh auto-updates ;;
+    23) run vh-system.sh sysctl ;;
+    24) run vh-changes.sh menu ;;
+    25) run vh-diagnose.sh ;;
+    26) update_source ;;
     *) log_warn "无效选项：$c"; sleep 1 ;;
   esac
 done

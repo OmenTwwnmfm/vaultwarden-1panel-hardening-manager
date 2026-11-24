@@ -314,7 +314,7 @@ vbm_installed() { [[ -f "$VBM_CONF" && -f "$VBM_WORKER" ]]; }
 vbm_backup_before_change() {
   if ! vbm_installed; then
     log_warn "未检测到 vbm（$VBM_WORKER），修改前无法做完整备份。"
-    echo "vhm 仍会保存修改前的 config.json，可在菜单 [20] 回滚。"
+    echo "vhm 仍会保存修改前的 config.json，可在菜单 [24] 回滚。"
     confirm_yes "在没有完整备份的情况下继续修改？" || return 1
     return 0
   fi
@@ -364,7 +364,7 @@ vw_apply() {
   if ((rc == 0)) && ! printf '%s\n' "$updates" | vw_config_write; then rc=1; fi
   if ((rc == 0)) && vw_restart_check; then
     change_status applied
-    log_ok "$desc：已生效（变更 $CHG_ID，可在 [20] 回滚）"
+    log_ok "$desc：已生效（变更 $CHG_ID，可在 [24] 回滚）"
   else
     log_err "$desc 失败，正在恢复原配置……"
     change_restore_files "$CHG_DIR"
@@ -381,6 +381,7 @@ vw_apply() {
 #   meta（ID/TIME/DESC/HOOKS）、status（pending/applied/rolled_back）
 #   files.tsv（序号、修改前是否存在、权限、属主、路径），files/<序号> 为原文件副本
 change_begin() { # change_begin 描述 [回滚钩子...]
+  change_prune
   CHG_ID="$(date '+%Y%m%d-%H%M%S')-$$"
   # 同一进程同一秒内多次修改（如连续添加密钥）时避免记录目录重名
   while [[ -e "$VH_CHANGES/$CHG_ID" ]]; do
@@ -433,6 +434,59 @@ change_restore_files() { # change_restore_files 记录目录
 
 change_meta() { sed -n "s/^$2=//p" "$VH_CHANGES/$1/meta" 2>/dev/null; } # change_meta ID KEY
 
+# ---------- 变更记录清理 ----------
+# 自动保留：最近 CHANGES_KEEP 条 + 最近 CHANGES_KEEP_DAYS 天内的全部记录，其余在下次修改前自动删除。
+# 正在防锁死保护中、或一小时内创建且未完成的记录永远不会被删除。
+CHANGES_KEEP=${CHANGES_KEEP:-50}
+CHANGES_KEEP_DAYS=${CHANGES_KEEP_DAYS:-90}
+
+change_ids() { # 从新到旧
+  find "$VH_CHANGES" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null |
+    grep -E '^[0-9]{8}-[0-9]{6}-[0-9]+$' | sort -r
+}
+
+change_protected() { # 0=受保护（不能删）
+  local id=$1 d="$VH_CHANGES/$1"
+  systemctl is-active --quiet "vhm-guard-$id.timer" 2>/dev/null && return 0
+  [[ $(cat "$d/status" 2>/dev/null) == pending && -n $(find "$d" -maxdepth 0 -mmin -60 2>/dev/null) ]] && return 0
+  return 1
+}
+
+change_delete() {
+  local id=$1
+  [[ $id =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ && -d $VH_CHANGES/$id ]] || return 1
+  change_protected "$id" && return 1
+  rm -rf -- "${VH_CHANGES:?}/$id"
+}
+
+change_prune() {
+  local cutoff n=0 id
+  [[ -d $VH_CHANGES ]] || return 0
+  cutoff=$(date -d "-$CHANGES_KEEP_DAYS days" '+%Y%m%d' 2>/dev/null) || return 0
+  while IFS= read -r id; do
+    n=$((n + 1))
+    ((n <= CHANGES_KEEP)) && continue
+    [[ ${id:0:8} > "$cutoff" || ${id:0:8} == "$cutoff" ]] && continue
+    change_delete "$id" || true
+  done < <(change_ids)
+  return 0
+}
+
+# 1Panel 面板变更的回滚：记录目录中的 panel.prev 保存修改前的端口与监听方式
+panel_restore() {
+  local d=$1 port listen cur
+  [[ -f $d/panel.prev ]] || return 0
+  port=$(conf_get PORT "$d/panel.prev" || true)
+  listen=$(conf_get LISTEN "$d/panel.prev" || true)
+  if [[ -n $listen ]]; then
+    panel_listen "$listen" >/dev/null || return 1
+  fi
+  if [[ -n $port ]]; then
+    cur=$(panel_port_of "$(panel_url)")
+    [[ $cur == "$port" ]] || panel_set_port "$port" >/dev/null || return 1
+  fi
+}
+
 run_hooks() { # run_hooks 记录目录 钩子...
   local d=$1 h rc=0
   shift
@@ -442,6 +496,7 @@ run_hooks() { # run_hooks 记录目录 钩子...
       fail2ban) f2b_reload || rc=1 ;;
       sysctl) sysctl_restore "$d" || rc=1 ;;
       vw) vw_restart_check || rc=1 ;;
+      panel) panel_restore "$d" || rc=1 ;;
     esac
   done
   return $rc
@@ -528,18 +583,142 @@ tfa_pam_on() { grep -Eq '^[[:space:]]*auth[[:space:]]+required[[:space:]]+pam_go
 tfa_enabled() { tfa_pam_on && sshd_get authenticationmethods | grep -q 'publickey,keyboard-interactive'; }
 
 # ---------- 防火墙 / Fail2Ban / sysctl ----------
+# 防火墙规则由 1Panel 管理，vhm 只读识别。1Panel（iptables）使用 1PANEL_BASIC_BEFORE / 1PANEL_BASIC /
+# 1PANEL_BASIC_AFTER 三条链挂在 INPUT 上，放行规则在 1PANEL_BASIC，末尾链默认丢弃其余 TCP/UDP。
 fw_type() {
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
     echo ufw
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     echo firewalld
+  elif command -v iptables >/dev/null 2>&1 && iptables -w -S INPUT 2>/dev/null | grep -q -- '-j 1PANEL_BASIC'; then
+    echo 1panel-iptables
+  elif command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -qi '1panel'; then
+    echo 1panel-nftables
   elif command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -Eq 'hook input .*policy drop'; then
     echo nftables
-  elif command -v iptables >/dev/null 2>&1 && iptables -S INPUT 2>/dev/null | grep -q '^-P INPUT DROP'; then
+  elif command -v iptables >/dev/null 2>&1 && iptables -w -S INPUT 2>/dev/null | grep -q '^-P INPUT DROP'; then
     echo iptables
   else
     echo none
   fi
+}
+
+# shellcheck disable=SC2120 # 参数可选，默认读取当前防火墙类型
+fw_label() {
+  case ${1:-$(fw_type)} in
+    1panel-iptables) echo "1Panel（iptables）" ;;
+    1panel-nftables) echo "1Panel（nftables）" ;;
+    none) echo "未启用" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# port_scope 端口 [tcp|udp]：主机防火墙对该端口的放行范围
+# 输出 all（所有 IP）/ limited（仅指定 IP）/ none（未放行）/ unknown（无法判断）
+port_scope() {
+  local p=$1 proto=${2:-tcp} rules
+  case $(fw_type) in
+    none) echo all ;;
+    ufw)
+      rules=$(ufw status 2>/dev/null | grep -E "^$p(/$proto)?[[:space:]]" | grep ALLOW || true)
+      if [[ -z $rules ]]; then echo none; elif grep -q 'ALLOW.*Anywhere' <<<"$rules"; then echo all; else echo limited; fi
+      ;;
+    firewalld)
+      if firewall-cmd --list-ports 2>/dev/null | tr ' ' '\n' | grep -qx "$p/$proto"; then
+        echo all
+      elif [[ $p == 22 && $proto == tcp ]] && firewall-cmd --list-services 2>/dev/null | grep -qw ssh; then
+        echo all
+      elif firewall-cmd --list-rich-rules 2>/dev/null | grep -q "port=\"$p\" protocol=\"$proto\""; then
+        echo limited
+      else
+        echo none
+      fi
+      ;;
+    1panel-iptables)
+      rules=$(iptables -w -S 1PANEL_BASIC 2>/dev/null | grep -E -- "-p $proto .*--dports? ([0-9,]*,)?$p(,| |$)" | grep -- '-j ACCEPT' || true)
+      if [[ -z $rules ]]; then echo none; elif grep -qv -- ' -s ' <<<"$rules"; then echo all; else echo limited; fi
+      ;;
+    *) echo unknown ;;
+  esac
+}
+
+port_allowed() { # 0=已放行 1=未放行 2=无法判断
+  case $(port_scope "$1" "${2:-tcp}") in
+    all | limited) return 0 ;;
+    none) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+# 修改端口前确认防火墙已放行；未放行时提示到 1Panel 放行
+wait_port_allowed() {
+  local p=$1 rc a
+  while true; do
+    rc=0
+    port_allowed "$p" || rc=$?
+    case $rc in
+      0) log_ok "防火墙已放行 $p/tcp"; return 0 ;;
+      2)
+        log_warn "当前防火墙是 $(fw_label)，无法自动判断 $p/tcp 是否已放行"
+        confirm_yes "确认已放行 $p/tcp？" && return 0
+        return 1
+        ;;
+    esac
+    log_warn "防火墙尚未放行 $p/tcp。请到 1Panel →「主机」→「防火墙」→「创建规则」，放行端口 $p，协议 TCP。"
+    echo "云服务器还要在服务商控制台的安全组里放行。"
+    read -r -p "放行后按 Enter 重新检查；输入 y 跳过检查（已用端口范围放行时）；输入 q 取消: " a || return 1
+    case $a in
+      q | Q) return 1 ;;
+      y | Y) return 0 ;;
+    esac
+  done
+}
+
+# 1Panel v2 的 Docker 端口访问控制（docker_guard）：nftables 表 nft_1panel_docker 或 iptables 链 1PANEL_DOCKER*
+docker_guard_on() {
+  { command -v nft >/dev/null 2>&1 && nft list tables 2>/dev/null | grep -q nft_1panel_docker; } ||
+    { command -v iptables >/dev/null 2>&1 && iptables -w -S 2>/dev/null | grep -q '1PANEL_DOCKER'; }
+}
+
+# ---------- 1Panel ----------
+panel_installed() { command -v 1pctl >/dev/null 2>&1; }
+panel_version() { timeout 20 1pctl version 2>/dev/null | grep -Eo 'v[0-9]+\.[0-9]+\.[0-9]+[^[:space:]]*' | head -n1; }
+panel_units() { # v2 为 1panel-core / 1panel-agent，v1 为 1panel
+  local u
+  for u in 1panel-core 1panel-agent 1panel; do
+    systemctl cat "$u.service" >/dev/null 2>&1 && echo "$u"
+  done
+  return 0
+}
+panel_active() {
+  local u
+  u=$(panel_units | head -n1)
+  [[ -n $u ]] && systemctl is-active --quiet "$u"
+}
+panel_url() { timeout 20 1pctl user-info 2>/dev/null | grep -Eo 'https?://[^[:space:]]+' | head -n1; }
+panel_port_of() { sed -nE 's#^https?://[^/]*:([0-9]+)(/.*)?$#\1#p' <<<"$1"; }
+panel_entrance_of() { sed -nE 's#^https?://[^/]*:[0-9]+/?([^[:space:]]*)$#\1#p' <<<"$1"; }
+panel_wait_port() { # 最多等待 40 秒，直到端口在监听
+  local i
+  for ((i = 0; i < 40; i++)); do
+    [[ -n $(ss -ltnH "sport = :$1" 2>/dev/null) ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+panel_set_port() { # 1pctl update port 从标准输入读取新端口，修改后自动重启面板
+  printf '%s\n' "$1" | timeout 90 1pctl update port || return 1
+  panel_wait_port "$1"
+}
+panel_restart_core() {
+  local u
+  u=$(panel_units | head -n1)
+  [[ -n $u ]] || return 1
+  systemctl restart "$u"
+}
+panel_listen() { # ipv4 | ipv6
+  [[ $1 == ipv4 || $1 == ipv6 ]] || return 1
+  timeout 60 1pctl listen-ip "$1" && panel_restart_core
 }
 
 f2b_reload() {

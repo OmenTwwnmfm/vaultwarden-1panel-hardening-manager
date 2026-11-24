@@ -15,7 +15,7 @@ check_deps() {
   command -v ss >/dev/null 2>&1 || log_warn "未检测到 ss（iproute2），端口检查不可用"
   command -v systemd-run >/dev/null 2>&1 || log_warn "未检测到 systemd-run，SSH 相关修改无法启用防锁死保护，将被拒绝"
   command -v curl >/dev/null 2>&1 || log_warn "未检测到 curl，Docker 端口实测不可用"
-  command -v git >/dev/null 2>&1 || log_warn "未检测到 git，[22] 源码更新不可用"
+  command -v git >/dev/null 2>&1 || log_warn "未检测到 git，[26] 源码更新不可用"
   if ((${#missing[@]})); then
     log_err "缺少依赖：${missing[*]}"
     echo "  Debian/Ubuntu: apt-get install -y util-linux coreutils python3 openssh-server openssh-client iproute2 curl" >&2
@@ -31,7 +31,8 @@ vhm $VH_VERSION — VPS & Vaultwarden (1Panel) 加固管理器
 用法: sudo vhm [子命令]
   （无参数）            进入交互菜单
   checkup              VPS 安全体检（只读）
-  ports                端口与放行规则一览（只读）
+  ports                端口暴露检查（只读）
+  panel-status         1Panel 面板状态（只读）
   ssh-status           SSH 状态（只读）
   vw-status            Vaultwarden 状态（只读）
   vw-users             Vaultwarden 用户列表（只读）
@@ -56,6 +57,7 @@ case "${1:-menu}" in
     ;;
   checkup) need_root; exec bash "$VH_DIR/vh-checkup.sh" full ;;
   ports) need_root; exec bash "$VH_DIR/vh-checkup.sh" ports ;;
+  panel-status) need_root; exec bash "$VH_DIR/vh-panel.sh" status ;;
   ssh-status) need_root; exec bash "$VH_DIR/vh-ssh.sh" status ;;
   vw-status) need_root; exec bash "$VH_DIR/vh-vaultwarden.sh" status ;;
   vw-users) need_root; exec bash "$VH_DIR/vh-vaultwarden.sh" users ;;
