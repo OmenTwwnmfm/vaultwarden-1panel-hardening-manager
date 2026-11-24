@@ -51,6 +51,12 @@ show_status() {
     echo "  面板用户："
     timeout 20 1pctl user-list 2>/dev/null | sed 's/^/    /'
   fi
+  if [[ $(fw_type) == 1panel-iptables ]]; then
+    echo
+    echo "  1Panel 防火墙端口规则（只读，修改请到 1Panel →「主机」→「防火墙」）："
+    printf '  %-6s %-5s %-14s %s\n' 动作 协议 端口 来源
+    panel_fw_rules || echo "  （读取失败）"
+  fi
   echo
   echo "两步验证、授权 IP、访问域名等更多设置请在 1Panel →「面板设置」→「安全」中查看。"
 }

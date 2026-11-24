@@ -640,7 +640,63 @@ sshd_eff() {
   [[ -n $out ]] && printf '%s\n' "$out"
 }
 sshd_eff_err() { mkdir -p /run/sshd 2>/dev/null; "$SSHD_BIN" -T 2>&1 >/dev/null | tail -n 3; }
-sshd_get() { sshd_eff | awk -v k="$1" '$1 == k { $1 = ""; sub(/^ /, ""); print }'; }
+
+# sshd -T 失败时，直接解析配置文件得到同样格式的「键 值」行（含 Include，遇到 Match 停止，未设置的用 OpenSSH 默认值）。
+# 只用于显示和判断状态；修改 SSH 时的生效值校验仍然只认 sshd -T。
+sshd_conf_view() {
+  python3 - "$SSHD_CONFIG" <<'PY'
+import glob, os, re, sys
+defaults = {"passwordauthentication": "yes", "pubkeyauthentication": "yes", "permitrootlogin": "prohibit-password",
+            "kbdinteractiveauthentication": "yes", "usepam": "no", "authenticationmethods": "any"}
+alias = {"challengeresponseauthentication": "kbdinteractiveauthentication"}
+vals, ports = {}, []
+def walk(path, depth=0):
+    if depth > 8:
+        return
+    try:
+        lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        s = line.split("#", 1)[0].strip()
+        if not s:
+            continue
+        parts = re.split(r"[\s=]+", s, maxsplit=1)
+        k = alias.get(parts[0].lower(), parts[0].lower())
+        v = parts[1].strip() if len(parts) > 1 else ""
+        if k == "match":
+            return
+        if k == "include":
+            for pat in v.split():
+                if not os.path.isabs(pat):
+                    pat = os.path.join("/etc/ssh", pat)
+                for f in sorted(glob.glob(pat)):
+                    walk(f, depth + 1)
+        elif k == "port":
+            ports.append(v)
+        elif k in defaults:
+            vals.setdefault(k, v.lower())  # sshd 对同一配置项取第一个值
+walk(sys.argv[1])
+for p in ports or ["22"]:
+    print("port", p)
+for k, d in defaults.items():
+    print(k, vals.get(k, d))
+PY
+}
+
+# 显示用的生效配置：sshd -T 优先，失败时退回解析配置文件
+sshd_view() {
+  local out
+  out=$(sshd_eff) || out=""
+  [[ -n $out ]] || out=$(sshd_conf_view 2>/dev/null) || out=""
+  [[ -n $out ]] && printf '%s\n' "$out"
+}
+sshd_view_src() { if [[ -n $(sshd_eff) ]]; then echo "sshd -T"; else echo "配置文件（sshd -T 失败）"; fi; }
+sshd_get() {
+  local out
+  out=$(sshd_view) || out=""
+  awk -v k="$1" '$1 == k { $1 = ""; sub(/^ /, ""); print }' <<<"$out"
+}
 ssh_service() { if systemctl cat ssh.service >/dev/null 2>&1; then echo ssh; else echo sshd; fi; }
 ssh_socket_used() { systemctl is-enabled --quiet ssh.socket 2>/dev/null || systemctl is-active --quiet ssh.socket 2>/dev/null; }
 
@@ -758,6 +814,24 @@ wait_port_allowed() {
 docker_guard_on() {
   { command -v nft >/dev/null 2>&1 && out_match nft_1panel_docker nft list tables; } ||
     { command -v iptables >/dev/null 2>&1 && out_match 1PANEL_DOCKER iptables -w -S; }
+}
+
+# 只读列出 1Panel（iptables）防火墙中 1PANEL_BASIC 链的端口规则：动作 协议 端口 来源
+panel_fw_rules() {
+  local out
+  out=$(iptables -w -S 1PANEL_BASIC 2>/dev/null) || return 1
+  awk '$1 == "-A" {
+    act = "?"; proto = "all"; port = "-"; src = "所有 IP"
+    for (i = 3; i <= NF; i++) {
+      if ($i == "-j") act = $(i + 1)
+      else if ($i == "-p") proto = $(i + 1)
+      else if ($i == "--dport" || $i == "--dports") port = $(i + 1)
+      else if ($i == "-s") src = $(i + 1)
+    }
+    sub(/\/32$/, "", src)
+    if (act == "ACCEPT") act = "允许"; else if (act == "DROP" || act == "REJECT") act = "拒绝"
+    printf "  %-6s %-5s %-14s %s\n", act, proto, port, src
+  }' <<<"$out"
 }
 
 # ---------- 1Panel ----------

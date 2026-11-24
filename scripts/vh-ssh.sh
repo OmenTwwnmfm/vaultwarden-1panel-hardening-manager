@@ -121,8 +121,10 @@ ensure_include() {
 }
 
 expect_eff() { # expect_eff 配置项（小写） 期望值
-  local v
-  v=$(sshd_get "$1")
+  local v eff
+  eff=$(sshd_eff) || eff=""
+  [[ -n $eff ]] || { log_err "无法读取 sshd 生效配置（$SSHD_BIN -T 失败）：$(sshd_eff_err)"; return 1; }
+  v=$(awk -v k="$1" '$1 == k { $1 = ""; sub(/^ /, ""); print }' <<<"$eff")
   [[ $v == "$2" ]] && return 0
   log_err "生效值不符：$1 = ${v:-空}（期望 $2）。可能被 $SSHD_CONFIG 或其他 drop-in 覆盖"
   return 1
@@ -266,10 +268,13 @@ keys_menu() {
 show_status() {
   title "SSH 状态"
   local eff
-  eff=$(sshd_eff)
+  eff=$(sshd_view)
   if [[ -z $eff ]]; then
     log_err "无法读取 sshd 生效配置（$SSHD_BIN -T 失败）：$(sshd_eff_err)"
     return 1
+  fi
+  if [[ -z $(sshd_eff) ]]; then
+    log_warn "$SSHD_BIN -T 失败（$(sshd_eff_err)），以下根据配置文件推算，可能与实际生效值有出入"
   fi
   get() { awk -v k="$1" '$1 == k { $1 = ""; sub(/^ /, ""); print }' <<<"$eff" | paste -sd' '; }
   printf '  %-22s %s\n' "监听端口" "$(get port)"

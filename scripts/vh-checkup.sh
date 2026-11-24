@@ -96,17 +96,20 @@ check_docker() {
 # ---------- SSH ----------
 check_ssh() {
   title "SSH"
-  local eff pa prl port
-  eff=$(sshd_eff)
+  local eff pa pk prl port
+  eff=$(sshd_view)
   if [[ -z $eff ]]; then
     chk warn "SSH 配置" "无法读取 sshd -T" "检查 sshd 配置：sshd -t"
     return 0
   fi
+  [[ -n $(sshd_eff) ]] || chk warn "SSH 配置" "sshd -T 失败，以下根据配置文件推算" "运行 [25] 诊断查看原因"
   pa=$(awk '$1 == "passwordauthentication" { print $2 }' <<<"$eff")
+  pk=$(awk '$1 == "pubkeyauthentication" { print $2 }' <<<"$eff")
   prl=$(awk '$1 == "permitrootlogin" { print $2 }' <<<"$eff")
   port=$(awk '$1 == "port" { print $2 }' <<<"$eff" | paste -sd' ')
   if [[ $port == 22 ]]; then chk warn "SSH 端口" "22（默认端口，扫描最多）" "可在 [05] 修改"; else chk ok "SSH 端口" "$port"; fi
   if [[ $pa == yes ]]; then chk bad "密码登录" "已开启" "只用密钥登录：启用 [06] 2FA 时会自动关闭密码登录"; else chk ok "密码登录" "已关闭"; fi
+  if [[ $pk == yes ]]; then chk ok "密钥登录" "已开启"; else chk warn "密钥登录" "已关闭" "启用 [06] 2FA 时会自动开启密钥登录"; fi
   if tfa_enabled; then
     chk ok "SSH 2FA" "已启用（密钥 + 动态口令），root 登录：$prl"
   else

@@ -71,11 +71,13 @@ update_source() {
 
 # 状态面板：每项都容错，读不到就显示「未知」
 status_args() {
-  local port tfa pa f2b vw="未识别" panel="未安装"
-  port=$(sshd_get port 2>/dev/null | head -n1)
+  local port tfa pa pk f2b vw="未识别" panel="未安装"
+  port=$(sshd_get port 2>/dev/null | paste -sd, -)
   if tfa_enabled 2>/dev/null; then tfa="已启用"; else tfa="未启用"; fi
   pa=$(sshd_get passwordauthentication 2>/dev/null)
   case $pa in yes) pa="开" ;; no) pa="关" ;; *) pa="未知" ;; esac
+  pk=$(sshd_get pubkeyauthentication 2>/dev/null)
+  case $pk in yes) pk="开" ;; no) pk="关" ;; *) pk="未知" ;; esac
   if systemctl is-active --quiet fail2ban 2>/dev/null; then
     f2b="运行中（封禁 $(f2b_banned || echo ?)）"
   elif command -v fail2ban-client >/dev/null 2>&1; then
@@ -100,7 +102,7 @@ status_args() {
     esac
     vw="$sig · $adm"
   fi
-  printf '%s\n' "$VH_VERSION" "SSH 端口：${port:-未知} · 2FA：$tfa · 密码登录：$pa" \
+  printf '%s\n' "$VH_VERSION" "SSH 端口：${port:-未知} · 密码登录：$pa · 密钥登录：$pk · 2FA：$tfa" \
     "1Panel：$panel · 防火墙：$(fw_label)" "Fail2Ban：$f2b · Vaultwarden：$vw"
 }
 
