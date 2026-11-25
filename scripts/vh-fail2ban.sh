@@ -21,14 +21,49 @@ log_backend() { # Debian 12+/Ubuntu 24.04 默认没有 /var/log/auth.log
   if [[ -s /var/log/auth.log ]]; then echo auto; else echo systemd; fi
 }
 
+install_port_sync() {
+  cat >"$F2B_SYNC_SERVICE" <<EOF
+[Unit]
+Description=Synchronize Fail2Ban SSH ports with sshd configuration
+After=fail2ban.service
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $VH_DIR/vh-fail2ban.sh sync-port
+SuccessExitStatus=75
+EOF
+  cat >"$F2B_SYNC_PATH" <<EOF
+[Unit]
+Description=Watch SSH configuration changes for Fail2Ban
+[Path]
+PathChanged=/etc/ssh/sshd_config
+PathModified=/etc/ssh/sshd_config.d/00-vhm.conf
+Unit=vhm-ssh-port-sync.service
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat >/etc/systemd/system/vhm-ssh-port-sync.timer <<'EOF'
+[Unit]
+Description=Periodically synchronize Fail2Ban SSH ports
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=15s
+AccuracySec=2s
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload &&
+    systemctl enable --now vhm-ssh-port-sync.path vhm-ssh-port-sync.timer
+}
+
 setup() {
   title "Fail2Ban SSH 防护"
   if ! command -v fail2ban-client >/dev/null 2>&1; then
     command -v apt-get >/dev/null 2>&1 || { log_err "未找到 apt-get，请手动安装 fail2ban"; return 1; }
     confirm_yes "未安装 Fail2Ban，现在安装？" || return 0
     apt_install fail2ban || return 1
-    [[ $(log_backend) == systemd ]] && ! python3 -c 'import systemd' 2>/dev/null &&
-      DEBIAN_FRONTEND=noninteractive apt-get install -y python3-systemd >/dev/null 2>&1
+    if [[ $(log_backend) == systemd ]] && ! python3 -c 'import systemd' 2>/dev/null; then
+      apt_install python3-systemd || log_warn "python3-systemd 未安装，Fail2Ban 的 journal 后端可能不可用"
+    fi
   fi
   local port maxretry findtime bantime ignore me
   port=$(sshd_get port | sort -un | paste -sd,)
@@ -80,17 +115,24 @@ EOF
     return 1
   fi
   change_status applied
-  log_ok "Fail2Ban SSH 防护已生效"
+  f2b_sync_ssh_port || log_warn "sshd 当前端口与 Fail2Ban 配置不同，后台同步器会继续检查"
+  install_port_sync || log_warn "自动 SSH 端口同步服务安装失败"
+  log_ok "Fail2Ban SSH 防护已生效，端口由 systemd 实时监测并自动同步"
+}
+
+sync_port() {
+  sleep 1
+  f2b_sync_ssh_port
 }
 
 manage() {
   title "Fail2Ban 状态"
-  command -v fail2ban-client >/dev/null 2>&1 || { log_warn "未安装 Fail2Ban，请先使用 [15]"; return 0; }
+  command -v fail2ban-client >/dev/null 2>&1 || { log_warn "未安装 Fail2Ban，请先使用 [16]"; return 0; }
   systemctl is-active --quiet fail2ban || { log_warn "Fail2Ban 未运行：systemctl status fail2ban"; return 0; }
   fail2ban-client status 2>/dev/null | sed 's/^/  /'
   echo
   if ! fail2ban-client status sshd >/dev/null 2>&1; then
-    log_warn "没有 sshd 防护，请使用 [15] 配置"
+    log_warn "没有 sshd 防护，请使用 [16] 配置"
     return 0
   fi
   fail2ban-client status sshd 2>/dev/null | sed 's/^/  /'
@@ -110,5 +152,6 @@ manage() {
 case ${1:-manage} in
   setup) need_root; with_lock setup ;;
   manage) need_root; manage ;;
+  sync-port) need_root; with_lock sync_port ;;
   *) die "未知参数：$1" ;;
 esac

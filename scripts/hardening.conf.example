@@ -4,3 +4,5 @@
 # 多个 Vaultwarden 实例时，在这里填写容器 /data 对应的主机路径。
 VW_DATA_DIR=""
 VW_CONTAINER=""
+# 可选：1Panel 自定义安装目录时，填写其持久防火墙规则目录（通常自动识别，无需填写）
+# PANEL_FIREWALL_DIR="/opt/1panel/firewall"

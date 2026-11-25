@@ -138,13 +138,15 @@ commit_ssh_change() { # commit_ssh_change 测试命令
     change_rollback "$CHG_ID"
     return 1
   fi
-  if ! ssh_reload; then
-    log_err "重载 SSH 服务失败，正在回滚"
+  # 先设好自动回滚定时器再重载：即使重载后管理器被中断，定时器也会把配置改回来
+  if ! guard_start; then
+    log_err "无法设置自动回滚保护，为安全起见放弃修改"
     change_rollback "$CHG_ID"
     return 1
   fi
-  if ! guard_start; then
-    log_err "无法设置自动回滚保护，为安全起见放弃修改"
+  if ! ssh_reload; then
+    log_err "重载 SSH 服务失败，正在回滚"
+    guard_stop
     change_rollback "$CHG_ID"
     return 1
   fi
@@ -284,7 +286,7 @@ show_status() {
   printf '  %-22s %s\n' "键盘交互认证" "$(get kbdinteractiveauthentication)"
   printf '  %-22s %s\n' "认证组合" "$(get authenticationmethods)"
   if tfa_enabled; then
-    printf '  %-22s %s\n' "2FA" "已启用（密钥 + 动态口令）"
+    printf '  %-22s %s\n' "2FA" "已启用（$(auth_mode_label "$(ssh_auth_mode)")）"
   elif tfa_pam_on; then
     printf '  %-22s %s\n' "2FA" "PAM 已配置但 sshd 未要求，未生效"
   else
@@ -329,7 +331,7 @@ show_logins() {
     grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9a-f]*:[0-9a-f:]+:[0-9a-f]+' | sort | uniq -c | sort -rn | head -n 15 |
     awk '{ printf "  %6d 次  %s\n", $1, $2 }'
   echo
-  echo "提示：经常成功登录的固定 IP 可以加入 Fail2Ban 白名单（[15]）。"
+  echo "提示：经常成功登录的固定 IP 可以加入 Fail2Ban 白名单（[16]）。"
 }
 
 # ---------- 端口 ----------
@@ -376,7 +378,7 @@ change_port() {
   wait_port_allowed "$new" || { log_info "已取消"; return 0; }
   echo
   echo "步骤：先同时监听 ${cur[*]} 和 $new → 你用新端口登录确认 → 关闭旧端口。"
-  [[ -f $F2B_JAIL ]] && echo "Fail2Ban 的 SSH 防护会同步改为端口 $new。"
+  [[ -f $F2B_JAIL ]] && echo "Fail2Ban 的 SSH 防护会自动同步到端口 $new。"
   confirm_yes "确认把 SSH 端口改为 $new？" || return 0
 
   change_begin "SSH 端口 ${cur[*]} → $new" sshd fail2ban
@@ -389,7 +391,7 @@ change_port() {
   set_ports "$new" || { change_rollback "$CHG_ID"; return 1; }
   if [[ -f $F2B_JAIL ]]; then
     change_track "$F2B_JAIL" && sed -i -E "s/^port[[:space:]]*=.*/port = $new/" "$F2B_JAIL" && f2b_reload ||
-      log_warn "Fail2Ban 端口同步失败，请在 [15] 重新保存配置"
+      log_warn "Fail2Ban 端口同步失败，请在 [16] 重新保存配置"
   fi
   if ! ssh_reload; then
     log_err "关闭旧端口失败，正在回滚"
@@ -463,95 +465,140 @@ ga_bind_new() {
   return 1
 }
 
-pam_enable_ga() {
-  python3 - "$PAM_SSHD" "$PAM_GA_LINE" "$PAM_MARK" <<'PY'
+pam_set_auth_mode() {
+  python3 - "$PAM_SSHD" "$PAM_GA_LINE" "$PAM_MARK" "$1" <<'PY'
 import re, sys
-path, ga, mark = sys.argv[1:]
+path, ga, mark, mode = sys.argv[1:]
 lines = open(path, encoding="utf-8").read().splitlines()
-out, done = [], False
+out, common_seen = [], False
+totp = mode.endswith("_totp")
+password_totp = mode == "password_totp"
 for line in lines:
     s = line.strip()
     if re.match(r"auth\s+\S+\s+pam_google_authenticator\.so", s):
         continue
-    if not done and re.match(r"@include\s+common-auth\b", s):
-        out += [mark + line, ga]
-        done = True
+    if line.startswith(mark) and re.match(r"@include\s+common-auth\b", line[len(mark):]):
+        line = line[len(mark):]
+        s = line.strip()
+    if re.match(r"@include\s+common-auth\b|auth\s+substack\s+common-auth\b", s):
+        common_seen = True
+        if mode == "key_totp":
+            out += [mark + line, ga]
+        elif password_totp:
+            out += [line, ga]
+        else:
+            out.append(line)
         continue
     out.append(line)
-if not done:
-    sys.exit("[错误] /etc/pam.d/sshd 中没有 @include common-auth，不支持此 PAM 布局，未修改")
+if totp and not common_seen:
+    if password_totp:
+        sys.exit("[错误] PAM 中找不到 common-auth，不能安全配置「密码 + 动态口令」模式")
+    out.append(ga)
 open(path, "w", encoding="utf-8").write("\n".join(out) + "\n")
 PY
 }
 
-pam_disable_ga() {
-  python3 - "$PAM_SSHD" "$PAM_MARK" <<'PY'
-import re, sys
-path, mark = sys.argv[1:]
-out = []
-for line in open(path, encoding="utf-8").read().splitlines():
-    if re.match(r"\s*auth\s+\S+\s+pam_google_authenticator\.so", line):
-        continue
-    out.append(line[len(mark):] if line.startswith(mark) else line)
-open(path, "w", encoding="utf-8").write("\n".join(out) + "\n")
-PY
+auth_mode_label() {
+  case $1 in
+    password) echo "密码登录（不建议）" ;;
+    key) echo "密钥登录" ;;
+    password_totp) echo "密码 + 动态口令" ;;
+    key_totp) echo "密钥 + 动态口令（推荐）" ;;
+    mixed) echo "密码或密钥（未限制）" ;;
+    *) echo "自定义配置" ;;
+  esac
 }
 
-tfa_enable() {
-  title "启用 SSH 2FA（密钥 + 动态口令）"
-  if tfa_enabled; then
-    log_ok "2FA 已启用。重新绑定、查看应急码或关闭请使用 [07]"
-    return 0
-  fi
-  load_keys
-  if ((${#KEY_FP[@]} == 0)); then
-    log_err "root 没有可用的登录密钥（$ROOT_KEYS）。启用后必须用密钥登录，请先在 [04] 添加密钥"
-    return 1
-  fi
-  echo "启用后 root 的 SSH 登录必须同时满足：① 你的 SSH 密钥 ② 手机上的 6 位动态口令。密码登录会关闭。"
-  echo "root 当前有 ${#KEY_FP[@]} 个授权密钥，请确认都是你自己的："
-  list_keys
-  local others
-  others=$(awk -F: '$3 >= 1000 && $3 < 65534 && $7 !~ /(nologin|false)$/ { print $1 }' /etc/passwd | paste -sd' ')
-  [[ -n $others ]] && log_warn "其他可登录用户（$others）没有绑定动态口令，启用后将无法通过 SSH 登录"
-  [[ -d /opt/1panel ]] && log_warn "1Panel 的「终端」功能通过 SSH 连接本机，启用 2FA 后将无法使用（「容器终端」不受影响）"
-  echo "VPS 服务商控制台的 VNC 登录不受影响，可作为最后的应急入口。"
-  time_synced || log_warn "系统时间未同步，动态口令可能失败。建议先执行：timedatectl set-ntp true"
-  confirm_yes "继续启用？" || return 0
-  ga_install || return 1
+change_root_password() {
+  title "修改 root 系统密码"
+  echo "通过系统 passwd 修改，输入内容不会回显。vhm 不读取或保存新旧密码。"
+  confirm_yes "继续修改 root 密码？" || return 0
+  passwd root || { log_err "passwd 未能修改 root 密码"; return 1; }
+  log_ok "root 系统密码已更新"
+}
 
-  local newga=""
-  if [[ -f $GA_FILE ]] && ! confirm_yes "root 已有动态口令绑定（$GA_FILE），输入 yes 重新绑定，其他输入沿用现有绑定"; then
-    log_info "沿用现有绑定"
-  else
-    newga=$(ga_bind_new) || return 1
+configure_auth_mode() {
+  local mode=$1 current newga="" need_keys=0 need_password=0 need_totp=0
+  local method password pubkey kbd permit
+  case $mode in
+    password) method=password; password=yes; pubkey=no; kbd=no; permit=yes; need_password=1 ;;
+    key) method=publickey; password=no; pubkey=yes; kbd=no; permit=prohibit-password; need_keys=1 ;;
+    password_totp) method=keyboard-interactive; password=no; pubkey=no; kbd=yes; permit=yes; need_password=1; need_totp=1 ;;
+    key_totp) method=publickey,keyboard-interactive; password=no; pubkey=yes; kbd=yes; permit=yes; need_keys=1; need_totp=1 ;;
+    *) log_err "未知 SSH 登录方式：$mode"; return 1 ;;
+  esac
+  current=$(ssh_auth_mode)
+  if [[ $current == "$mode" ]]; then log_ok "当前已是 $(auth_mode_label "$mode")"; return 0; fi
+  if ((need_keys)); then
+    load_keys
+    [[ -n ${KEY_FP[*]} ]] || { log_err "root 没有授权 SSH 密钥，请先用 [04] 添加"; return 1; }
   fi
-
-  change_begin "启用 SSH 2FA（密钥 + 动态口令）" sshd
+  if ((need_password)); then
+    local password_status
+    password_status=$(passwd -S root 2>/dev/null | awk '{print $2}')
+    [[ $password_status == P ]] || { log_err "root 当前没有可用系统密码（passwd 状态：${password_status:-未知}），请先修改密码"; return 1; }
+  fi
+  if ((need_totp)); then
+    time_synced || log_warn "系统时间未同步，TOTP 可能校验失败"
+    ga_install || return 1
+    [[ -f $GA_FILE ]] || newga=$(ga_bind_new) || return 1
+  fi
+  case $mode in
+    password) log_warn "密码单独登录不建议用于公网 VPS" ;;
+    password_totp) log_info "登录时由 PAM 依次验证 root 系统密码和 6 位动态口令" ;;
+    key_totp)
+      [[ -d /opt/1panel ]] && log_warn "1Panel 网页终端通过 SSH 连接本机，启用后将无法使用"
+      echo "请保持当前窗口，另开窗口测试密钥 + 动态口令登录。"
+      ;;
+  esac
+  confirm_yes "将 SSH 登录方式改为：$(auth_mode_label "$mode")？" || { [[ -z $newga ]] || rm -f -- "$newga"; return 0; }
+  change_begin "SSH 登录方式：$(auth_mode_label "$mode")" sshd
   {
     ensure_include &&
-      change_track "$PAM_SSHD" && change_track "$SSHD_DROPIN" && change_track "$GA_FILE" &&
-      { [[ -z $newga ]] || mv -f -- "$newga" "$GA_FILE"; } &&
-      pam_enable_ga &&
+      change_track "$PAM_SSHD" && change_track "$SSHD_DROPIN" &&
+      { [[ -z $newga ]] || { change_track "$GA_FILE" && mv -f -- "$newga" "$GA_FILE"; }; } &&
+      pam_set_auth_mode "$mode" &&
       dropin_set UsePAM yes &&
-      dropin_set PubkeyAuthentication yes &&
-      dropin_set PasswordAuthentication no &&
+      dropin_set PasswordAuthentication "$password" &&
+      dropin_set PubkeyAuthentication "$pubkey" &&
       dropin_set PermitEmptyPasswords no &&
-      dropin_set KbdInteractiveAuthentication yes &&
-      # OpenSSH 8.7 之前（Debian 11）键盘交互认证由 ChallengeResponseAuthentication 控制，之后为其别名
-      dropin_set ChallengeResponseAuthentication yes &&
-      dropin_set AuthenticationMethods publickey,keyboard-interactive &&
-      # 认证组合已强制先通过密钥；prohibit-password 会同时禁止动态口令，所以这里必须为 yes
-      dropin_set PermitRootLogin yes
+      dropin_set KbdInteractiveAuthentication "$kbd" &&
+      dropin_set ChallengeResponseAuthentication "$kbd" &&
+      dropin_set AuthenticationMethods "$method" &&
+      dropin_set PermitRootLogin "$permit"
   } || { log_err "写入配置失败，正在回滚"; change_rollback "$CHG_ID"; return 1; }
-  if ! { expect_eff authenticationmethods publickey,keyboard-interactive &&
-    expect_eff passwordauthentication no && expect_eff kbdinteractiveauthentication yes && expect_eff usepam yes; }; then
+  if ! { expect_eff authenticationmethods "$method" &&
+    expect_eff passwordauthentication "$password" &&
+    expect_eff pubkeyauthentication "$pubkey" &&
+    expect_eff kbdinteractiveauthentication "$kbd" &&
+    expect_eff usepam yes; }; then
     change_rollback "$CHG_ID"
     return 1
   fi
   commit_ssh_change "$(test_cmd)" || return 1
   change_status applied
-  log_ok "SSH 2FA 已启用：密钥 + 动态口令"
+  log_ok "SSH 登录方式已改为：$(auth_mode_label "$mode")"
+}
+
+auth_mode_menu() {
+  title "SSH 登录方式"
+  echo "当前方式：$(auth_mode_label "$(ssh_auth_mode)")"
+  echo
+  echo "  [1] 密码登录（不建议）"
+  echo "  [2] 密钥登录"
+  echo "  [3] 密码登录 + 动态口令"
+  echo "  [4] 密钥登录 + 动态口令（推荐）"
+  echo "  [5] 修改 root 系统密码"
+  echo "  [0] 返回"
+  local choice
+  read -r -p "请选择：" choice || return 0
+  case $choice in
+    1) configure_auth_mode password ;;
+    2) configure_auth_mode key ;;
+    3) configure_auth_mode password_totp ;;
+    4) configure_auth_mode key_totp ;;
+    5) change_root_password ;;
+  esac
 }
 
 tfa_rebind() {
@@ -597,24 +644,14 @@ tfa_qr() {
 
 tfa_disable() {
   tfa_enabled || tfa_pam_on || { log_info "2FA 未启用"; return 0; }
-  echo "关闭后 root 只需 SSH 密钥即可登录，密码登录保持关闭。动态口令绑定文件会保留，以后可直接重新启用。"
-  confirm_yes "确认关闭 SSH 2FA？" || return 0
-  change_begin "关闭 SSH 2FA" sshd
-  {
-    change_track "$PAM_SSHD" && change_track "$SSHD_DROPIN" &&
-      pam_disable_ga &&
-      dropin_del AuthenticationMethods KbdInteractiveAuthentication ChallengeResponseAuthentication &&
-      dropin_set PasswordAuthentication no &&
-      dropin_set PermitRootLogin prohibit-password
-  } || { change_rollback "$CHG_ID"; return 1; }
-  commit_ssh_change "$(test_cmd)" || return 1
-  change_status applied
-  log_ok "SSH 2FA 已关闭"
+  echo "关闭 2FA 后将改为仅 SSH 密钥登录。动态口令绑定文件会保留，以后可再次启用。"
+  confirm_yes "关闭 2FA 并切换到密钥登录？" || return 0
+  configure_auth_mode key
 }
 
 tfa_manage() {
   title "2FA 管理"
-  if tfa_enabled; then log_ok "2FA 已启用"; else log_info "2FA 未启用（启用请用 [06]）"; fi
+  if tfa_enabled; then log_ok "2FA 已启用：$(auth_mode_label "$(ssh_auth_mode)")"; else log_info "2FA 未启用（[06] 可选择登录方式）"; fi
   echo
   echo "  [1] 显示绑定二维码（在新手机 / 第二个验证器上添加同一账号）"
   echo "  [2] 重新绑定（换新密钥：密钥泄露 / 应急码用完）"
@@ -635,7 +672,7 @@ case ${1:-status} in
   status) show_status ;;
   keys) need_root; with_lock keys_menu ;;
   port) need_root; with_lock change_port ;;
-  2fa-enable) need_root; with_lock tfa_enable ;;
+  2fa-enable | auth-mode) need_root; with_lock auth_mode_menu ;;
   2fa-manage) need_root; with_lock tfa_manage ;;
   logins) show_logins ;;
   *) die "未知参数：$1" ;;

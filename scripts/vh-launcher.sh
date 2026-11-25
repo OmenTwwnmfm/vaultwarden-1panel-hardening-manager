@@ -15,7 +15,7 @@ check_deps() {
   command -v ss >/dev/null 2>&1 || log_warn "未检测到 ss（iproute2），端口检查不可用"
   command -v systemd-run >/dev/null 2>&1 || log_warn "未检测到 systemd-run，SSH 相关修改无法启用防锁死保护，将被拒绝"
   command -v curl >/dev/null 2>&1 || log_warn "未检测到 curl，Docker 端口实测不可用"
-  command -v git >/dev/null 2>&1 || log_warn "未检测到 git，[26] 源码更新不可用"
+  command -v git >/dev/null 2>&1 || log_warn "未检测到 git，[27] 源码更新不可用"
   if ((${#missing[@]})); then
     log_err "缺少依赖：${missing[*]}"
     echo "  Debian/Ubuntu: apt-get install -y util-linux coreutils python3 openssh-server openssh-client iproute2 curl" >&2

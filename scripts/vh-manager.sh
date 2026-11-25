@@ -42,31 +42,77 @@ first_setup() {
   pause
 }
 
-update_source() {
-  local root
+VH_SOURCE_UPDATED=10
+
+# 从官方仓库的 main 快进更新源码。返回 0 = 已是最新，10 = 已更新，1 = 跳过或失败（已输出原因）。
+# 只在以下条件全部满足时更新：origin 指向官方仓库、当前在 main 分支、已跟踪文件没有本地改动、
+# 本地提交都已包含在远端（只快进，不合并）。抓取限时 30 秒且禁止交互式输入凭据。
+sync_source() {
+  local root url branch before target
   root="$(cd "$VH_DIR/.." && pwd -P)"
-  command -v git >/dev/null 2>&1 || { log_err "未安装 git"; pause; return; }
-  if ! git -C "$root" diff --quiet || ! git -C "$root" diff --cached --quiet; then
+  command -v git >/dev/null 2>&1 || { log_warn "未安装 git，无法检查更新"; return 1; }
+  git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { log_warn "$root 不是 git 仓库，无法检查更新"; return 1; }
+  url=$(git -C "$root" remote get-url origin 2>/dev/null || true)
+  url=${url%/}
+  url=${url%.git}
+  case $url in
+    https://github.com/OmenTwwnmfm/vaultwarden-1panel-hardening-manager | git@github.com:OmenTwwnmfm/vaultwarden-1panel-hardening-manager | ssh://git@github.com/OmenTwwnmfm/vaultwarden-1panel-hardening-manager) ;;
+    *) log_warn "origin 不是官方仓库（${url:-未设置}），不检查更新"; return 1 ;;
+  esac
+  branch=$(git -C "$root" symbolic-ref --short -q HEAD || true)
+  [[ $branch == main ]] || { log_warn "当前分支为 ${branch:-分离的 HEAD}，只在 main 分支上更新"; return 1; }
+  if [[ -n $(git -C "$root" status --porcelain --untracked-files=no 2>/dev/null) ]]; then
     log_warn "源码目录有未提交的修改，未更新：$root"
-    pause
-    return
+    return 1
   fi
-  local before after
-  before=$(git -C "$root" rev-parse HEAD)
-  if git -C "$root" fetch -q origin main && git -C "$root" merge -q --ff-only origin/main; then
-    after=$(git -C "$root" rev-parse HEAD)
-    if [[ $before == "$after" ]]; then
-      log_ok "已是最新版本（v$VH_VERSION）"
-      pause
-    else
-      log_ok "已更新到 v$(cat "$root/VERSION")，重新进入菜单"
-      pause
-      exec bash "$VH_DIR/vh-launcher.sh" menu
-    fi
-  else
-    log_warn "无法从 GitHub 快进更新（网络问题或本地分支已分叉）"
-    pause
+  before=$(git -C "$root" rev-parse HEAD) || return 1
+  if ! GIT_TERMINAL_PROMPT=0 timeout 30 git -C "$root" fetch --quiet --no-tags origin main </dev/null 2>/dev/null; then
+    log_warn "暂时无法连接 GitHub，继续使用本地 v$VH_VERSION"
+    return 1
   fi
+  target=$(git -C "$root" rev-parse FETCH_HEAD) || return 1
+  [[ $before == "$target" ]] && return 0
+  if ! git -C "$root" merge-base --is-ancestor "$before" "$target"; then
+    log_warn "本地有远端没有的提交，无法快进更新"
+    return 1
+  fi
+  git -C "$root" merge --ff-only --quiet "$target" || { log_warn "快进更新失败，源码保持不变"; return 1; }
+  return "$VH_SOURCE_UPDATED"
+}
+
+restart_menu() {
+  export VHM_AUTO_UPDATE_CHECKED=1
+  exec bash "$VH_DIR/vh-launcher.sh" menu
+}
+
+update_source() { # 菜单 [27]
+  local rc=0
+  log_info "正在检查 GitHub 更新……"
+  sync_source || rc=$?
+  if ((rc == VH_SOURCE_UPDATED)); then
+    log_ok "已更新到 v$(cat "$VH_DIR/../VERSION")，重新进入菜单"
+    pause
+    restart_menu
+  fi
+  ((rc == 0)) && log_ok "已是最新版本（v$VH_VERSION）"
+  pause
+}
+
+auto_update_source() { # 每次进入菜单时检查一次
+  [[ ${VHM_AUTO_UPDATE_CHECKED:-0} == 1 ]] && return 0
+  export VHM_AUTO_UPDATE_CHECKED=1
+  local rc=0
+  log_info "正在检查 GitHub 更新……"
+  sync_source || rc=$?
+  case $rc in
+    0) ;;
+    "$VH_SOURCE_UPDATED")
+      log_ok "检测到新版本，已自动更新到 v$(cat "$VH_DIR/../VERSION")，重新进入菜单"
+      sleep 2
+      restart_menu
+      ;;
+    *) sleep 2 ;;
+  esac
 }
 
 # 状态面板：每项都容错，读不到就显示「未知」
@@ -151,7 +197,7 @@ sections = [
         "[03] SSH 状态（端口、登录方式、2FA、当前会话）",
         "[04] 管理登录密钥（列出 / 添加 / 删除）",
         "[05] 修改 SSH 端口",
-        "[06] 安装 / 启用 2FA（密钥 + 动态口令）",
+        "[06] SSH 登录方式（密码 / 密钥 / 密码 + 2FA / 密钥 + 2FA）",
         "[07] 2FA 管理（二维码 / 重新绑定 / 应急码 / 关闭）",
         "[08] 登录记录（成功、失败、来源 IP）"]),
     ("03 · 1Panel 面板", [
@@ -161,22 +207,24 @@ sections = [
         "[12] 切换监听地址（IPv4 / IPv6）",
         "[13] 启动 / 停止 / 重启 1Panel",
         "[14] 应急重置（安全入口、授权 IP、两步验证等）"]),
-    ("04 · Fail2Ban", [
-        "[15] 安装 / 修改 SSH 防护配置",
-        "[16] 状态、封禁列表、解封 IP"]),
-    ("05 · Vaultwarden", [
-        "[17] 状态总览（注册、邀请、后台、版本）",
-        "[18] 开启 / 关闭注册",
-        "[19] 后台 ADMIN（开启 / 更换令牌 / 关闭）",
-        "[20] 用户列表",
-        "[21] 安全选项（密码提示、Send、紧急访问等）"]),
-    ("06 · 系统加固", [
-        "[22] 自动安全更新",
-        "[23] 内核网络参数加固"]),
-    ("07 · 系统维护", [
-        "[24] 变更记录与回滚（含删除记录）",
-        "[25] 生成脱敏诊断报告",
-        "[26] 检查 / 更新项目源码"]),
+    ("04 · 防火墙（与 1Panel 同步）", [
+        "[15] 规则列表 / 添加 / 删除（支持 1Panel iptables 与 UFW）"]),
+    ("05 · Fail2Ban", [
+        "[16] 安装 / 修改 SSH 防护配置（端口自动同步）",
+        "[17] 状态、封禁列表、解封 IP"]),
+    ("06 · Vaultwarden", [
+        "[18] 状态总览（注册、邀请、后台、版本）",
+        "[19] 开启 / 关闭注册",
+        "[20] 后台 ADMIN（开启 / 更换令牌 / 关闭）",
+        "[21] 用户列表",
+        "[22] 安全选项（密码提示、Send、紧急访问等）"]),
+    ("07 · 系统加固", [
+        "[23] 自动安全更新",
+        "[24] 内核网络参数加固"]),
+    ("08 · 系统维护", [
+        "[25] 变更记录与回滚（含删除记录）",
+        "[26] 生成脱敏诊断报告",
+        "[27] 检查 / 更新项目源码"]),
 ]
 for title, items in sections:
     row(title)
@@ -189,6 +237,7 @@ PYMENU
 }
 
 while true; do
+  auto_update_source
   [[ -t 1 ]] && clear
   render_menu
   read -r -p "请选择：" c || exit 0
@@ -208,18 +257,19 @@ while true; do
     12) run vh-panel.sh listen ;;
     13) run vh-panel.sh service ;;
     14) run vh-panel.sh reset ;;
-    15) run vh-fail2ban.sh setup ;;
-    16) run vh-fail2ban.sh manage ;;
-    17) run vh-vaultwarden.sh status ;;
-    18) run vh-vaultwarden.sh signups ;;
-    19) run vh-vaultwarden.sh admin ;;
-    20) run vh-vaultwarden.sh users ;;
-    21) run vh-vaultwarden.sh options ;;
-    22) run vh-system.sh auto-updates ;;
-    23) run vh-system.sh sysctl ;;
-    24) run vh-changes.sh menu ;;
-    25) run vh-diagnose.sh ;;
-    26) update_source ;;
+    15) run vh-firewall.sh menu ;;
+    16) run vh-fail2ban.sh setup ;;
+    17) run vh-fail2ban.sh manage ;;
+    18) run vh-vaultwarden.sh status ;;
+    19) run vh-vaultwarden.sh signups ;;
+    20) run vh-vaultwarden.sh admin ;;
+    21) run vh-vaultwarden.sh users ;;
+    22) run vh-vaultwarden.sh options ;;
+    23) run vh-system.sh auto-updates ;;
+    24) run vh-system.sh sysctl ;;
+    25) run vh-changes.sh menu ;;
+    26) run vh-diagnose.sh ;;
+    27) update_source ;;
     *) log_warn "无效选项：$c"; sleep 1 ;;
   esac
 done

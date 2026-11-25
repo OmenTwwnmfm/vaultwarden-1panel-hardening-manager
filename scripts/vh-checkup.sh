@@ -108,12 +108,12 @@ check_ssh() {
   prl=$(awk '$1 == "permitrootlogin" { print $2 }' <<<"$eff")
   port=$(awk '$1 == "port" { print $2 }' <<<"$eff" | paste -sd' ')
   if [[ $port == 22 ]]; then chk warn "SSH 端口" "22（默认端口，扫描最多）" "可在 [05] 修改"; else chk ok "SSH 端口" "$port"; fi
-  if [[ $pa == yes ]]; then chk bad "密码登录" "已开启" "只用密钥登录：启用 [06] 2FA 时会自动关闭密码登录"; else chk ok "密码登录" "已关闭"; fi
-  if [[ $pk == yes ]]; then chk ok "密钥登录" "已开启"; else chk warn "密钥登录" "已关闭" "启用 [06] 2FA 时会自动开启密钥登录"; fi
+  if [[ $pa == yes ]]; then chk bad "密码登录" "已开启" "可在 [06] 选择密钥登录或增加动态口令"; else chk ok "密码登录" "已关闭"; fi
+  if [[ $pk == yes ]]; then chk ok "密钥登录" "已开启"; else chk warn "密钥登录" "已关闭" "可在 [06] 选择密钥登录"; fi
   if tfa_enabled; then
-    chk ok "SSH 2FA" "已启用（密钥 + 动态口令），root 登录：$prl"
+    chk ok "SSH 2FA" "已启用，root 登录：$prl"
   else
-    chk warn "SSH 2FA" "未启用，root 登录：$prl" "在 [06] 启用 密钥 + 动态口令"
+    chk warn "SSH 2FA" "未启用，root 登录：$prl" "在 [06] 选择登录方式"
   fi
   if [[ -f $ROOT_KEYS ]] && [[ $(stat -c %a "$ROOT_KEYS") =~ [0-7][1-7][0-7]$|[0-7][0-7][1-7]$ ]]; then
     chk warn "authorized_keys 权限" "$(stat -c %a "$ROOT_KEYS")" "chmod 600 $ROOT_KEYS"
@@ -129,11 +129,11 @@ check_ssh() {
 check_f2b() {
   title "Fail2Ban"
   if ! command -v fail2ban-client >/dev/null 2>&1; then
-    chk warn "Fail2Ban" "未安装" "在 [15] 安装并配置 SSH 防护"
+    chk warn "Fail2Ban" "未安装" "在 [16] 安装并配置 SSH 防护"
   elif ! systemctl is-active --quiet fail2ban; then
-    chk bad "Fail2Ban" "已安装但未运行" "systemctl enable --now fail2ban，或在 [15] 重新配置"
+    chk bad "Fail2Ban" "已安装但未运行" "systemctl enable --now fail2ban，或在 [16] 重新配置"
   elif ! fail2ban-client status sshd >/dev/null 2>&1; then
-    chk warn "Fail2Ban" "运行中，但没有 sshd 防护" "在 [15] 配置"
+    chk warn "Fail2Ban" "运行中，但没有 sshd 防护" "在 [16] 配置"
   else
     chk ok "Fail2Ban" "sshd 防护运行中，当前封禁 $(f2b_banned) 个 IP"
   fi
@@ -150,7 +150,7 @@ check_system() {
   if [[ $(apt-config dump 2>/dev/null | sed -nE 's/^APT::Periodic::Unattended-Upgrade "([0-9]+)";/\1/p') =~ ^[1-9] ]] && systemctl is-enabled --quiet unattended-upgrades 2>/dev/null; then
     chk ok "自动安全更新" "已启用"
   else
-    chk warn "自动安全更新" "未启用" "在 [22] 启用"
+    chk warn "自动安全更新" "未启用" "在 [23] 启用"
   fi
   local bad=() k want v
   for k in net.ipv4.tcp_syncookies=1 net.ipv4.conf.all.rp_filter=1 net.ipv4.conf.all.accept_redirects=0 net.ipv4.conf.all.send_redirects=0 net.ipv4.conf.all.accept_source_route=0; do
@@ -159,7 +159,7 @@ check_system() {
     [[ $k == *rp_filter && $v == 2 ]] && continue
     [[ $v == "$want" ]] || bad+=("$k=$v")
   done
-  if ((${#bad[@]})); then chk warn "内核网络参数" "${bad[*]}" "在 [23] 加固"; else chk ok "内核网络参数" "已加固"; fi
+  if ((${#bad[@]})); then chk warn "内核网络参数" "${bad[*]}" "在 [24] 加固"; else chk ok "内核网络参数" "已加固"; fi
   if [[ -f /var/run/reboot-required ]]; then chk warn "重启" "有更新需要重启才能生效" "择机重启 VPS"; fi
 }
 
@@ -198,12 +198,12 @@ check_vw() {
   echo "  实例：$VW_CONTAINER（$VW_DATA_DIR）"
   local sig domain
   sig=$(vw_eff signups_allowed SIGNUPS_ALLOWED true)
-  if [[ $sig == false ]]; then chk ok "开放注册" "已关闭"; else chk bad "开放注册" "已开启，任何人都能注册" "在 [18] 关闭"; fi
+  if [[ $sig == false ]]; then chk ok "开放注册" "已关闭"; else chk bad "开放注册" "已开启，任何人都能注册" "在 [19] 关闭"; fi
   case $(vw_admin_state) in
     off) chk ok "后台 /admin" "已关闭" ;;
-    argon2) chk warn "后台 /admin" "已开启（argon2 哈希令牌）" "不用时在 [19] 关闭，或在 OpenResty 中限制 /admin 的来源 IP" ;;
-    plain) chk bad "后台 /admin" "已开启，令牌为明文保存" "在 [19] 更换为 argon2 哈希令牌" ;;
-    notoken) chk bad "后台 /admin" "免令牌访问（DISABLE_ADMIN_TOKEN=true）" "在 [19] 关闭或设置令牌" ;;
+    argon2) chk warn "后台 /admin" "已开启（argon2 哈希令牌）" "不用时在 [20] 关闭，或在 OpenResty 中限制 /admin 的来源 IP" ;;
+    plain) chk bad "后台 /admin" "已开启，令牌为明文保存" "在 [20] 更换为 argon2 哈希令牌" ;;
+    notoken) chk bad "后台 /admin" "免令牌访问（DISABLE_ADMIN_TOKEN=true）" "在 [20] 关闭或设置令牌" ;;
   esac
   domain=$(vw_eff domain DOMAIN "")
   if [[ $domain == https://* ]]; then chk ok "DOMAIN" "$domain"; else chk bad "DOMAIN" "${domain:-未设置}（非 https）" "1Panel 网站中为该域名启用 HTTPS，并在应用参数中设置 https:// 域名"; fi

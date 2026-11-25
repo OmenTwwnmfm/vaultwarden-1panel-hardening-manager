@@ -86,7 +86,7 @@ change_port() {
     return 1
   fi
   change_status applied
-  log_ok "面板端口已改为 $new（变更 $CHG_ID，可在 [24] 回滚）"
+  log_ok "面板端口已改为 $new（变更 $CHG_ID，可在 [25] 回滚）"
   echo "确认能用新地址登录后，可在 1Panel 防火墙中删除旧端口 $cur 的放行规则。"
 }
 
@@ -145,7 +145,7 @@ change_listen() {
     return 1
   fi
   change_status applied
-  log_ok "已切换为 $want（变更 $CHG_ID，可在 [24] 回滚）"
+  log_ok "已切换为 $want（变更 $CHG_ID，可在 [25] 回滚）"
 }
 
 service_menu() {

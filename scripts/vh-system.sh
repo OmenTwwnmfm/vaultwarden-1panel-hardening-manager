@@ -111,7 +111,7 @@ sysctl_menu() {
   change_track "$SYSCTL_FILE" || { change_rollback "$CHG_ID"; return 1; }
   : >"$CHG_DIR/sysctl.prev"
   {
-    echo "# 由 vhm 管理，可在 vhm [24] 中回滚"
+    echo "# 由 vhm 管理，可在 vhm [25] 中回滚"
     for p in "${SYSCTL_PARAMS[@]}"; do
       k=${p%%=*}
       v=$(sysctl -n "$k" 2>/dev/null) || continue

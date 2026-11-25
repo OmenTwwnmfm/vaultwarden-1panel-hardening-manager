@@ -2,9 +2,18 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0] - 2026-11-25
+
+### Added
+- SSH 登录方式菜单支持密码（不建议）、密钥、密码 + TOTP、密钥 + TOTP，提供 root 密码修改。模式修改有生效值校验和 5 分钟防锁死保护。
+- 防火墙菜单支持 1Panel iptables 与 UFW，规则按来源 IP/CIDR、协议、端口和优先顺序实时生效并写入持久配置，变更可回滚。
+- Fail2Ban SSH jail 使用 systemd path 和定时器检测 sshd 配置变化，自动同步 vhm 管理的 SSH jail 端口。
+- 每次进入菜单自动检查 GitHub main 并尝试快进更新；源码有本地改动或网络不可用时提示并保留现状。不创建 GitHub Release。
+- 菜单扩展至 [27]。
+
 ## [0.2.0] - 2026-11-24
 
-**不兼容变更**：从「只审计、给指引」改为「VPS + Vaultwarden 加固工具」，菜单重新编号为 `[01]–[26]`，旧子命令全部移除。
+**不兼容变更**：从「只审计、给指引」改为「VPS + Vaultwarden 加固工具」，菜单重新编号为 `[01]–[26]`，旧子命令全部移除。v0.3.0 在 [14] 后增加防火墙管理项，后续菜单编号顺延到 [27]。
 
 ### Added
 - 新菜单：顶部状态面板（SSH 端口 / 2FA / 密码登录、防火墙、Fail2Ban、Vaultwarden 注册与后台），按 7 个大类分组，样式与 vbm 一致。

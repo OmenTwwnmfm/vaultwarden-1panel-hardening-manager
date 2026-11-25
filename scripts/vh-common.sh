@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # 公共函数库：日志、交互、锁、脱敏、实例识别、变更记录与回滚、SSH/防火墙状态、vbm 备份、Vaultwarden 配置
 # shellcheck disable=SC2034
+F2B_SYNC_PATH=${F2B_SYNC_PATH:-/etc/systemd/system/vhm-ssh-port-sync.path}
+F2B_SYNC_SERVICE=${F2B_SYNC_SERVICE:-/etc/systemd/system/vhm-ssh-port-sync.service}
 
 VH_DIR=${VH_DIR:-"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"}
 VH_VERSION="$(cat "$VH_DIR/../VERSION" 2>/dev/null || echo unknown)"
@@ -384,7 +386,7 @@ vbm_installed() { [[ -f "$VBM_CONF" && -f "$VBM_WORKER" ]]; }
 vbm_backup_before_change() {
   if ! vbm_installed; then
     log_warn "未检测到 vbm（$VBM_WORKER），修改前无法做完整备份。"
-    echo "vhm 仍会保存修改前的 config.json，可在菜单 [24] 回滚。"
+    echo "vhm 仍会保存修改前的 config.json，可在菜单 [25] 回滚。"
     confirm_yes "在没有完整备份的情况下继续修改？" || return 1
     return 0
   fi
@@ -434,7 +436,7 @@ vw_apply() {
   if ((rc == 0)) && ! printf '%s\n' "$updates" | vw_config_write; then rc=1; fi
   if ((rc == 0)) && vw_restart_check; then
     change_status applied
-    log_ok "$desc：已生效（变更 $CHG_ID，可在 [24] 回滚）"
+    log_ok "$desc：已生效（变更 $CHG_ID，可在 [25] 回滚）"
   else
     log_err "$desc 失败，正在恢复原配置……"
     change_restore_files "$CHG_DIR"
@@ -567,6 +569,7 @@ run_hooks() { # run_hooks 记录目录 钩子...
       sysctl) sysctl_restore "$d" || rc=1 ;;
       vw) vw_restart_check || rc=1 ;;
       panel) panel_restore "$d" || rc=1 ;;
+      firewall) bash "$VH_DIR/vh-firewall.sh" restore "$d" || rc=1 ;;
     esac
   done
   return $rc
@@ -717,7 +720,28 @@ ssh_reload() {
 }
 
 tfa_pam_on() { grep -Eq '^[[:space:]]*auth[[:space:]]+required[[:space:]]+pam_google_authenticator\.so' "$PAM_SSHD" 2>/dev/null; }
-tfa_enabled() { tfa_pam_on && [[ $(sshd_get authenticationmethods) == *publickey,keyboard-interactive* ]]; }
+tfa_enabled() {
+  local mode
+  mode=$(sshd_get authenticationmethods)
+  tfa_pam_on && [[ $mode == *keyboard-interactive* ]]
+}
+
+ssh_auth_mode() {
+  local methods password pubkey tfa common_auth
+  methods=$(sshd_get authenticationmethods)
+  password=$(sshd_get passwordauthentication)
+  pubkey=$(sshd_get pubkeyauthentication)
+  tfa=$(tfa_pam_on && echo yes || echo no)
+  common_auth=no
+  if grep -Eq '^[[:space:]]*(@include[[:space:]]+common-auth|auth[[:space:]]+substack[[:space:]]+common-auth)' "$PAM_SSHD" 2>/dev/null; then common_auth=yes; fi
+  if [[ $tfa == yes && $methods == *publickey,keyboard-interactive* ]]; then echo key_totp
+  elif [[ $tfa == yes && $methods == keyboard-interactive && $common_auth == yes ]]; then echo password_totp
+  elif [[ $methods == publickey && $pubkey == yes ]]; then echo key
+  elif [[ $methods == password && $password == yes ]]; then echo password
+  elif [[ $methods == any && $password == yes && $pubkey == yes ]]; then echo mixed
+  else echo custom
+  fi
+}
 
 # ---------- 防火墙 / Fail2Ban / sysctl ----------
 # 防火墙规则由 1Panel 管理，vhm 只读识别。1Panel（iptables）使用 1PANEL_BASIC_BEFORE / 1PANEL_BASIC /
@@ -896,6 +920,28 @@ f2b_reload() {
 }
 
 f2b_banned() { fail2ban-client status sshd 2>/dev/null | awk -F: '/Currently banned/ { gsub(/[[:space:]]/, "", $2); print $2 }'; }
+
+f2b_sync_ssh_port() {
+  command -v fail2ban-client >/dev/null 2>&1 || return 0
+  [[ -f $F2B_JAIL ]] || return 0
+  local eff ports current out
+  eff=$(sshd_eff) || eff=""
+  [[ -n $eff ]] || { log_err "sshd -T 未通过，Fail2Ban 端口同步暂缓"; return 1; }
+  ports=$(awk '$1 == "port" { print $2 }' <<<"$eff" | sort -un | paste -sd,)
+  [[ -n $ports ]] || { log_err "无法从 sshd -T 读取 SSH 端口，Fail2Ban 保持现有配置"; return 1; }
+  current=$(sed -nE 's/^[[:space:]]*port[[:space:]]*=[[:space:]]*(.*)$/\1/p' "$F2B_JAIL" | tail -n1)
+  [[ $current == "$ports" ]] && return 0
+  change_begin "Fail2Ban SSH 端口 $current → $ports" fail2ban
+  change_track "$F2B_JAIL" || return 1
+  sed -i -E "s/^[[:space:]]*port[[:space:]]*=.*/port = $ports/" "$F2B_JAIL"
+  if ! out=$(fail2ban-client -t 2>&1) || ! f2b_reload; then
+    log_err "Fail2Ban 同步 SSH 端口失败：$(tail -n 3 <<<"$out")"
+    change_rollback "$CHG_ID"
+    return 1
+  fi
+  change_status applied
+  log_ok "Fail2Ban 已同步 SSH 端口：$ports"
+}
 
 sysctl_restore() { # 恢复修改前记录的运行时参数
   local d=$1 k v
