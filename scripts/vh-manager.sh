@@ -248,7 +248,7 @@ while true; do
     03 | 3) run vh-ssh.sh status ;;
     04 | 4) run vh-ssh.sh keys ;;
     05 | 5) run vh-ssh.sh port ;;
-    06 | 6) run vh-ssh.sh 2fa-enable ;;
+    06 | 6) run vh-ssh.sh auth-mode ;;
     07 | 7) run vh-ssh.sh 2fa-manage ;;
     08 | 8) run vh-ssh.sh logins ;;
     09 | 9) run vh-panel.sh status ;;
