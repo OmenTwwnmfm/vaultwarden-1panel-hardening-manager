@@ -2,6 +2,26 @@
 # 启动器：依赖检查后转交菜单或子命令
 set -Eeuo pipefail
 VH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# 与 run.sh 相同的路径安全检查，日常入口也复检：项目目录或其上级目录被
+# 放宽权限后，不能仍以 root 无提示地执行其中脚本（纵深防御）。
+path_component_safe() {
+  local path=$1 owner
+  owner=$(stat -c '%u' -- "$path" 2>/dev/null) || return 1
+  [[ "$owner" == 0 || "$owner" == "$(id -u)" ]] || return 1
+  [[ -z "$(find "$path" -maxdepth 0 -perm /022 -print 2>/dev/null)" ]]
+}
+launcher_path_safe() {
+  local path=$1
+  while true; do
+    path_component_safe "$path" || return 1
+    [[ "$path" == / ]] && break
+    path=$(dirname -- "$path")
+  done
+}
+if ! launcher_path_safe "$VH_DIR"; then
+  echo "错误：项目目录或其上级目录不安全（须由 root 或当前用户所有，且不可被组/其他用户写入）：$VH_DIR" >&2
+  exit 1
+fi
 # shellcheck source=scripts/vh-common.sh
 source "$VH_DIR/vh-common.sh"
 

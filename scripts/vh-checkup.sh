@@ -102,7 +102,7 @@ check_ssh() {
     chk warn "SSH 配置" "无法读取 sshd -T" "检查 sshd 配置：sshd -t"
     return 0
   fi
-  [[ -n $(sshd_eff) ]] || chk warn "SSH 配置" "sshd -T 失败，以下根据配置文件推算" "运行 [25] 诊断查看原因"
+  [[ -n $(sshd_eff) ]] || chk warn "SSH 配置" "sshd -T 失败，以下根据配置文件推算" "运行 [26] 诊断查看原因"
   pa=$(awk '$1 == "passwordauthentication" { print $2 }' <<<"$eff")
   pk=$(awk '$1 == "pubkeyauthentication" { print $2 }' <<<"$eff")
   prl=$(awk '$1 == "permitrootlogin" { print $2 }' <<<"$eff")
@@ -112,6 +112,10 @@ check_ssh() {
   if [[ $pk == yes ]]; then chk ok "密钥登录" "已开启"; else chk warn "密钥登录" "已关闭" "可在 [06] 选择密钥登录"; fi
   if tfa_enabled; then
     chk ok "SSH 2FA" "已启用，root 登录：$prl"
+  elif tfa_pam_nullok; then
+    chk bad "SSH 2FA" "PAM 带 nullok，未绑定动态口令也能登录" "在 [06] 重新选择登录方式"
+  elif tfa_pam_on; then
+    chk bad "SSH 2FA" "PAM 已配置但 sshd 未要求 keyboard-interactive" "检查 AuthenticationMethods"
   else
     chk warn "SSH 2FA" "未启用，root 登录：$prl" "在 [06] 选择登录方式"
   fi
@@ -210,9 +214,9 @@ check_vw() {
   local loose=() p m
   while IFS= read -r p; do
     m=$(stat -c '%a' "$p") || continue
-    (((8#$m & 8#007) != 0)) && loose+=("${p#"$VW_DATA_DIR"/}:$m")
+    (((8#$m & 8#077) != 0)) && loose+=("${p#"$VW_DATA_DIR"/}:$m")
   done < <(vw_sensitive_paths)
-  if ((${#loose[@]})); then chk warn "数据目录权限" "其他用户可访问：${loose[*]}" "chmod -R o-rwx $VW_DATA_DIR"; else chk ok "数据目录权限" "其他用户无权限"; fi
+  if ((${#loose[@]})); then chk warn "数据目录权限" "同组或其他用户可访问：${loose[*]}" "chmod -R go-rwx $VW_DATA_DIR"; else chk ok "数据目录权限" "同组和其他用户无权限"; fi
   if command -v vbm >/dev/null 2>&1 || vbm_installed; then
     local res st when
     res=/var/lib/vaultwarden-backup/last-result.env

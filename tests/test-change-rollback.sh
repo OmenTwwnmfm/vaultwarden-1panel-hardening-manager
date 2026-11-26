@@ -31,5 +31,26 @@ change_rollback "bad/../id" >/dev/null 2>&1 && { echo "FAIL 接受了非法 ID";
 mkdir "$T/dir.conf"
 change_begin "目录" >/dev/null
 change_track "$T/dir.conf" 2>/dev/null && { echo "FAIL 接受了目录"; fail=1; }
+
+# 回滚失败必须留下可重试的记录，不能标记成已回滚；非 root 才能用只读目录模拟失败
+if ((EUID != 0)); then
+  mkdir "$T/ro"
+  printf 'keep\n' >"$T/ro/file.conf"
+  change_begin "回滚失败" >/dev/null
+  change_track "$T/ro/file.conf"
+  change_track "$T/ro/new.conf"
+  printf 'changed\n' >"$T/ro/file.conf"
+  printf 'new\n' >"$T/ro/new.conf"
+  change_status applied
+  chmod 500 "$T/ro"
+  change_rollback "$CHG_ID" >/dev/null 2>&1 && { echo "FAIL 回滚失败却返回 0"; fail=1; }
+  [[ $(cat "$CHG_DIR/status") == rollback_failed ]] || { echo "FAIL 失败状态不是 rollback_failed"; fail=1; }
+  chmod 700 "$T/ro"
+  change_rollback "$CHG_ID" >/dev/null 2>&1 || { echo "FAIL 修复后重试回滚失败"; fail=1; }
+  [[ $(cat "$T/ro/file.conf") == keep ]] || { echo "FAIL 重试后内容未恢复"; fail=1; }
+  [[ ! -e $T/ro/new.conf ]] || { echo "FAIL 重试后新建文件未删除"; fail=1; }
+  [[ $(cat "$CHG_DIR/status") == rolled_back ]] || { echo "FAIL 重试后状态不是 rolled_back"; fail=1; }
+fi
+
 ((fail == 0)) && echo "PASS change-rollback"
 exit $fail

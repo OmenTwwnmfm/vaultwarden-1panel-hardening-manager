@@ -53,7 +53,7 @@ show_status() {
   fi
   if [[ $(fw_type) == 1panel-iptables ]]; then
     echo
-    echo "  1Panel 防火墙端口规则（只读，修改请到 1Panel →「主机」→「防火墙」）："
+    echo "  1Panel 防火墙端口规则（只读，修改可在 1Panel →「主机」→「防火墙」或 vhm [15]）："
     printf '  %-6s %-5s %-14s %s\n' 动作 协议 端口 来源
     panel_fw_rules || echo "  （读取失败）"
   fi
@@ -136,6 +136,9 @@ change_listen() {
     *) return 0 ;;
   esac
   [[ $want == "$cur" ]] && { log_info "已经是 $want"; return 0; }
+  if [[ $cur != ipv4 && $cur != ipv6 ]]; then
+    log_warn "当前监听模式为 $cur（具体地址或未知），变更记录无法保存该值：日后回滚只能恢复端口，不能自动恢复监听方式"
+  fi
   confirm_yes "把面板切换为监听 $want？面板会重启" || return 0
   change_begin "1Panel 面板监听 $cur → $want" panel
   [[ $cur == ipv4 || $cur == ipv6 ]] && printf 'LISTEN="%s"\n' "$cur" >"$CHG_DIR/panel.prev"

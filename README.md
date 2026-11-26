@@ -10,8 +10,9 @@
 ![Panel](https://img.shields.io/badge/panel-1Panel-1677ff)
 ![SSH](https://img.shields.io/badge/ssh-password%20%7C%20key%20%7C%20TOTP-16a34a)
 ![Protection](https://img.shields.io/badge/protection-Fail2Ban-dc2626)
-![Version](https://img.shields.io/badge/version-0.3.0-blue)
+![Version](https://img.shields.io/badge/version-0.3.1-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
+![CI](https://github.com/OmenTwwnmfm/vaultwarden-1panel-hardening-manager/actions/workflows/ci.yml/badge.svg)
 
 </div>
 
@@ -30,6 +31,16 @@ Vaultwarden 把整个家庭或团队的密码库放在一台 VPS 上，这台服
 所有会修改系统的操作都会先显示要改什么，再要求输入 `yes`。大小写不敏感：`yes`、`YES`、`Yes` 都可以继续；其他输入均取消。只读功能（体检、状态、端口一览、用户列表、登录记录）不需要确认，也不会修改任何文件。
 
 ## 功能特点
+
+### v0.3.1 修复说明
+
+- 回滚失败会记录为「回滚失败」并允许重试；自动回滚失败也会明确报警，不再被确认动作掩盖。
+- 自动回滚会等待全局修改锁并检查更新的重叠变更，避免覆盖正在编辑的配置。
+- UFW 规则删除改为按 `vhm` 注释定位，同条件但非 vhm 创建的规则不会被误删。
+- PAM 的 `auth substack common-auth` 写法在切换登录方式时可以正确恢复。
+- `sshd -T` 使用当前登录来源地址计算，`Match Address` 块能正确参与校验；2FA 状态识别 `nullok` 配置。
+- Fail2Ban 的 vhm jail 缺少 `port` 行时会自动补上；源码更新对 SSH 远端禁用交互式提示。
+- 本次同样只推送源码提交，不创建 GitHub Release。
 
 ### v0.3.0 升级说明
 
@@ -108,7 +119,7 @@ v0.2.0 从「只审计、给指引」改为可直接操作的加固工具，菜�
 - 未安装时自动安装；配置失败次数、统计时间窗口、封禁时长和白名单（默认填入当前连接 IP）。
 - 配置写入独立的 `/etc/fail2ban/jail.d/vhm-sshd.local`，不修改系统自带文件；SSH 端口与日志后端（auth.log / systemd journal）自动识别。
 - 配置先经 `fail2ban-client -t` 检查，启动失败自动恢复原配置。
-- `[16]` 查看状态与封禁列表，输入 IP 即可解封。
+- `[17]` 查看状态与封禁列表，输入 IP 即可解封。
 
 ### 1Panel 面板
 
@@ -128,7 +139,7 @@ v0.2.0 从「只审计、给指引」改为可直接操作的加固工具，菜�
 - **后台 ADMIN**：开启时自动生成随机密码（只显示一次）或自己输入，`config.json` 中只保存 argon2id 哈希；不用时可一键关闭。
 - **用户列表**：邮箱、注册时间、最近活动、是否开启两步验证、是否被禁用。只读打开 SQLite，不修改数据库。
 - **安全选项**：密码提示、登录页显示提示、Send、紧急访问、可创建组织的用户、图标服务，支持一键推荐设置。
-- 设置写入数据目录的 `config.json`，与在 `/admin` 页面保存的效果相同。它优先于 1Panel 应用参数，且 1Panel 升级或重建应用时不会被覆盖。`[17]` 显示每项的实际生效值和来源。
+- 设置写入数据目录的 `config.json`，与在 `/admin` 页面保存的效果相同。它优先于 1Panel 应用参数，且 1Panel 升级或重建应用时不会被覆盖。`[18]` 显示每项的实际生效值和来源。
 
 ### 修改前自动备份
 
@@ -168,6 +179,8 @@ sudo git clone https://github.com/OmenTwwnmfm/vaultwarden-1panel-hardening-manag
 cd /opt/vaultwarden-1panel-hardening-manager
 sudo bash ./run.sh
 ```
+
+第一次也可以先只做体检、不动系统：进入菜单选 `[02]`，或退出后运行 `sudo vhm checkup`。体检是只读的，不会修改任何文件；先看清哪些项是「危险」，再决定改什么。会改哪些文件、哪些事明确不会做、怎么回滚，见 [安全与影响说明](docs/安全与影响说明.md)。
 
 推荐顺序：
 
@@ -209,7 +222,7 @@ sudo bash ./run.sh
 
 **1Panel 的网页「终端」用不了了？** 它通过 SSH 连接本机，启用 2FA 后无法使用。1Panel 的「容器终端」不走 SSH，不受影响。
 
-**改了 1Panel 应用参数却不生效？** `config.json` 中的同名设置优先。用 `[17]` 查看每项的来源，在 vhm 中修改即可。
+**改了 1Panel 应用参数却不生效？** `config.json` 中的同名设置优先。用 `[18]` 查看每项的来源，在 vhm 中修改即可。
 
 **防火墙里关了端口，外网还能访问 Vaultwarden？** Docker 发布的端口会绕过 ufw / firewalld。在 1Panel →「已安装应用」→ Vaultwarden →「参数」中取消「端口外部访问」，让容器只监听 `127.0.0.1`。
 
@@ -228,10 +241,23 @@ sudo bash ./run.sh
 
 欢迎提交 Issue 或 Pull Request。涉及 SSH、PAM、防火墙和容器启停的修改，请同时提供 shellcheck 结果、测试结果，以及防锁死和回滚路径的说明。不要在 Issue 中上传真实配置、应急码、令牌或未脱敏的日志；需要环境信息时请贴 `[26]` 的脱敏诊断报告。
 
+## 开发与测试
+
+CI 在每次推送和 Pull Request 时运行 shellcheck、全部测试、密钥泄漏扫描和发布策略检查。本地可用同样的命令验证：
+
+```bash
+shellcheck -x run.sh scripts/*.sh tests/*.sh
+for t in tests/test-*.sh; do bash "$t"; done
+```
+
+提交涉及 SSH、PAM、防火墙和容器启停的修改前，请先在本地跑通全部测试，并说明防锁死与回滚路径。
+
 ## 文档
 
 - [快速开始](docs/快速开始.md)
 - [使用手册](docs/使用手册.md)
+- [安全与影响说明](docs/安全与影响说明.md)
+- [路线图](ROADMAP.md)
 - [更新日志](CHANGELOG.md)
 
 ## License

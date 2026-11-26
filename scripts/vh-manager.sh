@@ -66,7 +66,8 @@ sync_source() {
     return 1
   fi
   before=$(git -C "$root" rev-parse HEAD) || return 1
-  if ! GIT_TERMINAL_PROMPT=0 timeout 30 git -C "$root" fetch --quiet --no-tags origin main </dev/null 2>/dev/null; then
+  if ! GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes" \
+    timeout 30 git -C "$root" fetch --quiet --no-tags origin main </dev/null 2>/dev/null; then
     log_warn "暂时无法连接 GitHub，继续使用本地 v$VH_VERSION"
     return 1
   fi
@@ -119,7 +120,13 @@ auto_update_source() { # 每次进入菜单时检查一次
 status_args() {
   local port tfa pa pk f2b vw="未识别" panel="未安装"
   port=$(sshd_get port 2>/dev/null | paste -sd, -)
-  if tfa_enabled 2>/dev/null; then tfa="已启用"; else tfa="未启用"; fi
+  if tfa_enabled 2>/dev/null; then
+    tfa="已启用"
+  elif tfa_pam_nullok 2>/dev/null; then
+    tfa="PAM 带 nullok"
+  else
+    tfa="未启用"
+  fi
   pa=$(sshd_get passwordauthentication 2>/dev/null)
   case $pa in yes) pa="开" ;; no) pa="关" ;; *) pa="未知" ;; esac
   pk=$(sshd_get pubkeyauthentication 2>/dev/null)

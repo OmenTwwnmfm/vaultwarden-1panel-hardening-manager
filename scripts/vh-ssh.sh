@@ -105,7 +105,7 @@ dropin_del() {
 }
 dropin_add() {
   install -d -m 755 "$(dirname "$SSHD_DROPIN")"
-  [[ -f $SSHD_DROPIN ]] || printf '# 由 vhm 管理，请勿手动修改；可在 vhm [24] 中回滚\n' >"$SSHD_DROPIN"
+  [[ -f $SSHD_DROPIN ]] || printf '# 由 vhm 管理，请勿手动修改；可在 vhm [25] 中回滚\n' >"$SSHD_DROPIN"
   printf '%s %s\n' "$1" "$2" >>"$SSHD_DROPIN"
   chmod 600 "$SSHD_DROPIN"
 }
@@ -247,7 +247,7 @@ del_key() {
   change_track "$ROOT_KEYS" || return 1
   sed -i "${KEY_LINE[$i]}d" "$ROOT_KEYS"
   change_status applied
-  log_ok "已删除（可在 [24] 回滚）"
+  log_ok "已删除（可在 [25] 回滚）"
 }
 
 keys_menu() {
@@ -287,6 +287,8 @@ show_status() {
   printf '  %-22s %s\n' "认证组合" "$(get authenticationmethods)"
   if tfa_enabled; then
     printf '  %-22s %s\n' "2FA" "已启用（$(auth_mode_label "$(ssh_auth_mode)")）"
+  elif tfa_pam_nullok; then
+    printf '  %-22s %s\n' "2FA" "PAM 带 nullok：未绑定动态口令也能登录，不算真正启用"
   elif tfa_pam_on; then
     printf '  %-22s %s\n' "2FA" "PAM 已配置但 sshd 未要求，未生效"
   else
@@ -439,7 +441,9 @@ ga_bind_new() {
   # </dev/null 保证即使将来又多出交互提问，也会立即失败而不是挂起。
   if ! out=$(google-authenticator -t -d -f -C -r 3 -R 30 -w 3 -e 5 -Q NONE -s "$f" \
     -i "$GA_ISSUER" -l "$(ga_label)" </dev/null 2>&1) || [[ ! -s $f ]]; then
-    log_err "生成动态口令密钥失败：$(tail -n 3 <<<"$out" | redact)"
+    # 工具失败输出可能包含刚生成的种子/应急码：只回显到当前终端，不写入日志
+    printf '%s\n' "$(tail -n 3 <<<"$out" | redact)" >&2
+    log_err "生成动态口令密钥失败（工具输出如上，仅显示在终端）"
     rm -f -- "$f"
     return 1
   fi
@@ -467,7 +471,7 @@ ga_bind_new() {
 
 pam_set_auth_mode() {
   python3 - "$PAM_SSHD" "$PAM_GA_LINE" "$PAM_MARK" "$1" <<'PY'
-import re, sys
+import os, re, sys, tempfile
 path, ga, mark, mode = sys.argv[1:]
 lines = open(path, encoding="utf-8").read().splitlines()
 out, common_seen = [], False
@@ -477,7 +481,7 @@ for line in lines:
     s = line.strip()
     if re.match(r"auth\s+\S+\s+pam_google_authenticator\.so", s):
         continue
-    if line.startswith(mark) and re.match(r"@include\s+common-auth\b", line[len(mark):]):
+    if line.startswith(mark) and re.match(r"(@include\s+common-auth|auth\s+substack\s+common-auth)\b", line[len(mark):]):
         line = line[len(mark):]
         s = line.strip()
     if re.match(r"@include\s+common-auth\b|auth\s+substack\s+common-auth\b", s):
@@ -494,7 +498,21 @@ if totp and not common_seen:
     if password_totp:
         sys.exit("[错误] PAM 中找不到 common-auth，不能安全配置「密码 + 动态口令」模式")
     out.append(ga)
-open(path, "w", encoding="utf-8").write("\n".join(out) + "\n")
+data = "\n".join(out) + "\n"
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".sshd.vhm-")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
 PY
 }
 
@@ -504,6 +522,8 @@ auth_mode_label() {
     key) echo "密钥登录" ;;
     password_totp) echo "密码 + 动态口令" ;;
     key_totp) echo "密钥 + 动态口令（推荐）" ;;
+    key_password_totp) echo "密钥 + 密码 + 动态口令（PAM 含 common-auth，需改为密钥 + 动态口令）" ;;
+    totp_only) echo "仅动态口令（未包含系统密码，建议改为密码 + 动态口令）" ;;
     mixed) echo "密码或密钥（未限制）" ;;
     *) echo "自定义配置" ;;
   esac
@@ -571,6 +591,7 @@ configure_auth_mode() {
     expect_eff passwordauthentication "$password" &&
     expect_eff pubkeyauthentication "$pubkey" &&
     expect_eff kbdinteractiveauthentication "$kbd" &&
+    expect_eff permitrootlogin "$permit" &&
     expect_eff usepam yes; }; then
     change_rollback "$CHG_ID"
     return 1
@@ -643,7 +664,7 @@ tfa_qr() {
 }
 
 tfa_disable() {
-  tfa_enabled || tfa_pam_on || { log_info "2FA 未启用"; return 0; }
+  tfa_enabled || tfa_pam_on || tfa_pam_nullok || { log_info "2FA 未启用"; return 0; }
   echo "关闭 2FA 后将改为仅 SSH 密钥登录。动态口令绑定文件会保留，以后可再次启用。"
   confirm_yes "关闭 2FA 并切换到密钥登录？" || return 0
   configure_auth_mode key
@@ -651,7 +672,13 @@ tfa_disable() {
 
 tfa_manage() {
   title "2FA 管理"
-  if tfa_enabled; then log_ok "2FA 已启用：$(auth_mode_label "$(ssh_auth_mode)")"; else log_info "2FA 未启用（[06] 可选择登录方式）"; fi
+  if tfa_enabled; then
+    log_ok "2FA 已启用：$(auth_mode_label "$(ssh_auth_mode)")"
+  elif tfa_pam_nullok; then
+    log_warn "PAM 带 nullok：未绑定动态口令也能登录，不算真正启用；请在 [06] 重新选择登录方式"
+  else
+    log_info "2FA 未启用（[06] 可选择登录方式）"
+  fi
   echo
   echo "  [1] 显示绑定二维码（在新手机 / 第二个验证器上添加同一账号）"
   echo "  [2] 重新绑定（换新密钥：密钥泄露 / 应急码用完）"
@@ -668,12 +695,14 @@ tfa_manage() {
   esac
 }
 
-case ${1:-status} in
-  status) show_status ;;
-  keys) need_root; with_lock keys_menu ;;
-  port) need_root; with_lock change_port ;;
-  2fa-enable | auth-mode) need_root; with_lock auth_mode_menu ;;
-  2fa-manage) need_root; with_lock tfa_manage ;;
-  logins) show_logins ;;
-  *) die "未知参数：$1" ;;
-esac
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  case ${1:-status} in
+    status) show_status ;;
+    keys) need_root; with_lock keys_menu ;;
+    port) need_root; with_lock change_port ;;
+    2fa-enable | auth-mode) need_root; with_lock auth_mode_menu ;;
+    2fa-manage) need_root; with_lock tfa_manage ;;
+    logins) show_logins ;;
+    *) die "未知参数：$1" ;;
+  esac
+fi

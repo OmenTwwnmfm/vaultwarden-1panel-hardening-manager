@@ -58,6 +58,18 @@ print("ipv%d" % net.version)
 PY
 }
 
+# 归一化来源：主机位带前缀（如 1.2.3.4/24）按网络地址输出，单主机保持原样
+source_normalize() {
+  python3 - "$1" <<'PY'
+import ipaddress, sys
+try:
+    net = ipaddress.ip_network(sys.argv[1], strict=False)
+except ValueError:
+    sys.exit(1)
+print(net.network_address if net.prefixlen == net.max_prefixlen else net)
+PY
+}
+
 valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
 
 # ---------- iptables（1Panel） ----------
@@ -103,7 +115,11 @@ ipt_apply_line() { # ipt_apply_line 地址族 规则行：用 restore 执行一�
   printf '*filter\n%s\nCOMMIT\n' "$2" | "$(family_bin "$1")-restore" -w --noflush
 }
 
-ipt_has_line() { "$(family_bin "$1")" -w -S "$FW_CHAIN" 2>/dev/null | grep -Fxq -- "$2"; }
+ipt_has_line() { # 先完整读取再匹配：grep -q 提前退出会让大链触发 SIGPIPE，pipefail 下误判为失败
+  local out
+  out=$("$(family_bin "$1")" -w -S "$FW_CHAIN" 2>/dev/null) || return 1
+  grep -Fxq -- "$2" <<<"$out"
+}
 
 # 与 1Panel 的保存逻辑相同：只写链中的 -A 行，保留原权限，临时文件改名替换
 persist_chain() {
@@ -136,7 +152,7 @@ ipt_add() { # ipt_add 地址族 动作 协议 端口 来源 位置 编号 注释
   fi
   raw=$("$bin" -w -S "$FW_CHAIN" | grep -F -m1 -- "vhm:$7")
   [[ -n $raw ]] || { log_err "规则写入后未能在 $FW_CHAIN 中找到"; return 1; }
-  record_undo delete "$family" 0 "$raw"
+  record_undo delete "$family" 0 "$raw" || { ipt_apply_line "$family" "${raw/#-A /-D }"; log_err "无法写入回滚记录"; return 1; }
   persist_chain "$family"
 }
 
@@ -178,29 +194,65 @@ PY
 
 ufw_spec() { printf '%s\n' "$1" from "$4" to any port "$3" proto "$2"; } # ufw_spec 动作 协议 端口 来源
 
+# 从 ufw status numbered 中找出带指定 vhm 标记的规则编号（v4 / v6 各一条时都会列出）
+ufw_comment_numbers() {
+  local id=$1
+  ufw_run status numbered 2>/dev/null | awk -v marker="vhm:$id" '
+    { n = "" }
+    match($0, /^\[[[:space:]]*[0-9]+\]/) {
+      n = substr($0, RSTART + 1, RLENGTH - 2)
+      gsub(/[^0-9]/, "", n)
+    }
+    n != "" && (index($0, "# " marker) || index($0, "#" marker)) { print n }
+  '
+}
+
+ufw_del_comment() { # ufw_del_comment 规则ID [必须存在=1]：只按 vhm 标记删除，不按同条件规则删除
+  local id=$1 required=${2:-0} n
+  local -a nums=()
+  mapfile -t nums < <(ufw_comment_numbers "$id" | sort -rn)
+  if ((${#nums[@]} == 0)); then
+    if ((required)); then
+      log_err "UFW 中找不到 vhm:$id 的规则（可能已在 1Panel 中删除），请刷新后重试"
+      return 1
+    fi
+    log_info "UFW 中已没有 vhm:$id 的规则"
+    return 0
+  fi
+  for n in "${nums[@]}"; do
+    ufw_run --force delete "$n" || { log_err "UFW 删除第 $n 条规则失败"; return 1; }
+  done
+  if [[ -n $(ufw_comment_numbers "$id") ]]; then
+    log_err "删除后仍能查到 vhm:$id，请检查 UFW 状态"
+    return 1
+  fi
+  log_ok "已删除 UFW 规则 vhm:$id（${#nums[@]} 条）"
+}
+
 ufw_add() { # ufw_add 动作 协议 端口 来源 位置 注释
-  local out
+  local out id=${6#vhm:}
+  id=${id%% *}
   local -a spec
   mapfile -t spec < <(ufw_spec "$1" "$2" "$3" "$4")
   if (($5 > 0)); then
-    out=$(ufw insert "$5" "${spec[@]}" comment "$6" 2>&1) || { log_err "UFW 添加失败：$out"; return 1; }
+    out=$(ufw_run insert "$5" "${spec[@]}" comment "$6" 2>&1) || { log_err "UFW 添加失败：$out"; return 1; }
   else
-    out=$(ufw "${spec[@]}" comment "$6" 2>&1) || { log_err "UFW 添加失败：$out"; return 1; }
+    out=$(ufw_run "${spec[@]}" comment "$6" 2>&1) || { log_err "UFW 添加失败：$out"; return 1; }
   fi
   echo "$out" | sed 's/^/  /'
   if [[ $out == *Skipping* && $out != *added* ]]; then
-    log_info "已存在相同规则，未重复添加"
-    return 0
+    if [[ -n $(ufw_comment_numbers "$id") ]]; then
+      log_info "已存在相同的 vhm 规则，未重复添加"
+      return 0
+    fi
+    log_warn "UFW 中已有相同条件但不是 vhm 创建的规则，未重复添加；请先在 1Panel 中确认"
+    return 1
   fi
-  record_undo ufw-delete "$1" "$2" "$3" "$4" "$6"
-}
-
-ufw_del() { # ufw_del 动作 协议 端口 来源
-  local out
-  local -a spec
-  mapfile -t spec < <(ufw_spec "$1" "$2" "$3" "$4")
-  out=$(ufw --force delete "${spec[@]}" 2>&1) || { log_err "UFW 删除失败：$out"; return 1; }
-  echo "$out" | sed 's/^/  /'
+  if [[ -z $(ufw_comment_numbers "$id") ]]; then
+    log_err "UFW 添加后未找到 vhm:$id 标记"
+    return 1
+  fi
+  record_undo ufw-delete "$6" || { ufw_del_comment "$id"; log_err "无法写入回滚记录"; return 1; }
 }
 
 # ---------- 界面 ----------
@@ -217,7 +269,7 @@ show_rules() {
     done
     ((${#R_RAW[@]})) || echo "  （链中暂无规则）"
   else
-    ufw status numbered 2>/dev/null | sed 's/^/  /'
+    ufw_run status numbered 2>/dev/null | sed 's/^/  /'
   fi
 }
 
@@ -236,6 +288,8 @@ add_rule() {
   source=${source:-any}
   if [[ $source != any ]]; then
     family=$(source_family "$source") || { log_err "来源不是有效的 IPv4 / IPv6 地址或网段"; return 1; }
+    # 归一化后再下发与回显：1.2.3.4/24 实际放行的是整个 1.2.3.0/24 网段，按原文回显会误导确认
+    source=$(source_normalize "$source") || { log_err "来源不是有效的 IPv4 / IPv6 地址或网段"; return 1; }
     scope=$source
   elif [[ $be == iptables ]] && have_family ipv6; then
     read -r -p "地址族 [4/6，默认 4]: " ans || return 0
@@ -298,15 +352,15 @@ delete_rule() {
     ipt_has_line "$family" "$raw" || { log_err "规则已被其他程序修改，请刷新后重试"; return 1; }
     change_begin "删除防火墙规则 vhm:${R_ID[$i]}" firewall
     FW_UNDO=$CHG_DIR/firewall-undo
+    record_undo insert "$family" "${R_POS[$i]}" "$raw" || { change_rollback "$CHG_ID"; return 1; }
     ipt_apply_line "$family" "${raw/#-A /-D }" || { log_err "删除失败"; change_rollback "$CHG_ID"; return 1; }
-    record_undo insert "$family" "${R_POS[$i]}" "$raw"
     persist_chain "$family" || { change_rollback "$CHG_ID"; return 1; }
   else
     IFS=$'\t' read -r rule_id action proto port source comment <<<"${UFW_ROWS[$i]}"
     change_begin "删除防火墙规则 vhm:$rule_id" firewall
     FW_UNDO=$CHG_DIR/firewall-undo
-    ufw_del "$action" "$proto" "$port" "$source" || { change_rollback "$CHG_ID"; return 1; }
-    record_undo ufw-add "$action" "$proto" "$port" "$source" "$comment"
+    record_undo ufw-add "$action" "$proto" "$port" "$source" "$comment" || { change_rollback "$CHG_ID"; return 1; }
+    ufw_del_comment "$rule_id" 1 || { change_rollback "$CHG_ID"; return 1; }
   fi
   change_status applied
   log_ok "规则已删除（变更 $CHG_ID，可在 [25] 回滚）"
@@ -338,7 +392,7 @@ menu() {
 
 # 回滚：按相反顺序撤销本次记录的每一步，只动这些规则，不覆盖之后新增的其他规则
 restore() {
-  local record=$1 rc=0 i kind a b c d e
+  local record=$1 rc=0 i kind a b c d e id
   local -a lines=() touched=()
   [[ -f $record/firewall-undo ]] || return 0
   mapfile -t lines <"$record/firewall-undo"
@@ -355,7 +409,14 @@ restore() {
         fi
         touched+=("$a")
         ;;
-      ufw-delete) ufw_del "$a" "$b" "$c" "$d" || rc=1 ;;
+      ufw-delete)
+        if [[ -n ${b:-} ]]; then
+          id=${e#vhm:}
+        else
+          id=${a#vhm:}
+        fi
+        ufw_del_comment "${id%% *}" || rc=1
+        ;;
       ufw-add) ufw_add "$a" "$b" "$c" "$d" 0 "$e" || rc=1 ;;
     esac
   done
@@ -367,11 +428,13 @@ restore() {
   return $rc
 }
 
-case ${1:-menu} in
-  menu) need_root; with_lock menu ;;
-  restore)
-    [[ -d ${2:-} ]] || exit 1
-    restore "$2"
-    ;;
-  *) die "未知参数：$1" ;;
-esac
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  case ${1:-menu} in
+    menu) need_root; with_lock menu ;;
+    restore)
+      [[ -d ${2:-} ]] || exit 1
+      restore "$2"
+      ;;
+    *) die "未知参数：$1" ;;
+  esac
+fi

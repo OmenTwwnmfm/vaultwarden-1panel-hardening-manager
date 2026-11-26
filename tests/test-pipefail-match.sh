@@ -4,7 +4,7 @@ set -Euo pipefail
 cd "$(dirname "$0")/.." || exit 1
 VH_LOG=/dev/null source scripts/vh-common.sh
 fail=0
-# shellcheck disable=SC2329 # 通过 out_match 间接调用
+# shellcheck disable=SC2329,SC2317 # 通过 out_match 间接调用
 noisy() { echo "  entrance    desc"; sleep 0.2; seq 1 200000; }
 out_match '^[[:space:]]+entrance[[:space:]]' noisy || { echo "FAIL 匹配被误判为失败"; fail=1; }
 out_match 'not-there' noisy && { echo "FAIL 不匹配却返回成功"; fail=1; }

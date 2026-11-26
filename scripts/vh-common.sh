@@ -38,6 +38,10 @@ fi
 # ---------- 日志 ----------
 _log_file() {
   [[ -w "$(dirname "$VH_LOG")" ]] || return 0
+  [[ ! -L "$VH_LOG" ]] || return 0
+  if [[ ! -e "$VH_LOG" ]]; then
+    (umask 077; : >>"$VH_LOG") 2>/dev/null || true
+  fi
   printf '%s [%s] %s\n' "$(date '+%F %T')" "$1" "$(redact "$2")" >>"$VH_LOG" 2>/dev/null || true
 }
 log_info() { printf '%s[信息]%s %s\n' "$C_B" "$C_0" "$*"; _log_file INFO "$*"; }
@@ -83,7 +87,11 @@ apt_install() {
   apt-get update && apt-get install -y "$@" && return 0
   host=$(apt_host)
   proxy=$(apt-config dump 2>/dev/null | grep -Ei '^Acquire::(https?|ftp)::Proxy ' || true)
-  [[ -n $proxy ]] && log_warn "apt 配置了代理（$proxy），请确认代理可用"
+  if [[ -n $proxy ]]; then
+    # 代理地址可能内嵌 user:password@，写日志前先去掉凭据部分
+    proxy=$(printf '%s' "$proxy" | sed -E 's#(://)[^/@[:space:]]+@#\1***@#g')
+    log_warn "apt 配置了代理（$proxy），请确认代理可用"
+  fi
   if [[ -z $host ]]; then
     log_err "安装 $* 失败（没有做任何修改），请查看上面 apt 的输出"
     return 1
@@ -154,12 +162,41 @@ with_lock() {
     return
   fi
   mkdir -p "$(dirname "$VH_LOCK")" 2>/dev/null || true
+  if [[ -L "$VH_LOCK" ]]; then
+    log_err "锁文件是符号链接，拒绝使用：$VH_LOCK"
+    exit 1
+  fi
   if ! exec 9>"$VH_LOCK"; then
     log_err "无法打开锁文件 $VH_LOCK"
     exit 1
   fi
   if ! flock -n 9; then
     log_warn "另一个 vhm 修改操作正在运行，请等它结束后再试（退出码 $VH_EXIT_LOCKED）"
+    exit "$VH_EXIT_LOCKED"
+  fi
+  export VH_LOCK_HELD=1
+  "$@"
+}
+
+# 最多等待 N 秒再拿全局锁；用于自动回滚，避免和用户正在进行的修改并发写配置
+with_lock_wait() {
+  local wait=$1
+  shift
+  if [[ "${VH_LOCK_HELD:-0}" == 1 ]]; then
+    "$@"
+    return
+  fi
+  mkdir -p "$(dirname "$VH_LOCK")" 2>/dev/null || true
+  if [[ -L "$VH_LOCK" ]]; then
+    log_err "锁文件是符号链接，拒绝使用：$VH_LOCK"
+    exit 1
+  fi
+  if ! exec 9>"$VH_LOCK"; then
+    log_err "无法打开锁文件 $VH_LOCK"
+    exit 1
+  fi
+  if ! flock -w "$wait" 9; then
+    log_warn "等待其他 vhm 修改操作超过 ${wait} 秒，本次自动回滚暂缓（退出码 $VH_EXIT_LOCKED）"
     exit "$VH_EXIT_LOCKED"
   fi
   export VH_LOCK_HELD=1
@@ -256,6 +293,15 @@ load_instance() {
   elif [[ -z "$VW_CONTAINER" ]] || ! docker inspect "$VW_CONTAINER" >/dev/null 2>&1; then
     # 1Panel 重建应用后容器名可能变化：按数据目录重新匹配
     detect_instance "$VW_DATA_DIR" || return $?
+  else
+    # 已保存的配对也要复检挂载关系：容器名可能被其他应用复用，
+    # 若它没有把该目录挂载为 /data，按数据目录重新识别而不是直接信任。
+    local mounted
+    mounted=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$VW_CONTAINER" 2>/dev/null)
+    if [[ "$mounted" != "$VW_DATA_DIR" ]]; then
+      log_warn "已保存的容器 $VW_CONTAINER 未把 $VW_DATA_DIR 挂载为 /data，按数据目录重新识别"
+      detect_instance "$VW_DATA_DIR" || return $?
+    fi
   fi
 }
 
@@ -418,6 +464,7 @@ vbm_backup_before_change() {
 vbm_lock_hold() {
   [[ -e $VBM_CONF ]] || return 0
   mkdir -p "$(dirname "$VBM_LOCK")" 2>/dev/null || true
+  [[ ! -L "$VBM_LOCK" ]] || { log_err "vbm 锁文件是符号链接，拒绝使用：$VBM_LOCK"; return 1; }
   exec 8>"$VBM_LOCK" || return 1
   flock -w 30 8 || { log_err "vbm 的锁被占用，本次未修改"; exec 8>&-; return 1; }
 }
@@ -439,9 +486,7 @@ vw_apply() {
     log_ok "$desc：已生效（变更 $CHG_ID，可在 [25] 回滚）"
   else
     log_err "$desc 失败，正在恢复原配置……"
-    change_restore_files "$CHG_DIR"
-    vw_restart_check || log_err "恢复后容器仍不健康，请在 1Panel 中检查 Vaultwarden 日志"
-    change_status rolled_back
+    change_rollback "$CHG_ID" || log_err "恢复失败，记录已标记为「回滚失败」，可在 [25] 重试"
     rc=1
   fi
   vbm_lock_release
@@ -450,7 +495,7 @@ vw_apply() {
 
 # ---------- 变更记录与回滚 ----------
 # 目录：$VH_CHANGES/<YYYYmmdd-HHMMSS-PID>/
-#   meta（ID/TIME/DESC/HOOKS）、status（pending/applied/rolled_back）
+#   meta（ID/TIME/DESC/HOOKS）、status（pending/applied/confirmed/rolled_back/rollback_failed）
 #   files.tsv（序号、修改前是否存在、权限、属主、路径），files/<序号> 为原文件副本
 change_begin() { # change_begin 描述 [回滚钩子...]
   change_prune
@@ -587,20 +632,53 @@ change_rollback() {
     exec 7>&-
     return 0
   fi
+  if [[ ${VH_ROLLBACK_PENDING_ONLY:-0} == 1 && $st != pending ]]; then
+    log_info "变更 $id 状态为 $st（已确认保留），自动回滚取消"
+    exec 7>&-
+    return 0
+  fi
   hooks=$(change_meta "$id" HOOKS)
   change_restore_files "$d" || rc=1
   # shellcheck disable=SC2086
   run_hooks "$d" $hooks || rc=1
-  printf 'rolled_back\n' >"$d/status"
+  if ((rc == 0)); then
+    printf 'rolled_back\n' >"$d/status"
+  else
+    printf 'rollback_failed\n' >"$d/status"
+  fi
   exec 7>&-
-  if ((rc == 0)); then log_ok "已回滚变更 $id（$(change_meta "$id" DESC)）"; else log_err "变更 $id 回滚时出现错误，请检查上面的输出"; fi
+  if ((rc == 0)); then
+    log_ok "已回滚变更 $id（$(change_meta "$id" DESC)）"
+  else
+    log_err "变更 $id 回滚时出现错误，记录标记为「回滚失败」，修复上面的问题后可在 [25] 重试"
+  fi
   return $rc
+}
+
+# 用户确认保留时先「认领」变更：在记录锁内把 pending 改为 confirmed。
+# 与定时器回滚共用同一把记录锁且回滚前在锁内复查状态，确认与回滚不会竞态：
+# 认领先完成则自动回滚取消；回滚先完成则认领失败并提示确认太晚。
+# 返回 0 表示认领成功；1 表示已经回滚。
+change_claim_confirmed() {
+  local id=$1 d="$VH_CHANGES/$1" st
+  [[ -d $d ]] || return 1
+  exec 7>"$d/.lock" || return 1
+  flock -w 60 7 || { exec 7>&-; return 1; }
+  st=$(cat "$d/status" 2>/dev/null)
+  if [[ $st == rolled_back || $st == rollback_failed ]]; then
+    exec 7>&-
+    return 1
+  fi
+  [[ $st == pending ]] && printf 'confirmed\n' >"$d/status"
+  exec 7>&-
+  return 0
 }
 
 # SSH 类变更的防锁死保护：到时未确认则由 systemd 定时器自动回滚（当前会话不受影响）
 guard_start() {
   command -v systemd-run >/dev/null 2>&1 || { log_err "缺少 systemd-run，无法设置自动回滚保护"; return 1; }
   systemd-run --quiet --unit="vhm-guard-$CHG_ID" --on-active="$GUARD_SECONDS" --timer-property=AccuracySec=1s \
+    --property=TimeoutStartSec=infinity \
     --setenv=VH_CONF="$VH_CONF" --setenv=VH_STATE="$VH_STATE" --setenv=VH_LOG="$VH_LOG" \
     /bin/bash "$VH_DIR/vh-changes.sh" auto-rollback "$CHG_ID"
 }
@@ -614,10 +692,15 @@ guard_wait_confirm() {
   echo "请【保持当前窗口不要关闭】，另开一个终端窗口按新方式登录服务器。"
   [[ -n ${1:-} ]] && echo "测试命令：$1"
   echo "登录成功后回到这里输入 yes 保留更改；输入其他内容会立即回滚；${mins} 分钟内无操作将自动回滚。"
+  echo "注意：保护期内请勿重启机器——定时器不跨重启，重启后自动回滚不会触发，只能用 VNC 登录后在 [25] 手动回滚。"
   if read -r -t "$GUARD_SECONDS" -p "新窗口登录成功了吗？输入 yes 保留: " ans && [[ ${ans,,} == yes ]]; then
     guard_stop
-    if [[ $(cat "$CHG_DIR/status" 2>/dev/null) == rolled_back ]]; then
-      log_err "确认太晚，已经自动回滚。"
+    if ! change_claim_confirmed "$CHG_ID"; then
+      case $(cat "$CHG_DIR/status" 2>/dev/null) in
+        rollback_failed) log_err "自动回滚失败，配置可能处于不一致状态，请立即用 VNC 登录检查并在 [25] 重试回滚。" ;;
+        rolled_back) log_err "确认太晚，已经自动回滚。" ;;
+        *) log_err "无法确认变更状态（可能被其他进程占用），请保持当前窗口并检查 [25]。" ;;
+      esac
       return 1
     fi
     return 0
@@ -634,11 +717,18 @@ if [[ -z ${SSHD_BIN:-} ]]; then
   if [[ -x /usr/sbin/sshd ]]; then SSHD_BIN=/usr/sbin/sshd; else SSHD_BIN=$(command -v sshd 2>/dev/null || echo /usr/sbin/sshd); fi
 fi
 sshd_test() { mkdir -p /run/sshd 2>/dev/null; "$SSHD_BIN" -t 2>&1; }
-# 生效配置：优先按「root 从外网登录」的条件计算（让 Match 块生效）；不支持 -C 时退回 sshd -T
+# 生效配置：优先按当前 SSH 客户端的真实来源地址计算（让 Match 块生效）；
+# 从控制台 / VNC 运行时没有来源地址，用一个文档保留地址代替。不支持 -C 时退回 sshd -T。
 sshd_eff() {
-  local out
+  local out addr
   mkdir -p /run/sshd 2>/dev/null
-  out=$("$SSHD_BIN" -T -C user=root,host=vhm-check,addr=203.0.113.1 2>/dev/null) || out=""
+  addr=${SSH_CONNECTION:-}
+  addr=${addr%% *}
+  if [[ -z $addr ]]; then
+    addr=$(who am i 2>/dev/null | awk '{ print $NF }' | tr -d '()')
+  fi
+  [[ $addr =~ ^[0-9a-fA-F:.]+$ ]] || addr=203.0.113.1
+  out=$("$SSHD_BIN" -T -C user=root,host=vhm-check,addr="$addr" 2>/dev/null) || out=""
   [[ -n $out ]] || out=$("$SSHD_BIN" -T 2>/dev/null) || out=""
   # OpenSSH 10.x 的 sshd -T 输出配置名用驼峰（Port、PasswordAuthentication），旧版是全小写；统一转成小写
   [[ -n $out ]] && awk '{ $1 = tolower($1); print }' <<<"$out"
@@ -719,7 +809,18 @@ ssh_reload() {
   fi
 }
 
-tfa_pam_on() { grep -Eq '^[[:space:]]*auth[[:space:]]+required[[:space:]]+pam_google_authenticator\.so' "$PAM_SSHD" 2>/dev/null; }
+tfa_pam_lines() { grep -E '^[[:space:]]*auth[[:space:]]+required[[:space:]]+pam_google_authenticator\.so' "$PAM_SSHD" 2>/dev/null; }
+# 带 nullok 时未绑定动态口令也可以跳过，不能算真正启用
+tfa_pam_on() {
+  local lines
+  lines=$(tfa_pam_lines) || return 1
+  grep -qv 'nullok' <<<"$lines"
+}
+tfa_pam_nullok() {
+  local lines
+  lines=$(tfa_pam_lines) || return 1
+  grep -q 'nullok' <<<"$lines"
+}
 tfa_enabled() {
   local mode
   mode=$(sshd_get authenticationmethods)
@@ -734,8 +835,10 @@ ssh_auth_mode() {
   tfa=$(tfa_pam_on && echo yes || echo no)
   common_auth=no
   if grep -Eq '^[[:space:]]*(@include[[:space:]]+common-auth|auth[[:space:]]+substack[[:space:]]+common-auth)' "$PAM_SSHD" 2>/dev/null; then common_auth=yes; fi
-  if [[ $tfa == yes && $methods == *publickey,keyboard-interactive* ]]; then echo key_totp
-  elif [[ $tfa == yes && $methods == keyboard-interactive && $common_auth == yes ]]; then echo password_totp
+  if [[ $tfa == yes && $methods == *publickey,keyboard-interactive* ]]; then
+    if [[ $common_auth == yes ]]; then echo key_password_totp; else echo key_totp; fi
+  elif [[ $tfa == yes && $methods == keyboard-interactive ]]; then
+    if [[ $common_auth == yes ]]; then echo password_totp; else echo totp_only; fi
   elif [[ $methods == publickey && $pubkey == yes ]]; then echo key
   elif [[ $methods == password && $password == yes ]]; then echo password
   elif [[ $methods == any && $password == yes && $pubkey == yes ]]; then echo mixed
@@ -744,15 +847,17 @@ ssh_auth_mode() {
 }
 
 # ---------- 防火墙 / Fail2Ban / sysctl ----------
-# 防火墙规则由 1Panel 管理，vhm 只读识别。1Panel（iptables）使用 1PANEL_BASIC_BEFORE / 1PANEL_BASIC /
+# 防火墙规则由 1Panel 和 vhm [15] 共同管理，两者读写同一后端。1Panel（iptables）使用 1PANEL_BASIC_BEFORE / 1PANEL_BASIC /
 # 1PANEL_BASIC_AFTER 三条链挂在 INPUT 上，放行规则在 1PANEL_BASIC，末尾链默认丢弃其余 TCP/UDP。
+ufw_run() { LANGUAGE=en_US:en LC_ALL=C ufw "$@"; }
 fw_type() {
-  if command -v ufw >/dev/null 2>&1 && out_match 'Status: active' ufw status; then
+  # 1Panel 的 iptables 后端优先：只要 INPUT 仍跳到 1PANEL_BASIC，vhm 就应与 1Panel 页面保持一致
+  if command -v iptables >/dev/null 2>&1 && out_match '-j 1PANEL_BASIC' iptables -w -S INPUT; then
+    echo 1panel-iptables
+  elif command -v ufw >/dev/null 2>&1 && out_match 'Status: active' ufw_run status; then
     echo ufw
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     echo firewalld
-  elif command -v iptables >/dev/null 2>&1 && out_match '-j 1PANEL_BASIC' iptables -w -S INPUT; then
-    echo 1panel-iptables
   elif command -v nft >/dev/null 2>&1 && out_match '1panel|1PANEL' nft list ruleset; then
     echo 1panel-nftables
   elif command -v nft >/dev/null 2>&1 && out_match 'hook input .*policy drop' nft list ruleset; then
@@ -769,6 +874,7 @@ fw_label() {
   case ${1:-$(fw_type)} in
     1panel-iptables) echo "1Panel（iptables）" ;;
     1panel-nftables) echo "1Panel（nftables）" ;;
+    ufw) echo "UFW" ;;
     none) echo "未启用" ;;
     *) echo "$1" ;;
   esac
@@ -781,7 +887,7 @@ port_scope() {
   case $(fw_type) in
     none) echo all ;;
     ufw)
-      rules=$(ufw status 2>/dev/null | grep -E "^$p(/$proto)?[[:space:]]" | grep ALLOW || true)
+      rules=$(ufw_run status 2>/dev/null | grep -E "^$p(/$proto)?[[:space:]]" | grep ALLOW || true)
       if [[ -z $rules ]]; then echo none; elif grep -q 'ALLOW.*Anywhere' <<<"$rules"; then echo all; else echo limited; fi
       ;;
     firewalld)
@@ -825,7 +931,7 @@ wait_port_allowed() {
         return 1
         ;;
     esac
-    log_warn "防火墙尚未放行 $p/tcp。请到 1Panel →「主机」→「防火墙」→「创建规则」，放行端口 $p，协议 TCP。"
+    log_warn "防火墙尚未放行 $p/tcp。请在 1Panel →「主机」→「防火墙」或 vhm [15] 中放行端口 $p，协议 TCP。"
     echo "云服务器还要在服务商控制台的安全组里放行。"
     read -r -p "放行后按 Enter 重新检查；输入 y 跳过检查（已用端口范围放行时）；输入 q 取消: " a || return 1
     case $a in
@@ -933,7 +1039,11 @@ f2b_sync_ssh_port() {
   [[ $current == "$ports" ]] && return 0
   change_begin "Fail2Ban SSH 端口 $current → $ports" fail2ban
   change_track "$F2B_JAIL" || return 1
-  sed -i -E "s/^[[:space:]]*port[[:space:]]*=.*/port = $ports/" "$F2B_JAIL"
+  if grep -Eq '^[[:space:]]*port[[:space:]]*=' "$F2B_JAIL"; then
+    sed -i -E "s/^[[:space:]]*port[[:space:]]*=.*/port = $ports/" "$F2B_JAIL"
+  else
+    printf 'port = %s\n' "$ports" >>"$F2B_JAIL"
+  fi
   if ! out=$(fail2ban-client -t 2>&1) || ! f2b_reload; then
     log_err "Fail2Ban 同步 SSH 端口失败：$(tail -n 3 <<<"$out")"
     change_rollback "$CHG_ID"

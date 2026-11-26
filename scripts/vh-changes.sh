@@ -18,7 +18,9 @@ load_list() {
 status_name() {
   case $(cat "$VH_CHANGES/$1/status" 2>/dev/null) in
     applied) echo 已生效 ;;
+    confirmed) echo 已确认 ;;
     rolled_back) echo 已回滚 ;;
+    rollback_failed) echo 回滚失败 ;;
     pending) change_protected "$1" && echo 保护中 || echo 未完成 ;;
     *) echo 未知 ;;
   esac
@@ -81,7 +83,9 @@ do_rollback() {
   awk -F'\t' '{ print "  " $5 ($2 == 0 ? "（修改前不存在，将删除）" : "") }' "$VH_CHANGES/$id/files.tsv"
   [[ -f $VH_CHANGES/$id/panel.prev ]] && echo "  1Panel 面板设置：$(tr '\n' ' ' <"$VH_CHANGES/$id/panel.prev")"
   for ((i = 0; i < n - 1; i++)); do
-    [[ $(cat "$VH_CHANGES/${CHG_LIST[$i]}/status" 2>/dev/null) == applied ]] && newer=1
+    local st
+    st=$(cat "$VH_CHANGES/${CHG_LIST[$i]}/status" 2>/dev/null)
+    [[ $st == applied || $st == confirmed ]] && newer=1
   done
   ((newer)) && log_warn "这条之后还有已生效的变更；如果它们改过同一个文件，回滚会一并覆盖掉后来的修改。"
   if [[ " $(change_meta "$id" HOOKS) " == *" sshd "* ]]; then
@@ -92,12 +96,15 @@ do_rollback() {
 }
 
 delete_ids() { # delete_ids 描述 ID...：确认后删除，返回删除条数
-  local desc=$1 id ok=0 skip=0 applied=0
+  local desc=$1 id ok=0 skip=0 keep=0 st
   shift
   (($#)) || { log_info "没有可删除的记录"; return 0; }
-  for id in "$@"; do [[ $(cat "$VH_CHANGES/$id/status" 2>/dev/null) == applied ]] && applied=$((applied + 1)); done
+  for id in "$@"; do
+    st=$(cat "$VH_CHANGES/$id/status" 2>/dev/null)
+    [[ $st == applied || $st == confirmed || $st == rollback_failed ]] && keep=$((keep + 1))
+  done
   echo "将删除 $# 条记录（$desc）。"
-  ((applied)) && log_warn "其中 $applied 条是「已生效」的变更，删除后这些修改将无法再回滚（修改本身保留）。"
+  ((keep)) && log_warn "其中 $keep 条是已生效、已确认或回滚失败的变更；删除后无法再回滚或重试（当前修改保留）。"
   confirm_yes "确认删除？" || return 0
   for id in "$@"; do
     if change_delete "$id"; then ok=$((ok + 1)); else skip=$((skip + 1)); fi
@@ -113,13 +120,15 @@ delete_menu() {
   echo "  [2] 删除所有「已回滚」的记录"
   echo "  [3] 只保留最近 N 条"
   echo "  [0] 返回"
-  local c ids=() i idx n
+  local c ids=() i idx n parsed
   read -r -p "请选择：" c || return 0
   case $c in
     1)
       read -r -p "输入序号: " n || return 0
       [[ -n $n ]] || return 0
-      mapfile -t idx < <(parse_indexes "$n") || true
+      parsed=$(parse_indexes "$n") || { log_err "序号格式无效：$n"; return 1; }
+      [[ -n $parsed ]] || { log_err "序号格式无效：$n"; return 1; }
+      mapfile -t idx <<<"$parsed"
       ((${#idx[@]})) || { log_err "序号格式无效：$n"; return 1; }
       for i in "${idx[@]}"; do
         ((i >= 1 && i <= ${#CHG_LIST[@]})) || { log_err "序号超出范围：$i"; return 1; }
@@ -158,19 +167,40 @@ menu() {
   done
 }
 
+# 是否有更新的变更改过同一批文件（自动回滚此时会覆盖新配置）
+change_newer_overlap() {
+  local id=$1 other d p st
+  while IFS= read -r p; do
+    [[ -n $p ]] || continue
+    for d in "$VH_CHANGES"/*; do
+      [[ -d $d ]] || continue
+      other=${d##*/}
+      [[ $other =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ && $other > $id ]] || continue
+      st=$(cat "$d/status" 2>/dev/null)
+      case $st in applied | confirmed | pending) ;; *) continue ;; esac
+      awk -F'\t' -v p="$p" '$5 == p { found = 1 } END { exit !found }' "$d/files.tsv" 2>/dev/null && return 0
+    done
+  done < <(awk -F'\t' '{ print $5 }' "$VH_CHANGES/$id/files.tsv" 2>/dev/null)
+  return 1
+}
+
 # 由 systemd-run 定时器调用：只回滚仍处于「未完成」的变更（用户已确认的不会被回滚）
 auto_rollback() {
   local id=${1:-}
   [[ -n $id && -d $VH_CHANGES/$id ]] || exit 1
   [[ $(cat "$VH_CHANGES/$id/status" 2>/dev/null) == pending ]] || exit 0
+  if change_newer_overlap "$id"; then
+    log_warn "变更 $id 之后已有新的变更修改了同一批文件，自动回滚取消；请人工确认后在 [25] 处理"
+    exit 0
+  fi
   log_warn "变更 $id 在保护时间内未被确认，自动回滚"
-  change_rollback "$id"
+  VH_ROLLBACK_PENDING_ONLY=1 change_rollback "$id"
 }
 
 case ${1:-menu} in
   menu) need_root; with_lock menu ;;
   list) show_list || true ;;
   rollback) need_root; [[ -n ${2:-} ]] || die "用法：vhm rollback <变更ID>"; with_lock change_rollback "$2" ;;
-  auto-rollback) auto_rollback "${2:-}" ;;
+  auto-rollback) with_lock_wait 300 auto_rollback "${2:-}" ;;
   *) die "未知参数：$1" ;;
 esac

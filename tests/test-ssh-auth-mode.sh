@@ -28,6 +28,9 @@ check password password yes no no '@include common-auth'
 check key publickey no yes no '@include common-auth'
 check password_totp keyboard-interactive no no yes $'@include common-auth\nauth required pam_google_authenticator.so'
 check key_totp publickey,keyboard-interactive no yes yes $'#vhm# @include common-auth\nauth required pam_google_authenticator.so'
+check key_password_totp publickey,keyboard-interactive no yes yes $'@include common-auth\nauth required pam_google_authenticator.so'
+check totp_only keyboard-interactive no no yes 'auth required pam_google_authenticator.so'
+check custom publickey,keyboard-interactive no yes yes $'#vhm# @include common-auth\nauth required pam_google_authenticator.so nullok'
 check mixed any yes yes no '@include common-auth'
 ((fail == 0)) && echo "PASS ssh-auth-mode"
 exit $fail

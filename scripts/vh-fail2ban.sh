@@ -91,7 +91,7 @@ setup() {
   change_track "$F2B_JAIL" || return 1
   install -d -m 755 "$(dirname "$F2B_JAIL")"
   cat >"$F2B_JAIL" <<EOF
-# 由 vhm 管理，可在 vhm [24] 中回滚
+# 由 vhm 管理，可在 vhm [25] 中回滚
 [sshd]
 enabled = true
 port = ${port:-22}
