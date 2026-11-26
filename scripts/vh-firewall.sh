@@ -80,19 +80,28 @@ fw_field() { # fw_field 文本 正则：输出第一个捕获组
 }
 
 fw_describe() { # 把 iptables -S 的一行转成「动作 协议 端口 来源 备注」
-  local line=$1 head action proto port source comment
+  local line=$1 head action proto port source comment iface state
   head=${line%%--comment*}
   action=$(fw_field "${line##*-j }" '^([A-Z]+)')
   proto=$(fw_field "$head" ' -p ([a-z0-9-]+)')
   port=$(fw_field "$head" ' --dports? ([0-9:,]+)')
   source=$(fw_field "$head" ' -s ([^ ]+)')
+  iface=$(fw_field "$head" ' -i ([^ ]+)')
+  state=$(fw_field "$head" ' --ctstate ([^ ]+)')
+  [[ -n $state ]] || state=$(fw_field "$head" ' --state ([^ ]+)')
+  if [[ $iface == lo ]]; then
+    source="本机 loopback"
+  elif [[ -n $iface ]]; then
+    source="接口 $iface${source:+ / $source}"
+  fi
+  [[ -z $state ]] || source="${source:-所有 IP} / $state"
   comment=$(fw_field "$line" '--comment ("[^"]*"|[^ ]+)')
   comment=${comment//\"/}
   case $action in
     ACCEPT) action=允许 ;;
     DROP | REJECT) action=拒绝 ;;
   esac
-  printf '%-4s %-5s %-12s %-20s %s' "$action" "${proto:-all}" "${port:--}" "${source:-所有 IP}" "$comment"
+  printf '%-4s %-5s %-12s %-30s %s' "$action" "${proto:-all}" "${port:--}" "${source:-所有 IP}" "$comment"
 }
 
 load_iptables_rules() { # 读取两个地址族的 1PANEL_BASIC 链，位置号与 iptables 中的顺序一致
@@ -256,18 +265,32 @@ ufw_add() { # ufw_add 动作 协议 端口 来源 位置 注释
 }
 
 # ---------- 界面 ----------
-show_rules() {
-  local be=$1 i mark
-  if [[ $be == iptables ]]; then
-    load_iptables_rules
-    echo "  当前 1Panel 规则（$FW_CHAIN 链，位置越小越先匹配）："
-    printf '  %-6s %-4s %-4s %-5s %-12s %-20s %s\n' 地址族 位置 动作 协议 端口 来源 备注
-    for i in "${!R_RAW[@]}"; do
-      mark=""
-      [[ -n ${R_ID[$i]} ]] && mark="  ← vhm"
-      printf '  %-6s %-4s %s%s\n' "${R_FAMILY[$i]}" "${R_POS[$i]}" "$(fw_describe "${R_RAW[$i]}")" "$mark"
+show_iptables_chains() {
+  local family chain output line mark found
+  for family in ipv4 ipv6; do
+    for chain in 1PANEL_BASIC_BEFORE 1PANEL_BASIC 1PANEL_BASIC_AFTER; do
+      output=$("$(family_bin "$family")" -w -S "$chain" 2>/dev/null) || continue
+      echo "  [$family · $chain]"
+      found=0
+      while IFS= read -r line; do
+        [[ $line == "-A $chain "* ]] || continue
+        found=1
+        mark=""
+        [[ $line =~ vhm:[0-9]{17} ]] && mark="  ← vhm"
+        printf '    %s%s\n' "$(fw_describe "$line")" "$mark"
+      done <<<"$output"
+      ((found)) || echo "    （空）"
     done
-    ((${#R_RAW[@]})) || echo "  （链中暂无规则）"
+  done
+}
+
+show_rules() {
+  local be=$1
+  if [[ $be == iptables ]]; then
+    echo "  当前 1Panel 规则（按 INPUT 顺序：BEFORE → BASIC → AFTER）："
+    printf '    %-4s %-5s %-12s %-30s %s\n' 动作 协议 端口 来源 备注
+    show_iptables_chains
+    echo "  vhm 新建规则写入 $FW_CHAIN；BEFORE / AFTER 是 1Panel 系统链，这里只读展示。"
   else
     ufw_run status numbered 2>/dev/null | sed 's/^/  /'
   fi

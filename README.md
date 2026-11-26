@@ -10,7 +10,7 @@
 ![Panel](https://img.shields.io/badge/panel-1Panel-1677ff)
 ![SSH](https://img.shields.io/badge/ssh-password%20%7C%20key%20%7C%20TOTP-16a34a)
 ![Protection](https://img.shields.io/badge/protection-Fail2Ban-dc2626)
-![Version](https://img.shields.io/badge/version-0.3.1-blue)
+![Version](https://img.shields.io/badge/version-0.3.2-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![CI](https://github.com/OmenTwwnmfm/vaultwarden-1panel-hardening-manager/actions/workflows/ci.yml/badge.svg)
 
@@ -32,11 +32,17 @@ Vaultwarden 把整个家庭或团队的密码库放在一台 VPS 上，这台服
 
 ## 功能特点
 
+### v0.3.2 修复说明
+
+- 端口体检按 1Panel 的 `1PANEL_BASIC_BEFORE → 1PANEL_BASIC → 1PANEL_BASIC_AFTER` 顺序判断，修复 BEFORE 中的 SSH 端口放行被误报为“被防火墙拦截”。
+- 防火墙菜单和 1Panel 面板状态显示三条链；vhm 新建规则仍写入 `1PANEL_BASIC`，BEFORE / AFTER 保持 1Panel 系统链只读展示。
+
 ### v0.3.1 修复说明
 
 - 回滚失败会记录为「回滚失败」并允许重试；自动回滚失败也会明确报警，不再被确认动作掩盖。
 - 自动回滚会等待全局修改锁并检查更新的重叠变更，避免覆盖正在编辑的配置。
 - UFW 规则删除改为按 `vhm` 注释定位，同条件但非 vhm 创建的规则不会被误删。
+- 端口体检按 1Panel 的 BEFORE → BASIC → AFTER 链顺序判断，修复 SSH 端口等 BEFORE 放行规则被误报为拦截。
 - PAM 的 `auth substack common-auth` 写法在切换登录方式时可以正确恢复。
 - `sshd -T` 使用当前登录来源地址计算，`Match Address` 块能正确参与校验；2FA 状态识别 `nullok` 配置。
 - Fail2Ban 的 vhm jail 缺少 `port` 行时会自动补上；源码更新对 SSH 远端禁用交互式提示。

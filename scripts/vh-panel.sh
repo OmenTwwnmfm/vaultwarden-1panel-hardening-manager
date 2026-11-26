@@ -54,7 +54,7 @@ show_status() {
   if [[ $(fw_type) == 1panel-iptables ]]; then
     echo
     echo "  1Panel 防火墙端口规则（只读，修改可在 1Panel →「主机」→「防火墙」或 vhm [15]）："
-    printf '  %-6s %-5s %-14s %s\n' 动作 协议 端口 来源
+    printf '  %-22s %-6s %-5s %-14s %s\n' 链 动作 协议 端口 来源
     panel_fw_rules || echo "  （读取失败）"
   fi
   echo

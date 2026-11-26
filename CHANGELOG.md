@@ -2,6 +2,16 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.2] - 2026-11-27
+
+### Fixed
+- 端口体检按 `1PANEL_BASIC_BEFORE → 1PANEL_BASIC → 1PANEL_BASIC_AFTER` 的实际顺序判断，修复 BEFORE 中的 SSH 端口放行被误报为“被防火墙拦截”。
+- 防火墙菜单和 1Panel 面板状态同时显示三条 1Panel 链；vhm 新建规则仍写入 `1PANEL_BASIC`。
+
+### Tests
+
+- 新增 `port_scope` 的链顺序、来源限制、loopback/ESTABLISHED 过滤测试。
+
 ## [0.3.1] - 2026-11-27
 
 ### Fixed
@@ -11,6 +21,7 @@
 - 自动回滚会等待全局修改锁，并检测之后是否有改过同批文件的新变更，避免覆盖正在编辑的配置。
 - `sshd -T` 使用当前 SSH 客户端的真实来源地址计算，`Match Address` 块能正确参与生效值校验。
 - UFW 调用固定英文 locale，非英文系统不再误判防火墙状态；检测到 1Panel iptables 链时优先按 1Panel 后端处理。
+- 端口体检按 `1PANEL_BASIC_BEFORE → 1PANEL_BASIC → 1PANEL_BASIC_AFTER` 的实际顺序判断，修复 BEFORE 中的放行（如 SSH 端口）被误报为拦截；防火墙和面板状态同时显示三条链。
 - 2FA 状态识别 `nullok` 和未注释的 `common-auth`，状态页、体检和 2FA 管理会提示配置与显示不一致。
 - 变更记录删除先完整校验序号再执行，避免部分删除；数据目录体检同时检查组权限；修正多处菜单编号引用。
 - 防锁死确认与定时器回滚的竞态：确认保留时在变更记录锁内先行认领（新增 `confirmed` 状态），自动回滚在锁内复查状态，不再出现「界面报成功、配置却被回滚、记录显示已生效」的不一致。
@@ -24,7 +35,7 @@
 
 ### Tests
 
-- 新增回滚失败后重试、PAM 两种 `common-auth` 写法、UFW 标记删除、大 iptables 输出和 SSH 登录方式识别的回归测试。
+- 新增回滚失败后重试、PAM 两种 `common-auth` 写法、UFW 标记删除、大 iptables 输出、端口链顺序和 SSH 登录方式识别的回归测试。
 
 ## [0.3.0] - 2026-11-25
 
