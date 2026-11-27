@@ -1,0 +1,137 @@
+# shellcheck shell=bash
+# shellcheck disable=SC2034
+# SSH 生效配置读取、服务重载与 2FA 状态；由 vh-common.sh 加载，不要单独执行
+
+# ---------- SSH ----------
+if [[ -z ${SSHD_BIN:-} ]]; then
+  if [[ -x /usr/sbin/sshd ]]; then SSHD_BIN=/usr/sbin/sshd; else SSHD_BIN=$(command -v sshd 2>/dev/null || echo /usr/sbin/sshd); fi
+fi
+sshd_test() { mkdir -p /run/sshd 2>/dev/null; "$SSHD_BIN" -t 2>&1; }
+# 生效配置：优先按当前 SSH 客户端的真实来源地址计算（让 Match 块生效）；
+# 从控制台 / VNC 运行时没有来源地址，用一个文档保留地址代替。不支持 -C 时退回 sshd -T。
+sshd_eff() {
+  local out addr
+  mkdir -p /run/sshd 2>/dev/null
+  addr=${SSH_CONNECTION:-}
+  addr=${addr%% *}
+  if [[ -z $addr ]]; then
+    addr=$(who am i 2>/dev/null | awk '{ print $NF }' | tr -d '()')
+  fi
+  [[ $addr =~ ^[0-9a-fA-F:.]+$ ]] || addr=203.0.113.1
+  out=$("$SSHD_BIN" -T -C user=root,host=vhm-check,addr="$addr" 2>/dev/null) || out=""
+  [[ -n $out ]] || out=$("$SSHD_BIN" -T 2>/dev/null) || out=""
+  # OpenSSH 10.x 的 sshd -T 输出配置名用驼峰（Port、PasswordAuthentication），旧版是全小写；统一转成小写
+  [[ -n $out ]] && awk '{ $1 = tolower($1); print }' <<<"$out"
+}
+sshd_eff_err() { mkdir -p /run/sshd 2>/dev/null; "$SSHD_BIN" -T 2>&1 >/dev/null | tail -n 3; }
+
+# sshd -T 失败时，直接解析配置文件得到同样格式的「键 值」行（含 Include，遇到 Match 停止，未设置的用 OpenSSH 默认值）。
+# 只用于显示和判断状态；修改 SSH 时的生效值校验仍然只认 sshd -T。
+sshd_conf_view() {
+  python3 - "$SSHD_CONFIG" <<'PY'
+import glob, os, re, sys
+defaults = {"passwordauthentication": "yes", "pubkeyauthentication": "yes", "permitrootlogin": "prohibit-password",
+            "kbdinteractiveauthentication": "yes", "usepam": "no", "authenticationmethods": "any"}
+alias = {"challengeresponseauthentication": "kbdinteractiveauthentication"}
+vals, ports = {}, []
+def walk(path, depth=0):
+    if depth > 8:
+        return
+    try:
+        lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        s = line.split("#", 1)[0].strip()
+        if not s:
+            continue
+        parts = re.split(r"[\s=]+", s, maxsplit=1)
+        k = alias.get(parts[0].lower(), parts[0].lower())
+        v = parts[1].strip() if len(parts) > 1 else ""
+        if k == "match":
+            return
+        if k == "include":
+            for pat in v.split():
+                if not os.path.isabs(pat):
+                    pat = os.path.join("/etc/ssh", pat)
+                for f in sorted(glob.glob(pat)):
+                    walk(f, depth + 1)
+        elif k == "port":
+            ports.append(v)
+        elif k in defaults:
+            vals.setdefault(k, v.lower())  # sshd 对同一配置项取第一个值
+walk(sys.argv[1])
+for p in ports or ["22"]:
+    print("port", p)
+for k, d in defaults.items():
+    print(k, vals.get(k, d))
+PY
+}
+
+# 显示用的生效配置：sshd -T 优先，失败时退回解析配置文件
+sshd_view() {
+  local out
+  out=$(sshd_eff) || out=""
+  [[ -n $out ]] || out=$(sshd_conf_view 2>/dev/null) || out=""
+  [[ -n $out ]] && printf '%s\n' "$out"
+}
+sshd_view_src() { if [[ -n $(sshd_eff) ]]; then echo "sshd -T"; else echo "配置文件（sshd -T 失败）"; fi; }
+sshd_get() {
+  local out
+  out=$(sshd_view) || out=""
+  awk -v k="$1" '$1 == k { $1 = ""; sub(/^ /, ""); print }' <<<"$out"
+}
+ssh_service() { if systemctl cat ssh.service >/dev/null 2>&1; then echo ssh; else echo sshd; fi; }
+ssh_socket_used() { systemctl is-enabled --quiet ssh.socket 2>/dev/null || systemctl is-active --quiet ssh.socket 2>/dev/null; }
+
+ssh_reload() {
+  local out svc
+  out=$(sshd_test) || { log_err "sshd 配置检查未通过：$out"; return 1; }
+  svc=$(ssh_service)
+  if ssh_socket_used; then
+    systemctl daemon-reload || return 1
+    systemctl restart ssh.socket || return 1
+    systemctl try-restart "$svc" || return 1
+  elif systemctl is-active --quiet "$svc"; then
+    systemctl reload "$svc" || systemctl restart "$svc" || return 1
+  else
+    systemctl start "$svc" || return 1
+  fi
+}
+
+tfa_pam_lines() { grep -E '^[[:space:]]*auth[[:space:]]+required[[:space:]]+pam_google_authenticator\.so' "$PAM_SSHD" 2>/dev/null; }
+# 带 nullok 时未绑定动态口令也可以跳过，不能算真正启用
+tfa_pam_on() {
+  local lines
+  lines=$(tfa_pam_lines) || return 1
+  grep -qv 'nullok' <<<"$lines"
+}
+tfa_pam_nullok() {
+  local lines
+  lines=$(tfa_pam_lines) || return 1
+  grep -q 'nullok' <<<"$lines"
+}
+tfa_enabled() {
+  local mode
+  mode=$(sshd_get authenticationmethods)
+  tfa_pam_on && [[ $mode == *keyboard-interactive* ]]
+}
+
+ssh_auth_mode() {
+  local methods password pubkey tfa common_auth
+  methods=$(sshd_get authenticationmethods)
+  password=$(sshd_get passwordauthentication)
+  pubkey=$(sshd_get pubkeyauthentication)
+  tfa=$(tfa_pam_on && echo yes || echo no)
+  common_auth=no
+  if grep -Eq '^[[:space:]]*(@include[[:space:]]+common-auth|auth[[:space:]]+substack[[:space:]]+common-auth)' "$PAM_SSHD" 2>/dev/null; then common_auth=yes; fi
+  if [[ $tfa == yes && $methods == *publickey,keyboard-interactive* ]]; then
+    if [[ $common_auth == yes ]]; then echo key_password_totp; else echo key_totp; fi
+  elif [[ $tfa == yes && $methods == keyboard-interactive ]]; then
+    if [[ $common_auth == yes ]]; then echo password_totp; else echo totp_only; fi
+  elif [[ $methods == publickey && $pubkey == yes ]]; then echo key
+  elif [[ $methods == password && $password == yes ]]; then echo password
+  elif [[ $methods == any && $password == yes && $pubkey == yes ]]; then echo mixed
+  else echo custom
+  fi
+}

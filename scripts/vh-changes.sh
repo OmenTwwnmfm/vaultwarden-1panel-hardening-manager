@@ -167,40 +167,12 @@ menu() {
   done
 }
 
-# 是否有更新的变更改过同一批文件（自动回滚此时会覆盖新配置）
-change_newer_overlap() {
-  local id=$1 other d p st
-  while IFS= read -r p; do
-    [[ -n $p ]] || continue
-    for d in "$VH_CHANGES"/*; do
-      [[ -d $d ]] || continue
-      other=${d##*/}
-      [[ $other =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ && $other > $id ]] || continue
-      st=$(cat "$d/status" 2>/dev/null)
-      case $st in applied | confirmed | pending) ;; *) continue ;; esac
-      awk -F'\t' -v p="$p" '$5 == p { found = 1 } END { exit !found }' "$d/files.tsv" 2>/dev/null && return 0
-    done
-  done < <(awk -F'\t' '{ print $5 }' "$VH_CHANGES/$id/files.tsv" 2>/dev/null)
-  return 1
-}
-
-# 由 systemd-run 定时器调用：只回滚仍处于「未完成」的变更（用户已确认的不会被回滚）
-auto_rollback() {
-  local id=${1:-}
-  [[ -n $id && -d $VH_CHANGES/$id ]] || exit 1
-  [[ $(cat "$VH_CHANGES/$id/status" 2>/dev/null) == pending ]] || exit 0
-  if change_newer_overlap "$id"; then
-    log_warn "变更 $id 之后已有新的变更修改了同一批文件，自动回滚取消；请人工确认后在 [25] 处理"
-    exit 0
-  fi
-  log_warn "变更 $id 在保护时间内未被确认，自动回滚"
-  VH_ROLLBACK_PENDING_ONLY=1 change_rollback "$id"
-}
-
 case ${1:-menu} in
   menu) need_root; with_lock menu ;;
   list) show_list || true ;;
   rollback) need_root; [[ -n ${2:-} ]] || die "用法：vhm rollback <变更ID>"; with_lock change_rollback "$2" ;;
-  auto-rollback) with_lock_wait 300 auto_rollback "${2:-}" ;;
+  # 由 systemd-run 定时器调用（保护时间到）与开机回滚服务调用（保护期内重启）
+  auto-rollback) with_lock_wait 300 change_auto_rollback "${2:-}" ;;
+  boot-rollback) need_root; with_lock_wait 300 change_boot_rollback ;;
   *) die "未知参数：$1" ;;
 esac

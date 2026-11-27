@@ -42,56 +42,28 @@ first_setup() {
   pause
 }
 
-VH_SOURCE_UPDATED=10
-
-# 从官方仓库的 main 快进更新源码。返回 0 = 已是最新，10 = 已更新，1 = 跳过或失败（已输出原因）。
-# 只在以下条件全部满足时更新：origin 指向官方仓库、当前在 main 分支、已跟踪文件没有本地改动、
-# 本地提交都已包含在远端（只快进，不合并）。抓取限时 30 秒且禁止交互式输入凭据。
-sync_source() {
-  local root url branch before target
-  root="$(cd "$VH_DIR/.." && pwd -P)"
-  command -v git >/dev/null 2>&1 || { log_warn "未安装 git，无法检查更新"; return 1; }
-  git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { log_warn "$root 不是 git 仓库，无法检查更新"; return 1; }
-  url=$(git -C "$root" remote get-url origin 2>/dev/null || true)
-  url=${url%/}
-  url=${url%.git}
-  case $url in
-    https://github.com/OmenTwwnmfm/vaultwarden-1panel-hardening-manager | git@github.com:OmenTwwnmfm/vaultwarden-1panel-hardening-manager | ssh://git@github.com/OmenTwwnmfm/vaultwarden-1panel-hardening-manager) ;;
-    *) log_warn "origin 不是官方仓库（${url:-未设置}），不检查更新"; return 1 ;;
-  esac
-  branch=$(git -C "$root" symbolic-ref --short -q HEAD || true)
-  [[ $branch == main ]] || { log_warn "当前分支为 ${branch:-分离的 HEAD}，只在 main 分支上更新"; return 1; }
-  if [[ -n $(git -C "$root" status --porcelain --untracked-files=no 2>/dev/null) ]]; then
-    log_warn "源码目录有未提交的修改，未更新：$root"
-    return 1
-  fi
-  before=$(git -C "$root" rev-parse HEAD) || return 1
-  if ! GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes" \
-    timeout 30 git -C "$root" fetch --quiet --no-tags origin main </dev/null 2>/dev/null; then
-    log_warn "暂时无法连接 GitHub，继续使用本地 v$VH_VERSION"
-    return 1
-  fi
-  target=$(git -C "$root" rev-parse FETCH_HEAD) || return 1
-  [[ $before == "$target" ]] && return 0
-  if ! git -C "$root" merge-base --is-ancestor "$before" "$target"; then
-    log_warn "本地有远端没有的提交，无法快进更新"
-    return 1
-  fi
-  git -C "$root" merge --ff-only --quiet "$target" || { log_warn "快进更新失败，源码保持不变"; return 1; }
-  return "$VH_SOURCE_UPDATED"
-}
-
 restart_menu() {
   export VHM_AUTO_UPDATE_CHECKED=1
   exec bash "$VH_DIR/vh-launcher.sh" menu
 }
 
+# 列出待更新的提交，输入 yes 后快进；返回 0 表示已更新
+offer_update() {
+  local rc=0
+  echo
+  echo "发现新版本 v$(source_target_version)（当前 v$VH_VERSION），包含以下提交："
+  source_show_pending
+  confirm_yes "更新到新版本？更新后菜单会重新加载" || return 1
+  source_apply || rc=$?
+  ((rc == VH_SOURCE_UPDATED)) || return 1
+  log_ok "已更新到 v$(cat "$VH_DIR/../VERSION")，重新进入菜单"
+}
+
 update_source() { # 菜单 [27]
   local rc=0
   log_info "正在检查 GitHub 更新……"
-  sync_source || rc=$?
-  if ((rc == VH_SOURCE_UPDATED)); then
-    log_ok "已更新到 v$(cat "$VH_DIR/../VERSION")，重新进入菜单"
+  source_check || rc=$?
+  if ((rc == VH_SOURCE_AVAILABLE)) && offer_update; then
     pause
     restart_menu
   fi
@@ -99,21 +71,35 @@ update_source() { # 菜单 [27]
   pause
 }
 
-auto_update_source() { # 每次进入菜单时检查一次
+auto_update_source() { # 每次启动菜单时按 AUTO_UPDATE 检查一次
   [[ ${VHM_AUTO_UPDATE_CHECKED:-0} == 1 ]] && return 0
   export VHM_AUTO_UPDATE_CHECKED=1
-  local rc=0
+  local mode rc=0
+  mode=$(update_mode)
+  [[ $mode == off ]] && return 0
   log_info "正在检查 GitHub 更新……"
-  sync_source || rc=$?
-  case $rc in
-    0) ;;
-    "$VH_SOURCE_UPDATED")
-      log_ok "检测到新版本，已自动更新到 v$(cat "$VH_DIR/../VERSION")，重新进入菜单"
+  source_check || rc=$?
+  if ((rc != VH_SOURCE_AVAILABLE)); then
+    ((rc == 0)) || sleep 2
+    return 0
+  fi
+  if [[ $mode == apply ]]; then
+    rc=0
+    source_apply || rc=$?
+    if ((rc == VH_SOURCE_UPDATED)); then
+      log_ok "AUTO_UPDATE=apply：已自动更新到 v$(cat "$VH_DIR/../VERSION")，重新进入菜单"
       sleep 2
       restart_menu
-      ;;
-    *) sleep 2 ;;
-  esac
+    fi
+    sleep 2
+    return 0
+  fi
+  if offer_update; then
+    sleep 2
+    restart_menu
+  fi
+  log_info "保持当前 v$VH_VERSION；可随时在 [27] 更新，或在 $VH_CONF 中设置 AUTO_UPDATE=off 关闭检查"
+  sleep 2
 }
 
 # 状态面板：每项都容错，读不到就显示「未知」

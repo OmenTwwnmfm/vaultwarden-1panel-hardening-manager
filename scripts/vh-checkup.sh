@@ -96,7 +96,7 @@ check_docker() {
 # ---------- SSH ----------
 check_ssh() {
   title "SSH"
-  local eff pa pk prl port
+  local eff pa pk prl port mat lgt x11 pep
   eff=$(sshd_view)
   if [[ -z $eff ]]; then
     chk warn "SSH 配置" "无法读取 sshd -T" "检查 sshd 配置：sshd -t"
@@ -119,6 +119,28 @@ check_ssh() {
   else
     chk warn "SSH 2FA" "未启用，root 登录：$prl" "在 [06] 选择登录方式"
   fi
+  if [[ $prl == no ]]; then
+    chk ok "root 直接登录" "已禁止"
+  elif tfa_enabled; then
+    chk ok "root 直接登录" "允许（$prl），但必须通过动态口令"
+  elif [[ $prl == yes && $pa == yes ]]; then
+    chk bad "root 直接登录" "允许 root 用密码登录" "在 [06] 改为密钥登录，或增加动态口令"
+  else
+    chk warn "root 直接登录" "允许（$prl）" "可在 [06] 启用密钥 + 动态口令；长期建议改用普通 sudo 用户登录并设置 PermitRootLogin no，见使用手册「改用普通用户登录」"
+  fi
+  # 以下几项只在 sshd -T 可用时才有值；读不到就不显示
+  mat=$(awk '$1 == "maxauthtries" { print $2 }' <<<"$eff")
+  lgt=$(awk '$1 == "logingracetime" { print $2 }' <<<"$eff")
+  x11=$(awk '$1 == "x11forwarding" { print $2 }' <<<"$eff")
+  pep=$(awk '$1 == "permitemptypasswords" { print $2 }' <<<"$eff")
+  if [[ $pep == yes ]]; then chk bad "空密码登录" "PermitEmptyPasswords yes" "立即改为 PermitEmptyPasswords no"; fi
+  if [[ $mat =~ ^[0-9]+$ ]] && ((mat > 6)); then
+    chk warn "MaxAuthTries" "$mat 次" "建议不超过 6，例如在 /etc/ssh/sshd_config 中设置 MaxAuthTries 3"
+  fi
+  if [[ $lgt =~ ^[0-9]+$ ]] && ((lgt == 0 || lgt > 120)); then
+    chk warn "LoginGraceTime" "${lgt} 秒（0 表示不限制）" "建议 30–60 秒，未完成登录的连接会更快被断开"
+  fi
+  if [[ $x11 == yes ]]; then chk warn "X11Forwarding" "已开启" "VPS 通常不需要图形转发，建议设置 X11Forwarding no"; fi
   if [[ -f $ROOT_KEYS ]] && [[ $(stat -c %a "$ROOT_KEYS") =~ [0-7][1-7][0-7]$|[0-7][0-7][1-7]$ ]]; then
     chk warn "authorized_keys 权限" "$(stat -c %a "$ROOT_KEYS")" "chmod 600 $ROOT_KEYS"
   fi
@@ -165,6 +187,15 @@ check_system() {
   done
   if ((${#bad[@]})); then chk warn "内核网络参数" "${bad[*]}" "在 [24] 加固"; else chk ok "内核网络参数" "已加固"; fi
   if [[ -f /var/run/reboot-required ]]; then chk warn "重启" "有更新需要重启才能生效" "择机重启 VPS"; fi
+  local unit target missing=()
+  for unit in /etc/systemd/system/vhm-*.service; do
+    [[ -f $unit ]] || continue
+    target=$(sed -nE 's#^ExecStart=/bin/bash ([^ ]+).*#\1#p' "$unit" | head -n1)
+    [[ -z $target || -f $target ]] || missing+=("${unit##*/}")
+  done
+  if ((${#missing[@]})); then
+    chk bad "vhm 后台服务" "${missing[*]} 指向的脚本不存在（项目目录被移动或删除？）" "在项目当前位置运行 sudo bash ./run.sh，进入菜单时会自动修正"
+  fi
 }
 
 # ---------- 1Panel ----------

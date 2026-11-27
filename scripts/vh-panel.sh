@@ -103,7 +103,7 @@ change_account() {
   read -r -p "请选择：" c || return 0
   case $c in
     1)
-      confirm_yes "修改面板用户名？接下来由 1pctl 直接提示输入" || return 0
+      confirm_yes "修改面板用户名？此操作无法回滚，接下来由 1pctl 直接提示输入" || return 0
       1pctl update username || { log_err "修改失败"; return 1; }
       log_info "已修改面板用户名"
       ;;
@@ -113,7 +113,7 @@ change_account() {
       if [[ ${g,,} != n ]]; then
         printf '\n%s建议密码（只显示这一次，请先保存到密码管理器）：%s\n\n    %s\n\n' "$C_Y" "$C_0" "$(gen_password)"
       fi
-      confirm_yes "修改面板密码？接下来由 1pctl 提示输入两次（输入时不显示）" || return 0
+      confirm_yes "修改面板密码？此操作无法回滚，接下来由 1pctl 提示输入两次（输入时不显示）" || return 0
       1pctl update password || { log_err "修改失败"; return 1; }
       log_info "已修改面板密码"
       ;;

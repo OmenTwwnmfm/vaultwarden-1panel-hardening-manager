@@ -6,3 +6,7 @@ VW_DATA_DIR=""
 VW_CONTAINER=""
 # 可选：1Panel 自定义安装目录时，填写其持久防火墙规则目录（通常自动识别，无需填写）
 # PANEL_FIREWALL_DIR="/opt/1panel/firewall"
+# 源码更新方式：notify（默认，进入菜单时检查，输入 yes 才更新）/ apply（自动更新）/ off（只在 [27] 手动检查）
+# AUTO_UPDATE="notify"
+# 设为 1 时只接受通过 git verify-commit 签名校验的新版本（需要先在 git 中配置信任的公钥）
+# UPDATE_REQUIRE_SIGNED="0"

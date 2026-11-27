@@ -10,7 +10,7 @@
 ![Panel](https://img.shields.io/badge/panel-1Panel-1677ff)
 ![SSH](https://img.shields.io/badge/ssh-password%20%7C%20key%20%7C%20TOTP-16a34a)
 ![Protection](https://img.shields.io/badge/protection-Fail2Ban-dc2626)
-![Version](https://img.shields.io/badge/version-0.3.2-blue)
+![Version](https://img.shields.io/badge/version-0.4.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![CI](https://github.com/OmenTwwnmfm/vaultwarden-1panel-hardening-manager/actions/workflows/ci.yml/badge.svg)
 
@@ -32,37 +32,15 @@ Vaultwarden 把整个家庭或团队的密码库放在一台 VPS 上，这台服
 
 ## 功能特点
 
-### v0.3.2 修复说明
+### v0.4.0 更新说明
 
-- 端口体检按 1Panel 的 `1PANEL_BASIC_BEFORE → 1PANEL_BASIC → 1PANEL_BASIC_AFTER` 顺序判断，修复 BEFORE 中的 SSH 端口放行被误报为“被防火墙拦截”。
-- 防火墙菜单和 1Panel 面板状态显示三条链；vhm 新建规则仍写入 `1PANEL_BASIC`，BEFORE / AFTER 保持 1Panel 系统链只读展示。
+- **源码更新改为提示后确认**：进入菜单时检查 GitHub main，有新版本时先列出待更新的提交，输入 `yes` 才更新。可在 `/etc/vaultwarden-hardening.conf` 中设置 `AUTO_UPDATE=notify`（默认）/ `apply`（自动更新，即 0.3.x 的行为）/ `off`（只在 `[27]` 手动检查），以及 `UPDATE_REQUIRE_SIGNED=1`（只接受签名校验通过的提交）。
+- **保护期内重启也会自动回滚**：新增常驻的 `vhm-guard-boot.service`，开机时回滚仍未确认的 SSH 变更。
+- 体检新增 root 直接登录、空密码、`MaxAuthTries`、`LoginGraceTime`、`X11Forwarding` 和 vhm 后台服务路径检查。
+- Fail2Ban 端口同步监视整个 `sshd_config.d` 目录，兜底定时器放宽到 5 分钟；项目目录移动后 systemd 单元自动指向新位置。
+- 修复防火墙添加规则后的回读在大规则链下可能误报失败。
 
-### v0.3.1 修复说明
-
-- 回滚失败会记录为「回滚失败」并允许重试；自动回滚失败也会明确报警，不再被确认动作掩盖。
-- 自动回滚会等待全局修改锁并检查更新的重叠变更，避免覆盖正在编辑的配置。
-- UFW 规则删除改为按 `vhm` 注释定位，同条件但非 vhm 创建的规则不会被误删。
-- 端口体检按 1Panel 的 BEFORE → BASIC → AFTER 链顺序判断，修复 SSH 端口等 BEFORE 放行规则被误报为拦截。
-- PAM 的 `auth substack common-auth` 写法在切换登录方式时可以正确恢复。
-- `sshd -T` 使用当前登录来源地址计算，`Match Address` 块能正确参与校验；2FA 状态识别 `nullok` 配置。
-- Fail2Ban 的 vhm jail 缺少 `port` 行时会自动补上；源码更新对 SSH 远端禁用交互式提示。
-- 本次同样只推送源码提交，不创建 GitHub Release。
-
-### v0.3.0 升级说明
-
-- 进入管理菜单时自动检查 GitHub main 并快进更新。工作区存在本地改动或网络不可用时保留当前代码并提示，可用 [27] 手动重试。
-- 新增 SSH 登录方式选择：密码（不建议）、密钥、密码 + 动态口令、密钥 + 动态口令（推荐），并支持修改 root 系统密码。
-- 新增 1Panel iptables / UFW 防火墙规则管理，支持来源 IP/CIDR 和规则顺序，修改同时写入运行规则与持久配置。
-- Fail2Ban SSH jail 通过 systemd path 和 15 秒定时检查自动跟踪 SSH 端口变化。
-- 菜单编号扩展到 [27]。本次只推送源码提交，不创建 GitHub Release。
-
-### v0.2.0 升级说明
-
-v0.2.0 从「只审计、给指引」改为可直接操作的加固工具，菜单重新编号为 `[01]`–`[26]`，0.1.x 的子命令全部移除。
-
-- 升级后首次进入菜单，会自动停用并删除 0.1.x 的定时巡检 `vaultwarden-hardening-watch.service/.timer` 和 `/usr/local/lib/vaultwarden-hardening`。
-- 0.1.x 的报告与快照留在 `/var/lib/vaultwarden-hardening/reports/`、`snapshots/`，不再使用，可手动删除。
-- 详细变更见 [CHANGELOG.md](CHANGELOG.md)。
+历次版本的完整变更见 [CHANGELOG.md](CHANGELOG.md)。从 0.1.x 升级时，首次进入菜单会自动清理旧版定时巡检。
 
 ### 菜单结构
 
@@ -118,7 +96,9 @@ v0.2.0 从「只审计、给指引」改为可直接操作的加固工具，菜�
 3. 启动 5 分钟的 systemd 定时器。你另开窗口按新方式登录，成功后回来输入 `yes` 保留。
 4. 输入其他内容、超时或管理器被中断，定时器都会自动回滚。
 
-修改端口时先同时监听新旧端口，确认新端口能登录后再关闭旧端口。Fail2Ban 通过 systemd 配置监视器和 15 秒周期核对自动同步 sshd jail 端口。
+保护期内机器意外重启时，开机回滚服务 `vhm-guard-boot.service` 会把仍未确认的修改改回来。
+
+修改端口时先同时监听新旧端口，确认新端口能登录后再关闭旧端口。Fail2Ban 通过 systemd 配置监视器（`sshd_config` 与整个 `sshd_config.d` 目录）和 5 分钟周期核对自动同步 sshd jail 端口。
 
 ### Fail2Ban
 
@@ -175,8 +155,8 @@ v0.2.0 从「只审计、给指引」改为可直接操作的加固工具，菜�
 
 - 每次通过 `sudo bash ./run.sh` 启动时，都会自动安装或修复 `/usr/local/bin/vhm`。
 - 之后在任意目录执行 `sudo vhm` 即可进入菜单。
-- 每次进入菜单时，vhm 自动检查 GitHub main。工作区干净且可快进时自动更新并重启菜单；本地有改动或网络不可用时保留当前版本，可用 [27] 手动重试。
-- `vhm` 指向当初克隆的项目目录，项目目录不要随意移动或删除。
+- 每次启动菜单时，vhm 检查 GitHub main：有新版本时列出待更新的提交，输入 `yes` 才快进并重启菜单；本地有改动、不在 main 分支或网络不可用时保留当前版本，可用 `[27]` 手动重试。更新方式由配置文件中的 `AUTO_UPDATE` 决定（`notify` / `apply` / `off`）。
+- `vhm` 指向当初克隆的项目目录。移动项目目录后，在新位置重新运行一次 `sudo bash ./run.sh`，进入菜单时会自动把 vhm 的 systemd 单元改到新位置。
 
 ## 快速开始
 
@@ -209,6 +189,8 @@ sudo bash ./run.sh
 | SSH 配置 | `/etc/ssh/sshd_config.d/00-vhm.conf` |
 | 2FA 绑定 | `/root/.google_authenticator`（`400`） |
 | Fail2Ban | `/etc/fail2ban/jail.d/vhm-sshd.local` |
+| 后台服务 | `/etc/systemd/system/vhm-ssh-port-sync.{service,path,timer}`、`vhm-guard-boot.service` |
+| 日志轮转 | `/etc/logrotate.d/vaultwarden-hardening` |
 | 内核参数 | `/etc/sysctl.d/90-vhm-hardening.conf` |
 | Vaultwarden 设置 | `<数据目录>/config.json` |
 

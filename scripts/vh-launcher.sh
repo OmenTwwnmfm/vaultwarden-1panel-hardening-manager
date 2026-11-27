@@ -73,6 +73,7 @@ case "${1:-menu}" in
     need_root
     [[ -t 0 ]] || die "这是交互式菜单，请在 SSH 终端中运行"
     vh_legacy_cleanup
+    vh_units_refresh
     exec bash "$VH_DIR/vh-manager.sh"
     ;;
   checkup) need_root; exec bash "$VH_DIR/vh-checkup.sh" full ;;

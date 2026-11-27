@@ -1,24 +1,24 @@
 name: ci
 on: [push, pull_request]
+permissions:
+  contents: read
 jobs:
   lint-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with: { fetch-depth: 0 }
       - name: shellcheck
-        run: shellcheck -x run.sh scripts/*.sh tests/*.sh
-      - name: shfmt
-        run: |
-          curl -fsSL -o shfmt https://github.com/mvdan/sh/releases/download/v3.8.0/shfmt_v3.8.0_linux_amd64 && chmod +x shfmt
-          ./shfmt -d -i 2 -ci run.sh scripts tests || true
+        run: shellcheck -x run.sh scripts/*.sh scripts/lib/*.sh tests/*.sh
+      - name: bash syntax
+        run: for f in run.sh scripts/*.sh scripts/lib/*.sh tests/*.sh; do bash -n "$f" || exit 1; done
       - name: tests
         run: |
           rc=0
           for t in tests/test-*.sh; do echo "== $t"; bash "$t" || rc=1; done
           exit $rc
       - name: gitleaks
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
         env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
       - name: release policy
         run: bash tests/test-release-policy.sh

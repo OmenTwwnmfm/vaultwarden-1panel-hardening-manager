@@ -35,5 +35,8 @@ EOF
 chmod 755 "$BIN.tmp"
 mv -f "$BIN.tmp" "$BIN"
 echo "[信息] 已安装/修复全局命令：$BIN"
+if [[ -d /etc/logrotate.d ]]; then
+  install -m 644 "$REPO_DIR/logrotate-vaultwarden-hardening" /etc/logrotate.d/vaultwarden-hardening
+fi
 
 exec bash "$REPO_DIR/scripts/vh-launcher.sh" "$@"

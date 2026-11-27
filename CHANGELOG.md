@@ -2,6 +2,31 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0] - 2026-11-27
+
+### Changed
+- **源码更新默认改为「提示后确认」**：进入菜单时检查 GitHub main，有新版本时列出待更新的提交，输入 `yes` 才快进。配置文件新增 `AUTO_UPDATE=notify|apply|off`（默认 `notify`；`apply` 为 0.3.x 的自动更新行为）与 `UPDATE_REQUIRE_SIGNED=1`（只接受通过 `git verify-commit` 的提交）。
+- Fail2Ban 端口同步：`.path` 改为监视整个 `/etc/ssh/sshd_config.d/` 目录，兜底定时器由 15 秒放宽到 5 分钟。已安装的单元在进入菜单时自动更新。
+- `scripts/vh-common.sh` 按主题拆分到 `scripts/lib/`（日志与锁、Vaultwarden、变更记录、SSH、防火墙、1Panel、Fail2Ban、源码更新），函数与行为不变。
+
+### Added
+- **保护期内重启也会自动回滚**：SSH 变更启用防锁死保护时安装常驻的 `vhm-guard-boot.service`，开机时回滚仍未确认的受保护变更；已确认或之后有新变更改过同一文件的不会回滚。
+- 体检新增 root 直接登录、空密码、`MaxAuthTries`、`LoginGraceTime`、`X11Forwarding` 检查，以及 vhm 后台服务指向的脚本是否存在。
+- 项目目录被移动或重新克隆后，进入菜单时自动把 vhm 的 systemd 单元改到当前位置。
+- `run.sh` 安装日志轮转配置 `/etc/logrotate.d/vaultwarden-hardening`。
+- 防火墙添加「所有 IP」规则时提示只作用于所选地址族；1Panel 修改用户名 / 密码的确认文案注明无法回滚。
+- 使用手册新增「VNC 手动恢复」与「改用普通用户登录」。
+
+### Fixed
+- 防火墙添加规则后的回读改为先完整读取再匹配，避免大规则链下 `grep -m1` 提前退出触发 SIGPIPE 误报失败；规则编号按完整编号匹配。
+
+### CI
+- 第三方 Action 固定到提交 SHA，工作流权限收紧为 `contents: read`；移除从不失败的 shfmt 步骤，新增 `bash -n` 语法检查；shellcheck 覆盖 `scripts/lib/`。
+- 发布策略测试同时校验 README 版本徽章。
+
+### Tests
+- 新增源码更新（官方 origin、分支、脏工作区、非快进、网络失败、签名校验、确认前不改源码）、开机回滚、systemd 单元刷新的测试；防火墙测试覆盖编号前缀误匹配。
+
 ## [0.3.2] - 2026-11-27
 
 ### Fixed

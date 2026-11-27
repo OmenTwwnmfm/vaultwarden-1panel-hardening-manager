@@ -22,37 +22,12 @@ log_backend() { # Debian 12+/Ubuntu 24.04 默认没有 /var/log/auth.log
 }
 
 install_port_sync() {
-  cat >"$F2B_SYNC_SERVICE" <<EOF
-[Unit]
-Description=Synchronize Fail2Ban SSH ports with sshd configuration
-After=fail2ban.service
-[Service]
-Type=oneshot
-ExecStart=/bin/bash $VH_DIR/vh-fail2ban.sh sync-port
-SuccessExitStatus=75
-EOF
-  cat >"$F2B_SYNC_PATH" <<EOF
-[Unit]
-Description=Watch SSH configuration changes for Fail2Ban
-[Path]
-PathChanged=/etc/ssh/sshd_config
-PathModified=/etc/ssh/sshd_config.d/00-vhm.conf
-Unit=vhm-ssh-port-sync.service
-[Install]
-WantedBy=multi-user.target
-EOF
-  cat >/etc/systemd/system/vhm-ssh-port-sync.timer <<'EOF'
-[Unit]
-Description=Periodically synchronize Fail2Ban SSH ports
-[Timer]
-OnBootSec=15s
-OnUnitActiveSec=15s
-AccuracySec=2s
-[Install]
-WantedBy=multi-user.target
-EOF
+  local rc=0
+  f2b_sync_units_write || rc=$?
+  ((rc != 2)) || return 1
   systemctl daemon-reload &&
-    systemctl enable --now vhm-ssh-port-sync.path vhm-ssh-port-sync.timer
+    systemctl enable --now vhm-ssh-port-sync.path vhm-ssh-port-sync.timer &&
+    { ((rc != 0)) || systemctl restart vhm-ssh-port-sync.path vhm-ssh-port-sync.timer; }
 }
 
 setup() {

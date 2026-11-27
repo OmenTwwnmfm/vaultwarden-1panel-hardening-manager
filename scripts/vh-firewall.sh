@@ -130,6 +130,12 @@ ipt_has_line() { # 先完整读取再匹配：grep -q 提前退出会让大链�
   grep -Fxq -- "$2" <<<"$out"
 }
 
+ipt_find_id() { # ipt_find_id 地址族 编号：输出注释为 vhm:<编号> 的规则行；同样先完整读取再匹配，编号后必须是空格或引号
+  local out
+  out=$("$(family_bin "$1")" -w -S "$FW_CHAIN" 2>/dev/null) || return 1
+  awk -v tag="vhm:$2" '{ i = index($0, tag); if (i) { c = substr($0, i + length(tag), 1); if (c == " " || c == "\"" || c == "") { print; exit } } }' <<<"$out"
+}
+
 # 与 1Panel 的保存逻辑相同：只写链中的 -A 行，保留原权限，临时文件改名替换
 persist_chain() {
   local family=$1 dir file tmp output mode=644
@@ -159,7 +165,7 @@ ipt_add() { # ipt_add 地址族 动作 协议 端口 来源 位置 编号 注释
   else
     "$bin" -w -A "$FW_CHAIN" "${args[@]}" || { log_err "写入 $family 规则失败"; return 1; }
   fi
-  raw=$("$bin" -w -S "$FW_CHAIN" | grep -F -m1 -- "vhm:$7")
+  raw=$(ipt_find_id "$family" "$7")
   [[ -n $raw ]] || { log_err "规则写入后未能在 $FW_CHAIN 中找到"; return 1; }
   record_undo delete "$family" 0 "$raw" || { ipt_apply_line "$family" "${raw/#-A /-D }"; log_err "无法写入回滚记录"; return 1; }
   persist_chain "$family"
@@ -318,6 +324,7 @@ add_rule() {
     read -r -p "地址族 [4/6，默认 4]: " ans || return 0
     [[ $ans == 6 ]] && family=ipv6
     scope="所有 IP（$family）"
+    log_warn "这条规则只作用于 $family；另一地址族的同一端口不受影响，需要时请再添加一条"
   else
     scope="所有 IP"
   fi
