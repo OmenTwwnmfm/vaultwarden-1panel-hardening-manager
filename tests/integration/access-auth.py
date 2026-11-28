@@ -255,25 +255,33 @@ def positive_login(credentials):
     return transport
 
 
-def wait_match(channel, pattern, label, timeout=15, *, completed=None):
+def wait_match(channel, pattern, label, timeout=15, *, completed=None, diagnostics=None):
     output = b""
+
+    def detail():
+        if diagnostics is None:
+            return ""
+        # Select fixed names only; a terminal transcript may contain secrets.
+        matched = [name for name, marker in diagnostics.items() if marker.encode("utf-8") in output]
+        return " (signals: " + (", ".join(matched) or "none") + ")"
+
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if channel.recv_ready():
             output = (output + channel.recv(4096))[-8192:]
             if completed is not None and (exit_match := completed.search(output)) is not None:
-                raise IntegrationFailure(f"interactive command exited with status {int(exit_match.group(1))} before {label}")
+                raise IntegrationFailure(f"interactive command exited with status {int(exit_match.group(1))} before {label}{detail()}")
             match = pattern.search(output)
             if match is not None:
                 return match
         elif channel.closed:
             break
         time.sleep(0.05)
-    raise IntegrationFailure(f"interactive shell did not reach {label}")
+    raise IntegrationFailure(f"interactive shell did not reach {label}{detail()}")
 
 
-def wait_marker(channel, marker, label, *, completed=None):
-    wait_match(channel, re.compile(re.escape(marker.encode("utf-8"))), label, completed=completed)
+def wait_marker(channel, marker, label, *, completed=None, diagnostics=None):
+    wait_match(channel, re.compile(re.escape(marker.encode("utf-8"))), label, completed=completed, diagnostics=diagnostics)
 
 
 @dataclass(frozen=True)
@@ -440,6 +448,16 @@ def ssh_login_checks(credentials):
 
 
 CREATE_DONE = re.compile(rb"\r\nVHM_CREATE_DONE:([0-9]+)\r\n")
+CREATE_DIAGNOSTICS = {
+    "cancelled": "已取消",
+    "unsafe_home_or_shell": "不符合创建要求",
+    "missing_tty": "创建用户需要交互终端",
+    "useradd_failed": "系统未确认创建",
+    "account_or_group_check_failed": "未通过普通账号或独立用户组校验",
+    "unexpected_sudo": "现有 sudo 规则允许该用户使用 sudo",
+    "passwd_started": "请按系统提示为",
+    "password_unconfirmed": "未确认可用密码",
+}
 USER_TYPE_PROMPT = "选择要配置的用户类型: "
 USERNAME_PROMPT = "普通用户名（不存在时可选择创建，回车返回）: "
 CONFIRM_PROMPT = "输入 yes 继续（其他输入均取消）: "
@@ -453,6 +471,23 @@ def select_ordinary_user(channel, username, label, completed):
     channel.sendall(username + "\n")
 
 
+def created_account_state(username):
+    from pwd import getpwnam
+
+    try:
+        getpwnam(username)
+    except KeyError:
+        return "account_exists=False has_password=False"
+    try:
+        result = subprocess.run(["passwd", "-S", username], capture_output=True, check=False, timeout=5,
+                                env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.TimeoutExpired):
+        return "account_exists=True has_password=unknown"
+    fields = result.stdout.split()
+    has_password = str(fields[1] == b"P") if result.returncode == 0 and len(fields) >= 2 else "unknown"
+    return f"account_exists=True has_password={has_password}"
+
+
 def create_user_checks(credentials):
     from pwd import getpwnam
 
@@ -464,16 +499,18 @@ def create_user_checks(credentials):
         with sudo_shell(root) as channel:
             channel.sendall("/usr/local/bin/vhm test-create-user; printf '\\nVHM_CREATE_DONE:%s\\n' \"$?\"\n")
             select_ordinary_user(channel, username, "create user", CREATE_DONE)
-            wait_marker(channel, CONFIRM_PROMPT, "account creation confirmation", completed=CREATE_DONE)
+            wait_marker(channel, CONFIRM_PROMPT, "account creation confirmation", completed=CREATE_DONE, diagnostics=CREATE_DIAGNOSTICS)
             channel.sendall("yes\n")
-            wait_marker(channel, "New password:", "new account password entry", completed=CREATE_DONE)
+            wait_marker(channel, "New password:", "new account password entry", completed=CREATE_DONE, diagnostics=CREATE_DIAGNOSTICS)
             channel.sendall(password + "\n")
-            wait_marker(channel, "Retype new password:", "new account password confirmation", completed=CREATE_DONE)
+            wait_marker(channel, "Retype new password:", "new account password confirmation", completed=CREATE_DONE, diagnostics=CREATE_DIAGNOSTICS)
             channel.sendall(password + "\n")
-            wait_marker(channel, USER_MENU_PROMPT, "created account menu", completed=CREATE_DONE)
+            wait_marker(channel, USER_MENU_PROMPT, "created account menu", completed=CREATE_DONE, diagnostics=CREATE_DIAGNOSTICS)
             channel.sendall("0\n")
             status = int(wait_match(channel, CREATE_DONE, "account creation result").group(1))
             require(status == 0, f"account creation command exited with status {status}")
+    except IntegrationFailure as error:
+        raise IntegrationFailure(f"{error}; {created_account_state(username)}") from None
     finally:
         root.close()
 
