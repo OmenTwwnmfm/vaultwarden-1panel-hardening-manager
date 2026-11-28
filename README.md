@@ -1,10 +1,10 @@
+<div align="center">
+
 # Vaultwarden Hardening Manager
 
-## 项目简介
+**VPS 安全体检 · 分用户 SSH 登录 · 防火墙与 Fail2Ban · Vaultwarden 管理**
 
-**安全体检 · SSH 登录模式 · 1Panel / UFW 防火墙 · Fail2Ban 端口同步 · Vaultwarden 管理**
-
-面向 Ubuntu / Debian 上通过 1Panel 应用商店安装 Vaultwarden 的 VPS
+面向在 Ubuntu / Debian 上用 1Panel 部署 Vaultwarden 的管理员
 
 ![Platform](https://img.shields.io/badge/platform-Ubuntu%20%7C%20Debian-blue)
 ![Panel](https://img.shields.io/badge/panel-1Panel-1677ff)
@@ -14,9 +14,19 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![CI](https://github.com/OmenTwwnmfm/vaultwarden-hardening-manager/actions/workflows/ci.yml/badge.svg)
 
-Vaultwarden 把整个家庭或团队的密码库放在一台 VPS 上，这台服务器本身的安全就是密码库的安全。本项目提供一个交互式加固管理器：体检 VPS 当前开放了哪些端口、对哪些 IP 放行、SSH 怎么登录、有没有暴力破解防护；然后一步步完成 SSH 双因素认证、Fail2Ban、系统加固，并管理 Vaultwarden 的注册、后台和安全选项。
+[快速开始](#快速开始) · [主菜单预览](#主菜单预览) · [使用手册](docs/使用手册.md) · [更新日志](CHANGELOG.md)
 
-项目不替代 1Panel。1Panel 继续负责应用安装、Docker、域名、HTTPS 和反向代理；防火墙规则可以在 1Panel 页面或 vhm `[15]` 中修改，两边读写同一套规则。本项目负责 SSH 登录安全、防火墙规则、Fail2Ban、系统参数和 Vaultwarden 的 `config.json` 设置。兄弟项目 [vaultwarden-backup-manager](https://github.com/OmenTwwnmfm/vaultwarden-backup-manager)（`vbm`）管「数据不丢」，本项目管「门锁不坏」。
+</div>
+
+---
+
+## 项目简介
+
+`vhm` 用来加固已运行的 Vaultwarden 和它所在的 VPS。先做一次只读体检，看看哪些端口对外开放、SSH 怎么验证登录、Fail2Ban 是否运行，再按结果调整 SSH、防火墙和 Vaultwarden 设置。改 SSH 端口或登录方式时，向导会先备份配置并启用自动回滚保护。
+
+1Panel 继续负责部署、域名、HTTPS 和反向代理；`vhm` 负责安全加固；兄弟项目 [vaultwarden-backup-manager](https://github.com/OmenTwwnmfm/vaultwarden-backup-manager)（`vbm`）负责备份与恢复。安装了 `vbm` 时，`vhm` 在修改 Vaultwarden 设置之前会先调用它备份。
+
+**当前版本：[`v0.5.1`](https://github.com/OmenTwwnmfm/vaultwarden-hardening-manager/releases/tag/v0.5.1)。** 启动和 `[27]` 检查源码更新时，先显示当前版本、目标版本和更新内容，输入 `yes` 才更新。历次变更见[更新日志](CHANGELOG.md)。
 
 ## 快速开始
 
@@ -28,46 +38,19 @@ cd /opt/vaultwarden-hardening-manager
 sudo bash ./run.sh
 ```
 
-安装后，在任意目录执行 `sudo vhm` 即可再次打开菜单。已有安装仍使用旧仓址时，请看[仓库改名后的升级步骤](docs/使用手册.md#仓库改名后的升级)。
+1. **首次配置：** 选 `[01]` 检查依赖并识别 Vaultwarden 实例。
+2. **做一次体检：** 选 `[02]`，或在终端运行 `sudo vhm checkup`。这一步是只读的，也可以在首次配置前运行。
+3. **按结果处理：** 优先看「危险」项，再选择 `[06]` 配置 SSH、`[15]` 管理防火墙或 `[16]` 启用 Fail2Ban。Vaultwarden 注册、后台及安全选项见 `[19]`、`[20]`、`[22]`。完整顺序见[快速开始指南](docs/快速开始.md)。
 
-想先看看当前风险，可以直接在菜单选 `[02]`，或退出菜单后运行 `sudo vhm checkup`。体检是只读操作；修改范围和回滚方式见[安全与影响说明](docs/安全与影响说明.md)。
+> **修改 SSH 前先打开 VPS 服务商的 VNC 控制台，并保留当前 SSH 会话。** 修改后用新连接验证成功，再回原窗口确认。
 
-> **修改 SSH 前请先打开 VPS 服务商的 VNC 控制台。** VNC 不受 SSH 配置影响，可用于登录失败时的恢复。
+以后在任意目录运行 `sudo vhm` 即可打开菜单。已有安装仍使用旧仓址时，参见[仓库改名后的升级步骤](docs/使用手册.md#仓库改名后的升级)。
 
-首次配置的推荐顺序：
+## 主菜单预览
 
-1. `[01]` 检查依赖、识别 Vaultwarden 实例（已安装 vbm 时复用其实例）。
-2. `[02]` 运行安全体检，先看哪些项是「危险」。
-3. `[04]` 确认现有 root 登录密钥；准备普通用户时先创建本地账户并设置其密码。
-4. `[15]` 管理防火墙规则，`[16]` 启用 Fail2Ban。
-5. `[06]` 先选 root 或普通用户，再选择该用户的 SSH 登录方式。普通管理员还可选「密钥 + 密码 + TOTP，sudo 再验密码 + TOTP」；向导验证新会话后才关闭 root SSH。
-6. `[19]` 关闭开放注册，`[20]` 不用时关闭后台，`[22]` 应用推荐安全选项。
-7. `[23]` 启用自动安全更新，`[24]` 加固内核网络参数。
-8. 体检提示 Docker 端口暴露时，在 1Panel 应用参数中取消「端口外部访问」。
+![vhm 主菜单局部演示：顶部状态摘要、快速操作和 SSH 登录安全](docs/menu-preview.png)
 
-## 操作确认输入
-
-所有会修改系统的操作都会先显示要改什么，再要求输入 `yes`。大小写不敏感：`yes`、`YES`、`Yes` 都可以继续；其他输入均取消。只读功能（体检、状态、端口一览、用户列表、登录记录）不需要确认，也不会修改任何文件。
-
-## 功能特点
-
-### v0.5.1 更新说明
-
-- 启动和 `[27]` 均先展示当前版本、目标版本及本次变更，输入 `yes` 才更新。仍在运行 v0.5.0 且设置了 `AUTO_UPDATE="apply"` 时，先将其改为 `"notify"` 再启动，让这一次升级也经过确认。
-
-### v0.5.0 更新说明
-
-- `[06]` 先选 root / 普通用户，再独立配置四种 SSH 登录方式；`[07]` 按用户管理动态口令。
-- 普通用户可选三项登录验证与 sudo 双项验证方案，验证新会话可用后再关闭 root SSH，保留完整回滚。
-- 增加真实 Linux 认证集成测试。已有旧仓址安装仍按[使用手册](docs/使用手册.md#仓库改名后的升级)升级。
-
-历次版本的完整变更见 [CHANGELOG.md](CHANGELOG.md)。从 0.1.x 升级时，首次进入菜单会自动清理旧版定时巡检。
-
-### 菜单结构
-
-主菜单分为八类，顶部状态面板显示 SSH 端口、2FA、密码登录、防火墙、Fail2Ban 封禁数，以及 Vaultwarden 的注册与后台状态。
-
-![vhm 主菜单预览，显示演示环境中的 SSH、1Panel、Fail2Ban 和 Vaultwarden 状态](docs/menu-preview.png)
+上图是旧版演示环境的菜单局部截图。当前菜单分为以下八类：
 
 | 分类 | 菜单 |
 |---|---|
@@ -79,6 +62,23 @@ sudo bash ./run.sh
 | 06 · Vaultwarden | `[18]` 状态总览　`[19]` 开启 / 关闭注册　`[20]` 后台 ADMIN　`[21]` 用户列表　`[22]` 安全选项 |
 | 07 · 系统加固 | `[23]` 自动安全更新　`[24]` 内核网络参数加固 |
 | 08 · 系统维护 | `[25]` 变更记录与回滚　`[26]` 生成脱敏诊断报告　`[27]` 检查 / 更新项目源码 |
+
+## 适用环境与边界
+
+| 项目 | 说明 |
+|---|---|
+| 系统 | Ubuntu / Debian，使用 systemd 管理服务与回滚保护 |
+| 权限 | root 或可使用 `sudo` 的账号；项目目录需由 root 所有、普通用户不可写 |
+| Vaultwarden | 主要面向 1Panel 应用商店的 Docker 部署；通过容器 `/data` 挂载识别实例，用户列表读取 SQLite |
+| 1Panel 和防火墙 | 面板管理通过 1Panel v2 的 `1pctl`；`[15]` 支持 1Panel 的 iptables 规则和 UFW |
+
+没有识别到 Vaultwarden 实例时，仍可使用 SSH、防火墙、Fail2Ban 与系统体检。修改范围与恢复方式见[安全与影响说明](docs/安全与影响说明.md)。
+
+## 操作确认输入
+
+需要确认的操作会先显示改动内容。输入 `yes`、`YES` 或 `Yes` 均可继续；其他输入取消。体检、状态和登录记录等只读操作不需要确认。
+
+## 功能特点
 
 ### VPS 安全体检
 
@@ -182,6 +182,7 @@ sudo bash ./run.sh
 - 之后在任意目录执行 `sudo vhm` 即可进入菜单。
 - 启动菜单时，vhm 默认检查官方仓库的 `main` 分支。发现可更新的源码时，先显示当前版本、目标版本及目标提交新增的更新日志；没有新增日志时显示提交摘要。输入 `yes` 才更新并重新加载菜单，未确认时保留当前源码。
 - `/etc/vaultwarden-hardening.conf` 中的 `AUTO_UPDATE="notify"`（默认）在启动时检查并询问，旧值 `"apply"` 也按 `notify` 处理。`AUTO_UPDATE="off"` 只跳过启动检查，仍可在 `[27]` 手动检查、预览并确认。本地已跟踪文件有改动、当前不在 `main` 或网络不可用时会保留当前版本。
+- 从 v0.5.0 升级时，只有明确设置了 `AUTO_UPDATE="apply"` 才需要在启动前改成 `"notify"`，让这次升级也先询问。没有配置文件时直接使用默认设置。
 - `vhm` 指向当初克隆的项目目录。移动项目目录后，在新位置重新运行一次 `sudo bash ./run.sh`，进入菜单时会自动把 vhm 的 systemd 单元改到新位置。
 
 ## 文件与路径
@@ -191,8 +192,9 @@ sudo bash ./run.sh
 | 配置（实例） | `/etc/vaultwarden-hardening.conf`（`600`） |
 | 变更记录 | `/var/lib/vaultwarden-hardening/changes/` |
 | 日志（已脱敏） | `/var/log/vaultwarden-hardening.log` |
-| SSH 配置 | `/etc/ssh/sshd_config.d/00-vhm.conf` |
-| 2FA 绑定 | `/root/.google_authenticator`（`400`） |
+| SSH 配置 | `/etc/ssh/sshd_config` 中的分用户规则，及 `/etc/ssh/sshd_config.d/00-vhm.conf` 的全局设置 |
+| 分用户公钥 | `/etc/ssh/vhm-authorized-keys/<用户>` |
+| 分用户 TOTP | `/etc/security/vhm-access/<用户>/totp`（`600`）；旧 root 绑定使用 `/root/.google_authenticator` |
 | Fail2Ban | `/etc/fail2ban/jail.d/vhm-sshd.local` |
 | 后台服务 | `/etc/systemd/system/vhm-ssh-port-sync.{service,path,timer}`、`vhm-guard-boot.service` |
 | 日志轮转 | `/etc/logrotate.d/vaultwarden-hardening` |
@@ -239,7 +241,7 @@ sudo bash ./run.sh
 CI 在每次推送和 Pull Request 时运行 ShellCheck、Bash 语法检查、全部测试、发布策略检查和密钥扫描。可以在 Debian / Ubuntu 下运行同样的脚本检查：
 
 ```bash
-shellcheck -x run.sh scripts/*.sh scripts/lib/*.sh tests/*.sh
+shellcheck -x run.sh scripts/*.sh scripts/lib/*.sh tests/*.sh tests/integration/*.sh
 bash tests/check.sh
 ```
 
