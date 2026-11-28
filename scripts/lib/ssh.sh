@@ -12,10 +12,10 @@ access_user() {
 access_active() { [[ -n $(access_user) ]]; }
 
 # 显示原始 SSH 登录账户；sudo/su 后仍沿用实际连接进程的身份，不读取登录环境变量。
-ssh_login_user() { _ssh_login_identity; }
+ssh_login_user() { _ssh_login_identity '' ''; }
 
 _ssh_login_identity() { # [预期用户名 UID]；传入时返回 sshd-pid:start-ticks
-  python3 - "$@" 2>/dev/null <<'PY'
+  python3 - "$1" "$2" 2>/dev/null <<'PY'
 import os
 import pwd
 import re
@@ -51,7 +51,7 @@ while pid > 1 and pid not in seen and len(seen) < 128:
         account = pwd.getpwnam(username)
         if account.pw_name != username or account.pw_uid != real_uid or real_uid != effective_uid:
             continue
-        if expected:
+        if expected[0]:
             if expected != [username, str(real_uid)]:
                 sys.exit(1)
             with open(path + '/stat', encoding='ascii', errors='replace') as stream:

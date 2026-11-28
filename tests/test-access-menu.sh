@@ -27,7 +27,7 @@ sudo() { [[ $* == "-n -l -U ${fixture_sudo_user:-none}" ]]; }
 access_password_terminal() { [[ ${fixture_terminal:-1} == 1 ]]; }
 access_safe_path() { [[ $1 == /home/* ]]; }
 useradd() {
-  local user=${@: -1}
+  local user=${!#}
   [[ $* == "--create-home --home-dir /home/$user --user-group --shell /bin/bash -- $user" ]] || fail 'account was not created with a private group and no extra privileges'
   printf 'useradd\t%s\n' "$user" >>"$trace"
   [[ $user != failedadd ]] || return 1

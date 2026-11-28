@@ -255,12 +255,14 @@ def positive_login(credentials):
     return transport
 
 
-def wait_match(channel, pattern, label, timeout=15):
+def wait_match(channel, pattern, label, timeout=15, *, completed=None):
     output = b""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if channel.recv_ready():
             output = (output + channel.recv(4096))[-8192:]
+            if completed is not None and (exit_match := completed.search(output)) is not None:
+                raise IntegrationFailure(f"interactive command exited with status {int(exit_match.group(1))} before {label}")
             match = pattern.search(output)
             if match is not None:
                 return match
@@ -270,8 +272,8 @@ def wait_match(channel, pattern, label, timeout=15):
     raise IntegrationFailure(f"interactive shell did not reach {label}")
 
 
-def wait_marker(channel, marker, timeout=15):
-    wait_match(channel, re.compile(re.escape(marker.encode("utf-8"))), "the expected prompt", timeout)
+def wait_marker(channel, marker, label, *, completed=None):
+    wait_match(channel, re.compile(re.escape(marker.encode("utf-8"))), label, completed=completed)
 
 
 @dataclass(frozen=True)
@@ -372,7 +374,7 @@ def sudo_shell(transport):
         channel.get_pty(term="dumb", width=120, height=25)
         channel.exec_command("exec /bin/bash --noprofile --norc")
         channel.sendall("unset HISTFILE; export LC_ALL=C; PS1=''; stty -echo; printf '\\nVHM_SHELL_READY\\n'\n")
-        wait_marker(channel, "\r\nVHM_SHELL_READY\r\n")
+        wait_marker(channel, "\r\nVHM_SHELL_READY\r\n", "SSH test shell readiness")
         yield channel
     finally:
         channel.close()
@@ -400,7 +402,7 @@ def original_sudo_check(credentials, username):
     try:
         with sudo_shell(transport) as channel:
             channel.sendall("sudo -k; printf '\\nVHM_SUDO_RESET\\n'\n")
-            wait_marker(channel, "\r\nVHM_SUDO_RESET\r\n")
+            wait_marker(channel, "\r\nVHM_SUDO_RESET\r\n", "sudo cache reset")
             result = sudo_command(channel, credentials, username=username)
             require(result.status == 0 and result.ran_as_root, "unmanaged sudo did not run as root: " + result.detail())
             require(result.passwords > 0 and result.tokens == 0, "sudo altered another administrator's authentication: " + result.detail())
@@ -437,6 +439,20 @@ def ssh_login_checks(credentials):
         ordinary.close()
 
 
+CREATE_DONE = re.compile(rb"\r\nVHM_CREATE_DONE:([0-9]+)\r\n")
+USER_TYPE_PROMPT = "选择要配置的用户类型: "
+USERNAME_PROMPT = "普通用户名（不存在时可选择创建，回车返回）: "
+CONFIRM_PROMPT = "输入 yes 继续（其他输入均取消）: "
+USER_MENU_PROMPT = "请选择："
+
+
+def select_ordinary_user(channel, username, label, completed):
+    wait_marker(channel, USER_TYPE_PROMPT, f"{label}: user type selection", completed=completed)
+    channel.sendall("2\n")
+    wait_marker(channel, USERNAME_PROMPT, f"{label}: username entry", completed=completed)
+    channel.sendall(username + "\n")
+
+
 def create_user_checks(credentials):
     from pwd import getpwnam
 
@@ -447,15 +463,17 @@ def create_user_checks(credentials):
     try:
         with sudo_shell(root) as channel:
             channel.sendall("/usr/local/bin/vhm test-create-user; printf '\\nVHM_CREATE_DONE:%s\\n' \"$?\"\n")
-            wait_marker(channel, "选择要配置的用户类型: ")
-            channel.sendall(f"2\n{username}\nyes\n")
-            wait_marker(channel, "New password:")
+            select_ordinary_user(channel, username, "create user", CREATE_DONE)
+            wait_marker(channel, CONFIRM_PROMPT, "account creation confirmation", completed=CREATE_DONE)
+            channel.sendall("yes\n")
+            wait_marker(channel, "New password:", "new account password entry", completed=CREATE_DONE)
             channel.sendall(password + "\n")
-            wait_marker(channel, "Retype new password:")
+            wait_marker(channel, "Retype new password:", "new account password confirmation", completed=CREATE_DONE)
             channel.sendall(password + "\n")
-            wait_marker(channel, "请选择：")
+            wait_marker(channel, USER_MENU_PROMPT, "created account menu", completed=CREATE_DONE)
             channel.sendall("0\n")
-            wait_marker(channel, "\r\nVHM_CREATE_DONE:0\r\n")
+            status = int(wait_match(channel, CREATE_DONE, "account creation result").group(1))
+            require(status == 0, f"account creation command exited with status {status}")
     finally:
         root.close()
 
@@ -490,12 +508,12 @@ ROOT_PHASE = re.compile(
 
 
 def menu_action(channel, command, username, action):
+    label = {7: "sudo grant", 8: "root SSH switch"}[action]
     channel.sendall(f"{command}; printf '\\nVHM_MENU_DONE:%s\\n' \"$?\"\n")
-    wait_marker(channel, "选择要配置的用户类型: ")
-    channel.sendall(f"2\n{username}\n")
-    wait_marker(channel, "请选择：")
+    select_ordinary_user(channel, username, label, MENU_DONE)
+    wait_marker(channel, USER_MENU_PROMPT, f"{label}: selected user menu", completed=MENU_DONE)
     channel.sendall(f"{action}\n")
-    wait_marker(channel, "输入 yes 继续（其他输入均取消）: ")
+    wait_marker(channel, CONFIRM_PROMPT, f"{label}: confirmation", completed=MENU_DONE)
 
 
 def menu_done(channel, label, timeout=15):
@@ -558,7 +576,7 @@ def local_admin_checks(credentials, username):
 
 
 def root_phase(channel, phase):
-    match = wait_match(channel, ROOT_PHASE, f"root SSH switch {phase} prompt", timeout=20)
+    match = wait_match(channel, ROOT_PHASE, f"root SSH switch {phase} prompt", timeout=20, completed=MENU_DONE)
     require(match.group(2).decode("ascii") == phase, "root SSH switch requested an unexpected verification phase")
     return match.group(1).decode("ascii")
 
