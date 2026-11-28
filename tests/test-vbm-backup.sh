@@ -34,8 +34,10 @@ flock() {
   fi
 }
 
-load_instance() { return 0; }
+selected_data=$VW_DATA_DIR
+load_instance() { VW_DATA_DIR=$selected_data VW_CONTAINER=fixture; }
 vw_restart_check() {
+  printf '%s\n' "$VW_DATA_DIR" >>"$T/restarts"
   if command flock -n "$VBM_LOCK" true; then
     echo "FAIL 重启 Vaultwarden 时未持有 vbm 锁"
     return 1
@@ -54,7 +56,14 @@ change_status applied || exit 1
   change_rollback "$CHG_ID" >/dev/null 2>&1 && { echo "FAIL 备份进行时允许了手动回滚"; fail=1; }
 } 6>"$VBM_LOCK"
 [[ $(vw_cfg signups_allowed) == false && $(cat "$CHG_DIR/status") == applied ]] || { echo "FAIL 锁被占用时改动了配置或记录"; fail=1; }
-change_rollback "$CHG_ID" >/dev/null || { echo "FAIL 释放备份锁后手动回滚失败"; fail=1; }
+selected_data="$T/other"
+printf '{"signups_allowed": true}\n' >"$selected_data/config.json"
+change_rollback "$CHG_ID" >/dev/null 2>&1 && { echo "FAIL 允许回滚其他 Vaultwarden 实例的记录"; fail=1; }
+[[ $(vw_cfg signups_allowed) == false && $(cat "$CHG_DIR/status") == applied && ! -e $T/restarts ]] || { echo "FAIL 实例不匹配时修改了配置或记录，或重启了容器"; fail=1; }
+command flock -n "$VBM_LOCK" true || { echo "FAIL 拒绝回滚后仍持有 vbm 锁"; fail=1; }
+selected_data="$VW_DATA_DIR/."
+mv -- "$config_file" "$T/previous-config" || exit 1
+change_rollback "$CHG_ID" >/dev/null || { echo "FAIL 相同数据目录的手动回滚失败"; fail=1; }
 [[ $(vw_cfg signups_allowed) == true && $(cat "$CHG_DIR/status") == rolled_back ]] || { echo "FAIL 手动回滚未恢复原设置"; fail=1; }
 command flock -n "$VBM_LOCK" true || { echo "FAIL 手动回滚结束后仍持有 vbm 锁"; fail=1; }
 

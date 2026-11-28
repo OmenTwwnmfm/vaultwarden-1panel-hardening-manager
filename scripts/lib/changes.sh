@@ -157,9 +157,20 @@ change_rollback() {
     return 0
   fi
   hooks=$(change_meta "$id" HOOKS)
-  if [[ " $hooks " == *" vw "* && ${2:-} != vbm-lock-held ]]; then
-    vbm_lock_hold || { exec 7>&-; return 1; }
-    acquired_vbm=1
+  if [[ " $hooks " == *" vw "* ]]; then
+    local recorded_config VW_DATA_DIR=${VW_DATA_DIR:-} VW_CONTAINER=${VW_CONTAINER:-}
+    if [[ ${2:-} != vbm-lock-held ]]; then
+      vbm_lock_hold || { exec 7>&-; return 1; }
+      acquired_vbm=1
+    fi
+    if ! recorded_config=$(awk -F '\t' 'NR == 1 && NF == 5 { path = $5 } END { if (NR != 1 || path == "") exit 1; print path }' "$d/files.tsv" 2>/dev/null) ||
+      ! load_instance || [[ $recorded_config != /* || ${recorded_config##*/} != config.json ||
+        ! -d $VW_DATA_DIR || ! "${recorded_config%/*}/" -ef $VW_DATA_DIR ]]; then
+      log_err "无法确认变更 $id 属于当前 Vaultwarden 实例，未恢复文件。请在 $VH_CONF 中将 VW_DATA_DIR 指回原实例，运行 [01] 后重试。"
+      if ((acquired_vbm)); then vbm_lock_release; fi
+      exec 7>&-
+      return 1
+    fi
   fi
   change_restore_files "$d" || rc=1
   # shellcheck disable=SC2086

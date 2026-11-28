@@ -133,7 +133,6 @@ vw_health_wait() { # 最多等待 120 秒，直到容器 healthy（无健康检�
 }
 
 vw_restart_check() {
-  load_instance >/dev/null 2>&1 || load_instance || return 1
   log_info "重启容器 $VW_CONTAINER 并等待健康检查……"
   docker restart "$VW_CONTAINER" >/dev/null || return 1
   vw_health_wait
@@ -251,7 +250,7 @@ vw_apply() {
     log_ok "$desc：已生效（变更 $CHG_ID，可在 [25] 回滚）"
   else
     log_err "$desc 失败，正在恢复原配置……"
-    change_rollback "$CHG_ID" vbm-lock-held || log_err "恢复失败，记录已标记为「回滚失败」，可在 [25] 重试"
+    change_rollback "$CHG_ID" vbm-lock-held || log_err "未能恢复原配置，请核对上述错误并在 [25] 重试"
     rc=1
   fi
   vbm_lock_release
