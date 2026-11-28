@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# vaultwarden-1panel-hardening-manager 安装/启动入口
+# vaultwarden-hardening-manager 安装/启动入口
 # 用法：sudo bash ./run.sh
 set -Eeuo pipefail
 

@@ -78,9 +78,11 @@ f2b_sync_ssh_port_now() {
 }
 
 sysctl_restore() { # 恢复修改前记录的运行时参数
-  local d=$1 k v
+  local d=$1 k v rc=0
   [[ -f $d/sysctl.prev ]] || return 0
   while IFS='=' read -r k v; do
-    [[ -n $k ]] && sysctl -q -w "$k=$v" >/dev/null
-  done <"$d/sysctl.prev"
+    [[ -n $k ]] || continue
+    sysctl -q -w "$k=$v" >/dev/null || rc=1
+  done <"$d/sysctl.prev" || rc=1
+  return "$rc"
 }

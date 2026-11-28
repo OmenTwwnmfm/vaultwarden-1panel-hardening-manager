@@ -191,7 +191,7 @@ conf_get() { # conf_get KEY [file]
 kv_set() { # kv_set 文件 KEY 值（值只允许安全字符）
   local f=$1 k=$2 v=$3 tmp
   [[ $v =~ ^[A-Za-z0-9._,:/@\ -]*$ ]] || { log_err "非法值：$k"; return 1; }
-  install -d -m 700 "$(dirname "$f")" || return 1
+  (umask 077; mkdir -p -- "$(dirname -- "$f")") || return 1
   tmp=$(mktemp "$f.XXXXXX") || return 1
   {
     [[ -f $f ]] && grep -v "^$k=" "$f"

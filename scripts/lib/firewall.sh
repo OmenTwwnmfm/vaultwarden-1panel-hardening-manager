@@ -27,12 +27,13 @@ fw_type() {
 
 # shellcheck disable=SC2120 # 参数可选，默认读取当前防火墙类型
 fw_label() {
-  case ${1:-$(fw_type)} in
+  local backend=${1:-$(fw_type)}
+  case $backend in
     1panel-iptables) echo "1Panel（iptables）" ;;
     1panel-nftables) echo "1Panel（nftables）" ;;
     ufw) echo "UFW" ;;
     none) echo "未启用" ;;
-    *) echo "$1" ;;
+    *) echo "$backend" ;;
   esac
 }
 

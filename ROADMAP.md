@@ -7,7 +7,8 @@
 - 在干净环境完整跑一遍加固流程并留实测记录，只写测过的组合。
 - 在拿到第一批外部试用反馈前冻结新功能，优先修稳定性问题。
 - 在 CI 中增加带 systemd 的集成测试（Debian 12、Ubuntu 22.04 / 24.04），覆盖改端口确认与超时回滚、2FA 开关、防火墙添加与回滚。
-- 支持为普通 sudo 用户绑定动态口令，并在 vhm 中一键改为 `PermitRootLogin no`。
+- 在后续功能版本中支持普通 sudo 用户绑定动态口令；先验证该用户能登录并使用 `sudo`，再关闭 root SSH（`PermitRootLogin no`）。
+- 评估普通用户的「密钥 + 账户密码 + TOTP」可选模式。用新会话分别检查缺少任意一项都不能登录，区分 SSH 登录与 `sudo` 提权，并覆盖取消、超时和重启回滚。
 - 维护者签名提交，让 `UPDATE_REQUIRE_SIGNED=1` 可以开箱使用。
 
 ## 明确不做
@@ -18,4 +19,6 @@
 ## 版本纪律
 
 - 遵循语义化版本：新功能升次版本，缺陷修复升修订号。
-- 每次发版同步更新 VERSION 与 CHANGELOG；是否创建 GitHub Release 按维护者安排，发布策略测试会校验 VERSION 与 CHANGELOG 一致。
+- 日常变更先记入 `CHANGELOG.md` 的 `[Unreleased]`。积累一批修复或完成一项功能后，再整理发版。
+- 发版前同步 `VERSION`、README 版本徽章和 CHANGELOG。候选提交先通过 Linux CI 中的 ShellCheck、Bash 语法、回归测试和密钥扫描；`main` 是 vhm 的源码更新来源，通过后再合入。
+- 用 `v<VERSION>` 标签标记已验证的提交；发布同名 GitHub Release，附变更摘要、安装或升级说明与验证范围。既有标签不移动。

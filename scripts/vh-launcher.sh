@@ -46,7 +46,7 @@ check_deps() {
 
 usage() {
   cat <<EOF
-vhm $VH_VERSION — VPS & Vaultwarden (1Panel) 加固管理器
+vhm $VH_VERSION — Vaultwarden Hardening Manager
 
 用法: sudo vhm [子命令]
   （无参数）            进入交互菜单

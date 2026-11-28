@@ -1,6 +1,6 @@
 <div align="center">
 
-# Vaultwarden 1Panel Hardening Manager
+# Vaultwarden Hardening Manager
 
 **安全体检 · SSH 登录模式 · 1Panel / UFW 防火墙 · Fail2Ban 端口同步 · Vaultwarden 管理**
 
@@ -10,9 +10,11 @@
 ![Panel](https://img.shields.io/badge/panel-1Panel-1677ff)
 ![SSH](https://img.shields.io/badge/ssh-password%20%7C%20key%20%7C%20TOTP-16a34a)
 ![Protection](https://img.shields.io/badge/protection-Fail2Ban-dc2626)
-![Version](https://img.shields.io/badge/version-0.4.0-blue)
+![Version](https://img.shields.io/badge/version-0.4.1-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![CI](https://github.com/OmenTwwnmfm/vaultwarden-1panel-hardening-manager/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/OmenTwwnmfm/vaultwarden-hardening-manager/actions/workflows/ci.yml/badge.svg)
+
+![vhm 主菜单预览，显示演示环境中的 SSH、1Panel、Fail2Ban 和 Vaultwarden 状态](docs/menu-preview.png)
 
 </div>
 
@@ -22,7 +24,7 @@
 
 Vaultwarden 把整个家庭或团队的密码库放在一台 VPS 上，这台服务器本身的安全就是密码库的安全。本项目提供一个交互式加固管理器：体检 VPS 当前开放了哪些端口、对哪些 IP 放行、SSH 怎么登录、有没有暴力破解防护；然后一步步完成 SSH 双因素认证、Fail2Ban、系统加固，并管理 Vaultwarden 的注册、后台和安全选项。
 
-项目不替代 1Panel。1Panel 继续负责应用安装、Docker、域名、HTTPS 和反向代理；防火墙规则可以在 1Panel 页面或 vhm `[15]` 中修改，两边读写同一套规则。本项目负责 SSH 登录安全、防火墙规则、Fail2Ban、系统参数和 Vaultwarden 的 `config.json` 设置。兄弟项目 [vaultwarden-1panel-backup-manager](https://github.com/OmenTwwnmfm/vaultwarden-1panel-backup-manager)（`vbm`）管「数据不丢」，本项目管「门锁不坏」。
+项目不替代 1Panel。1Panel 继续负责应用安装、Docker、域名、HTTPS 和反向代理；防火墙规则可以在 1Panel 页面或 vhm `[15]` 中修改，两边读写同一套规则。本项目负责 SSH 登录安全、防火墙规则、Fail2Ban、系统参数和 Vaultwarden 的 `config.json` 设置。兄弟项目 [vaultwarden-backup-manager](https://github.com/OmenTwwnmfm/vaultwarden-backup-manager)（`vbm`）管「数据不丢」，本项目管「门锁不坏」。
 
 > **修改 SSH 前请先打开 VPS 服务商控制台的 VNC。** 本工具对每次 SSH 修改都有 5 分钟自动回滚保护，但 VNC 是最后的应急入口，不受 SSH 配置影响。
 
@@ -32,19 +34,17 @@ Vaultwarden 把整个家庭或团队的密码库放在一台 VPS 上，这台服
 
 ## 功能特点
 
-### v0.4.0 更新说明
+### v0.4.1 更新说明
 
-- **源码更新改为提示后确认**：进入菜单时检查 GitHub main，有新版本时先列出待更新的提交，输入 `yes` 才更新。可在 `/etc/vaultwarden-hardening.conf` 中设置 `AUTO_UPDATE=notify`（默认）/ `apply`（自动更新，即 0.3.x 的行为）/ `off`（只在 `[27]` 手动检查），以及 `UPDATE_REQUIRE_SIGNED=1`（只接受签名校验通过的提交）。
-- **保护期内重启也会自动回滚**：新增常驻的 `vhm-guard-boot.service`，开机时回滚仍未确认的 SSH 变更。
-- 体检新增 root 直接登录、空密码、`MaxAuthTries`、`LoginGraceTime`、`X11Forwarding` 和 vhm 后台服务路径检查。
-- Fail2Ban 端口同步监视整个 `sshd_config.d` 目录，兜底定时器放宽到 5 分钟；项目目录移动后 systemd 单元自动指向新位置。
-- 修复防火墙添加规则后的回读在大规则链下可能误报失败。
+- GitHub 仓库改名为 `vaultwarden-hardening-manager`。已有安装请按[使用手册](docs/使用手册.md#仓库改名后的升级)更新 `origin`，可继续使用现有安装目录。
+- 修复首次配置可能改变配置文件父目录权限的问题。修改 Vaultwarden 设置前，核对 vbm 备份的是当前选中的数据目录。
+- 加强 SSH 变更的回滚保护，源码更新在应用前复查本地状态。详细变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 历次版本的完整变更见 [CHANGELOG.md](CHANGELOG.md)。从 0.1.x 升级时，首次进入菜单会自动清理旧版定时巡检。
 
 ### 菜单结构
 
-主菜单分为七类，顶部状态面板显示 SSH 端口、2FA、密码登录、防火墙、Fail2Ban 封禁数，以及 Vaultwarden 的注册与后台状态。
+主菜单分为八类，顶部状态面板显示 SSH 端口、2FA、密码登录、防火墙、Fail2Ban 封禁数，以及 Vaultwarden 的注册与后台状态。
 
 | 分类 | 菜单 |
 |---|---|
@@ -75,7 +75,7 @@ Vaultwarden 把整个家庭或团队的密码库放在一台 VPS 上，这台服
 
 - [15] 检测当前后端并写入同一个规则体系。1Panel iptables 模式更新 1PANEL_BASIC 链并写入 1Panel 启动时读取的 firewall rules 文件；UFW 模式通过 ufw 命令写入其持久规则。
 - 规则包含动作、地址族、TCP/UDP、端口和来源 IPv4/IPv6/CIDR。规则立即生效并显示在 1Panel 防火墙页面，重启后仍保留。
-- 每次修改留下可回滚记录。回滚会恢复规则文件与内核运行规则，UFW 会重新加载。
+- 可在 `[25]` 撤销规则改动。UFW 无法确认删除规则的原位置时会停止并提示人工处理，详见[使用手册](docs/使用手册.md#5-防火墙与-docker)。
 
 ### SSH 登录方式与 2FA
 
@@ -91,10 +91,10 @@ Vaultwarden 把整个家庭或团队的密码库放在一台 VPS 上，这台服
 
 修改端口、启用或关闭 2FA、重新绑定动态口令时：
 
-1. 写入配置后执行 `sshd -t`，并用 `sshd -T` 确认生效值确实是期望值，防止被其他配置文件覆盖。
-2. 重载 SSH 服务（兼容 Ubuntu 22.10+ 的 `ssh.socket`），**当前会话不会断开**。
-3. 启动 5 分钟的 systemd 定时器。你另开窗口按新方式登录，成功后回来输入 `yes` 保留。
-4. 输入其他内容、超时或管理器被中断，定时器都会自动回滚。
+1. 先保存原配置，再启用 systemd 定时器和开机回滚服务；保护启用失败时取消修改。
+2. 写入配置后执行 `sshd -t`，用 `sshd -T` 核对生效值，再重载 SSH（兼容 Ubuntu 22.10+ 的 `ssh.socket`）。
+3. 保持当前会话，另开窗口按新方式登录，成功后回来输入 `yes`。确认状态保存后才停止定时器。
+4. 输入其他内容会立即尝试回滚；超时或管理器被中断时，定时器会接手。
 
 保护期内机器意外重启时，开机回滚服务 `vhm-guard-boot.service` 会把仍未确认的修改改回来。
 
@@ -161,8 +161,8 @@ Vaultwarden 把整个家庭或团队的密码库放在一台 VPS 上，这台服
 ## 快速开始
 
 ```bash
-sudo git clone https://github.com/OmenTwwnmfm/vaultwarden-1panel-hardening-manager /opt/vaultwarden-1panel-hardening-manager
-cd /opt/vaultwarden-1panel-hardening-manager
+sudo git clone https://github.com/OmenTwwnmfm/vaultwarden-hardening-manager /opt/vaultwarden-hardening-manager
+cd /opt/vaultwarden-hardening-manager
 sudo bash ./run.sh
 ```
 
@@ -231,11 +231,11 @@ sudo bash ./run.sh
 
 ## 开发与测试
 
-CI 在每次推送和 Pull Request 时运行 shellcheck、全部测试、密钥泄漏扫描和发布策略检查。本地可用同样的命令验证：
+CI 在每次推送和 Pull Request 时运行 ShellCheck、Bash 语法检查、全部测试、发布策略检查和密钥扫描。可以在 Debian / Ubuntu 下运行同样的脚本检查：
 
 ```bash
-shellcheck -x run.sh scripts/*.sh tests/*.sh
-for t in tests/test-*.sh; do bash "$t"; done
+shellcheck -x run.sh scripts/*.sh scripts/lib/*.sh tests/*.sh
+bash tests/check.sh
 ```
 
 提交涉及 SSH、PAM、防火墙和容器启停的修改前，请先在本地跑通全部测试，并说明防锁死与回滚路径。

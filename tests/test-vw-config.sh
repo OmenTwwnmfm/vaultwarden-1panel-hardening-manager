@@ -23,6 +23,11 @@ printf 'admin_token\t"$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA"\n' | vw_conf
 printf 'disable_admin_token\ttrue\n' | vw_config_write
 [[ $(vw_admin_state) == notoken ]] || { echo "FAIL 未识别免令牌"; fail=1; }
 [[ $(vw_eff sends_allowed SENDS_ALLOWED true) == true ]] || { echo "FAIL 默认值错误"; fail=1; }
+vw_env() { if [[ $1 == ORG_CREATION_USERS ]]; then echo none; fi; }
+[[ $(vw_eff org_creation_users ORG_CREATION_USERS '') == none ]] || { echo "FAIL 缺少配置键时未读取环境变量"; fail=1; }
+printf 'org_creation_users\t""\n' | vw_config_write || { echo "FAIL 空值写入失败"; fail=1; }
+[[ -z $(vw_eff org_creation_users ORG_CREATION_USERS '') ]] || { echo "FAIL 空配置值未覆盖环境变量"; fail=1; }
+[[ $(vw_src org_creation_users ORG_CREATION_USERS) == config.json ]] || { echo "FAIL 空配置值的来源错误"; fail=1; }
 printf '{broken' >"$T/config.json"
 printf 'signups_allowed\tfalse\n' | vw_config_write 2>/dev/null && { echo "FAIL 覆盖了损坏的 config.json"; fail=1; }
 [[ $(cat "$T/config.json") == '{broken' ]] || { echo "FAIL 损坏文件被修改"; fail=1; }

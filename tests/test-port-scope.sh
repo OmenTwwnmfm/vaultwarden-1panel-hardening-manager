@@ -31,7 +31,14 @@ EOF
     ;;
 esac
 SH
-chmod +x "$T/bin/iptables"
+cat >"$T/bin/ss" <<'SH'
+#!/usr/bin/env bash
+cat <<'EOF'
+tcp LISTEN 0 128 [::1]:10098 [::]:* users:(("loopback",pid=1,fd=3))
+tcp LISTEN 0 128 0.0.0.0:10098 0.0.0.0:* users:(("demo",pid=2,fd=3))
+EOF
+SH
+chmod +x "$T/bin/iptables" "$T/bin/ss"
 export PATH="$T/bin:$PATH" VH_STATE="$T/state" VH_LOG=/dev/null
 # shellcheck source=scripts/vh-common.sh
 source scripts/vh-common.sh
@@ -49,5 +56,10 @@ expect none 10099 tcp
 expect none 22 tcp
 expect none 9000 tcp
 expect none 10098 udp
+report=$(bash scripts/vh-checkup.sh ports)
+[[ $report == *'10098/tcp(demo)'* ]] || { echo "FAIL 本机监听掩盖了同端口的对外监听"; fail=1; }
+[[ $(fw_label firewalld) == firewalld ]] || { echo "FAIL 显式防火墙后端显示错误"; fail=1; }
+fw_type() { echo firewalld; }
+[[ $(fw_label) == firewalld ]] || { echo "FAIL 自动识别的防火墙后端显示错误"; fail=1; }
 ((fail == 0)) && echo "PASS port-scope"
 exit $fail

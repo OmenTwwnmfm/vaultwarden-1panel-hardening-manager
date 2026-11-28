@@ -81,33 +81,24 @@ vw_env() { # 读取容器环境变量（只读）
 
 vw_cfg() { # 读取 /data/config.json 键（/admin 保存的设置，优先于环境变量）
   local f="$VW_DATA_DIR/config.json"
-  [[ -r "$f" ]] || return 0
-  python3 - "$f" "$1" <<'PY' 2>/dev/null || true
-import json, sys
-try:
-    v = json.load(open(sys.argv[1], encoding="utf-8")).get(sys.argv[2])
-except Exception:
-    sys.exit(0)
-if v is not None:
-    print(str(v).lower() if isinstance(v, bool) else v)
-PY
-}
-
-vw_cfg_has() { # config.json 中是否存在该键（值可为空串）
-  local f="$VW_DATA_DIR/config.json"
   [[ -r "$f" ]] || return 1
   python3 - "$f" "$1" <<'PY' 2>/dev/null
 import json, sys
 try:
-    sys.exit(0 if sys.argv[2] in json.load(open(sys.argv[1], encoding="utf-8")) else 1)
+    v = json.load(open(sys.argv[1], encoding="utf-8")).get(sys.argv[2])
 except Exception:
     sys.exit(1)
+if v is None:
+    sys.exit(1)
+print(str(v).lower() if isinstance(v, bool) else v)
 PY
 }
 
+vw_cfg_has() { vw_cfg "$1" >/dev/null; }
+
 vw_eff() { # 有效值：config.json > 环境变量 > 默认
   local k_cfg=$1 k_env=$2 def=$3 v
-  v=$(vw_cfg "$k_cfg"); [[ -n "$v" ]] && { echo "$v"; return; }
+  if v=$(vw_cfg "$k_cfg"); then printf '%s\n' "$v"; return; fi
   v=$(vw_env "$k_env"); [[ -n "$v" ]] && { echo "${v,,}"; return; }
   echo "$def"
 }
@@ -123,7 +114,7 @@ vw_admin_state() {
     echo notoken
     return
   fi
-  if vw_cfg_has admin_token; then tok=$(vw_cfg admin_token); else tok=$(vw_env ADMIN_TOKEN); fi
+  if ! tok=$(vw_cfg admin_token); then tok=$(vw_env ADMIN_TOKEN); fi
   tok=${tok//[[:space:]]/}
   if [[ -z $tok ]]; then echo off; elif [[ $tok == '$argon2'* ]]; then echo argon2; else echo plain; fi
 }
@@ -205,7 +196,12 @@ vbm_backup_before_change() {
     confirm_yes "在没有完整备份的情况下继续修改？" || return 1
     return 0
   fi
-  local target run_id result rc=0 k
+  local target backup_data run_id result rc=0 k
+  backup_data=$(conf_get VW_DATA_DIR "$VBM_CONF" || true)
+  if [[ $backup_data != /* || ! -d $backup_data || ! -d ${VW_DATA_DIR:-} || ! $backup_data -ef ${VW_DATA_DIR:-} ]]; then
+    log_err "无法确认 vbm 的备份目录与当前 Vaultwarden 实例一致。请核对 $VBM_CONF 中的 VW_DATA_DIR，本次未修改。"
+    return 1
+  fi
   target=$(conf_get BACKUP_TARGET "$VBM_CONF" || true)
   [[ $target == github || $target == webdav ]] || { log_err "无法从 $VBM_CONF 读取备份目标，未修改"; return 1; }
   run_id="vhm-$(date '+%Y%m%d-%H%M%S')-$$"
@@ -237,7 +233,7 @@ vbm_lock_hold() {
   exec 8>"$VBM_LOCK" || return 1
   flock -w 30 8 || { log_err "vbm 的锁被占用，本次未修改"; exec 8>&-; return 1; }
 }
-vbm_lock_release() { exec 8>&- 2>/dev/null || true; }
+vbm_lock_release() { exec 8>&-; }
 
 # vw_apply 描述 更新行（格式见 vw_config_write）。更新内容按参数传入，保证标准输入仍是终端，
 # 以便 vbm 未安装时还能交互确认。
@@ -255,7 +251,7 @@ vw_apply() {
     log_ok "$desc：已生效（变更 $CHG_ID，可在 [25] 回滚）"
   else
     log_err "$desc 失败，正在恢复原配置……"
-    change_rollback "$CHG_ID" || log_err "恢复失败，记录已标记为「回滚失败」，可在 [25] 重试"
+    change_rollback "$CHG_ID" vbm-lock-held || log_err "恢复失败，记录已标记为「回滚失败」，可在 [25] 重试"
     rc=1
   fi
   vbm_lock_release

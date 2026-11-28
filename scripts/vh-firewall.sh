@@ -172,20 +172,19 @@ ipt_add() { # ipt_add 地址族 动作 协议 端口 来源 位置 编号 注释
 }
 
 # ---------- UFW ----------
-load_ufw_rows() { # 从 UFW 持久规则读取 vhm 规则：编号 动作 协议 端口 来源 注释
+load_ufw_rows() { # 从 UFW 持久规则读取 vhm 规则：编号 动作 协议 端口 来源 注释 恢复方式
   UFW_ROWS=()
   mapfile -t UFW_ROWS < <(python3 - "$UFW_DIR" <<'PY'
+import ipaddress
 import sys
-seen = set()
-for name in ("user.rules", "user6.rules"):
+entries = {}
+for name, network in (("user.rules", "0.0.0.0/0"), ("user6.rules", "::/0")):
     try:
         lines = open(f"{sys.argv[1]}/{name}", encoding="utf-8").read().splitlines()
     except OSError:
         continue
-    for line in lines:
-        if not line.startswith("### tuple ### "):
-            continue
-        parts = line[len("### tuple ### "):].split()
+    tuples = [line[len("### tuple ### "):].split() for line in lines if line.startswith("### tuple ### ")]
+    for index, parts in enumerate(tuples):
         comment = ""
         for part in parts:
             if part.startswith("comment="):
@@ -195,37 +194,79 @@ for name in ("user.rules", "user6.rules"):
                     comment = ""
         if len(parts) < 7 or not comment.startswith("vhm:"):
             continue
-        action, proto, port, _dst, _sport, source = parts[:6]
+        action, proto, port, dst, sport, source, direction = parts[:7]
         rule_id = comment[4:].split(" ", 1)[0]
-        if rule_id in seen:
+        if len(rule_id) != 17 or not rule_id.isascii() or not rule_id.isdigit() or "\t" in comment or "\n" in comment:
             continue
-        seen.add(rule_id)
-        if source in ("0.0.0.0/0", "::/0"):
-            source = "any"
-        print("\t".join([rule_id, action, proto, port, source, comment]))
+        mode = "append" if index == len(tuples) - 1 else "insert"
+        if source == "any":
+            source = network
+        try:
+            same_family = ipaddress.ip_network(source, strict=False).version == ipaddress.ip_network(network).version
+        except ValueError:
+            same_family = False
+        if (len(parts) != 8 or action not in ("allow", "deny") or proto not in ("tcp", "udp")
+                or not port.isdigit() or dst != network or sport != "any" or direction != "in" or not same_family):
+            mode = "unsupported"
+        if rule_id in entries:
+            entries[rule_id][-1] = "unsupported"
+        else:
+            entries[rule_id] = [rule_id, action, proto, port, source, comment, mode]
+for entry in entries.values():
+    print("\t".join(entry))
 PY
   )
 }
 
 ufw_spec() { printf '%s\n' "$1" from "$4" to any port "$3" proto "$2"; } # ufw_spec 动作 协议 端口 来源
 
-# 从 ufw status numbered 中找出带指定 vhm 标记的规则编号（v4 / v6 各一条时都会列出）
+ufw_numbered() {
+  local status
+  status=$(ufw_run status numbered 2>/dev/null) || return 1
+  [[ ${status%%$'\n'*} == 'Status: active' ]] || return 1
+  printf '%s\n' "$status"
+}
+
 ufw_comment_numbers() {
-  local id=$1
-  ufw_run status numbered 2>/dev/null | awk -v marker="vhm:$id" '
-    { n = "" }
+  local id=$1 status
+  if (($# == 2)); then status=$2; else status=$(ufw_numbered) || return 1; fi
+  awk -v marker="vhm:$id" '
     match($0, /^\[[[:space:]]*[0-9]+\]/) {
       n = substr($0, RSTART + 1, RLENGTH - 2)
       gsub(/[^0-9]/, "", n)
+      start = index($0, "#")
+      if (!start) next
+      comment = substr($0, start + 1)
+      sub(/^[[:space:]]+/, "", comment)
+      if (comment == marker || index(comment, marker " ") == 1) print n
     }
-    n != "" && (index($0, "# " marker) || index($0, "#" marker)) { print n }
-  '
+  ' <<<"$status"
 }
 
-ufw_del_comment() { # ufw_del_comment 规则ID [必须存在=1]：只按 vhm 标记删除，不按同条件规则删除
-  local id=$1 required=${2:-0} n
+ufw_order_hash() {
+  local checksum
+  checksum=$(awk -v omit="${2:-0}" '
+    match($0, /^\[[[:space:]]*[0-9]+\]/) {
+      if (substr($0, RSTART + 1, RLENGTH - 2) + 0 == omit) next
+      row = substr($0, RLENGTH + 1)
+      gsub(/[[:space:]]+/, " ", row)
+      sub(/ $/, "", row)
+      print row
+    }
+  ' <<<"$1" | sha256sum) || return 1
+  printf '%s\n' "${checksum%% *}"
+}
+
+ufw_del_comment() { # ufw_del_comment 规则ID [必须存在=1] [变更前规则顺序指纹]
+  local id=$1 required=${2:-0} expected=${3:-} n status numbers
   local -a nums=()
-  mapfile -t nums < <(ufw_comment_numbers "$id" | sort -rn)
+  status=$(ufw_numbered) || { log_err "无法读取活动的 UFW 规则"; return 1; }
+  if [[ -n $expected && $(ufw_order_hash "$status") != "$expected" ]]; then
+    log_err "UFW 规则已经变化，请刷新后重试"
+    return 1
+  fi
+  numbers=$(ufw_comment_numbers "$id" "$status") || return 1
+  [[ -z $numbers ]] || mapfile -t nums < <(sort -rn <<<"$numbers")
   if ((${#nums[@]} == 0)); then
     if ((required)); then
       log_err "UFW 中找不到 vhm:$id 的规则（可能已在 1Panel 中删除），请刷新后重试"
@@ -237,11 +278,42 @@ ufw_del_comment() { # ufw_del_comment 规则ID [必须存在=1]：只按 vhm 标
   for n in "${nums[@]}"; do
     ufw_run --force delete "$n" || { log_err "UFW 删除第 $n 条规则失败"; return 1; }
   done
-  if [[ -n $(ufw_comment_numbers "$id") ]]; then
+  numbers=$(ufw_comment_numbers "$id") || { log_err "无法核对 UFW 删除结果"; return 1; }
+  if [[ -n $numbers ]]; then
     log_err "删除后仍能查到 vhm:$id，请检查 UFW 状态"
     return 1
   fi
   log_ok "已删除 UFW 规则 vhm:$id（${#nums[@]} 条）"
+}
+
+ufw_prepare_delete() {
+  local status numbers
+  [[ $2 == insert || $2 == append ]] || { log_err "规则包含多个地址族或无法原位恢复，未删除；请在 UFW 或 1Panel 中处理"; return 1; }
+  status=$(ufw_numbered) || { log_err "无法读取活动的 UFW 规则，未删除"; return 1; }
+  numbers=$(ufw_comment_numbers "$1" "$status") || return 1
+  [[ $numbers =~ ^[1-9][0-9]*$ ]] || { log_err "规则已变化或包含多个地址族，不能可靠回滚，未删除"; return 1; }
+  UFW_INSERT_POS=$numbers
+  [[ $2 != append ]] || UFW_INSERT_POS=0
+  UFW_BEFORE_HASH=$(ufw_order_hash "$status") || return 1
+  UFW_AFTER_HASH=$(ufw_order_hash "$status" "$numbers") || return 1
+}
+
+ufw_restore_rule() {
+  local status checksum id=${5#vhm:}
+  status=$(ufw_numbered) || { log_err "无法核对 UFW 规则顺序，请手动恢复"; return 1; }
+  checksum=$(ufw_order_hash "$status") || return 1
+  [[ $checksum != "$7" ]] || return 0
+  if [[ $checksum != "$8" || ! $6 =~ ^(0|[1-9][0-9]*)$ ]]; then
+    log_err "UFW 规则顺序已变化，无法安全恢复原位置；请手动恢复"
+    return 1
+  fi
+  ufw_add "$1" "$2" "$3" "$4" "$6" "$5" || return 1
+  status=$(ufw_numbered) || { log_err "无法核对恢复后的 UFW 规则顺序"; return 1; }
+  if [[ $(ufw_order_hash "$status") != "$7" ]]; then
+    ufw_del_comment "${id%% *}" || true
+    log_err "UFW 未恢复到原顺序，请手动恢复"
+    return 1
+  fi
 }
 
 ufw_add() { # ufw_add 动作 协议 端口 来源 位置 注释
@@ -352,7 +424,7 @@ add_rule() {
 }
 
 delete_rule() {
-  local be=$1 n i action proto port source comment rule_id
+  local be=$1 n i action proto port source comment rule_id mode selected
   local -a pick=()
   echo
   echo "  vhm 创建的规则："
@@ -366,7 +438,7 @@ delete_rule() {
   else
     load_ufw_rows
     for i in "${!UFW_ROWS[@]}"; do
-      IFS=$'\t' read -r rule_id action proto port source comment <<<"${UFW_ROWS[$i]}"
+      IFS=$'\t' read -r rule_id action proto port source comment mode <<<"${UFW_ROWS[$i]}"
       pick+=("$i")
       printf '  [%d] %-6s %-5s %-8s %-20s %s\n' "${#pick[@]}" "$action" "$proto" "$port" "$source" "$comment"
     done
@@ -386,11 +458,15 @@ delete_rule() {
     ipt_apply_line "$family" "${raw/#-A /-D }" || { log_err "删除失败"; change_rollback "$CHG_ID"; return 1; }
     persist_chain "$family" || { change_rollback "$CHG_ID"; return 1; }
   else
-    IFS=$'\t' read -r rule_id action proto port source comment <<<"${UFW_ROWS[$i]}"
+    selected=${UFW_ROWS[$i]}
+    load_ufw_rows
+    printf '%s\n' "${UFW_ROWS[@]}" | grep -Fx -- "$selected" >/dev/null || { log_err "UFW 规则已变化，请刷新后重试"; return 1; }
+    IFS=$'\t' read -r rule_id action proto port source comment mode <<<"$selected"
+    ufw_prepare_delete "$rule_id" "$mode" || return 1
     change_begin "删除防火墙规则 vhm:$rule_id" firewall
     FW_UNDO=$CHG_DIR/firewall-undo
-    record_undo ufw-add "$action" "$proto" "$port" "$source" "$comment" || { change_rollback "$CHG_ID"; return 1; }
-    ufw_del_comment "$rule_id" 1 || { change_rollback "$CHG_ID"; return 1; }
+    record_undo ufw-restore "$action" "$proto" "$port" "$source" "$comment" "$UFW_INSERT_POS" "$UFW_BEFORE_HASH" "$UFW_AFTER_HASH" || { change_rollback "$CHG_ID"; return 1; }
+    ufw_del_comment "$rule_id" 1 "$UFW_BEFORE_HASH" || { change_rollback "$CHG_ID"; return 1; }
   fi
   change_status applied
   log_ok "规则已删除（变更 $CHG_ID，可在 [25] 回滚）"
@@ -422,12 +498,12 @@ menu() {
 
 # 回滚：按相反顺序撤销本次记录的每一步，只动这些规则，不覆盖之后新增的其他规则
 restore() {
-  local record=$1 rc=0 i kind a b c d e id
+  local record=$1 rc=0 i kind a b c d e pos before after id
   local -a lines=() touched=()
   [[ -f $record/firewall-undo ]] || return 0
   mapfile -t lines <"$record/firewall-undo"
   for ((i = ${#lines[@]} - 1; i >= 0; i--)); do
-    IFS=$'\t' read -r kind a b c d e <<<"${lines[$i]}"
+    IFS=$'\t' read -r kind a b c d e pos before after <<<"${lines[$i]}"
     case $kind in
       delete)
         if ipt_has_line "$a" "$c"; then ipt_apply_line "$a" "${c/#-A /-D }" || rc=1; fi
@@ -447,7 +523,8 @@ restore() {
         fi
         ufw_del_comment "${id%% *}" || rc=1
         ;;
-      ufw-add) ufw_add "$a" "$b" "$c" "$d" 0 "$e" || rc=1 ;;
+      ufw-add) log_err "这条旧记录未保存 UFW 规则原位置，请手动恢复"; rc=1 ;;
+      ufw-restore) ufw_restore_rule "$a" "$b" "$c" "$d" "$e" "$pos" "$before" "$after" || rc=1 ;;
     esac
   done
   local family

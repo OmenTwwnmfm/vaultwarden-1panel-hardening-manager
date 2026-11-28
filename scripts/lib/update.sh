@@ -10,7 +10,7 @@
 
 VH_SOURCE_UPDATED=10
 VH_SOURCE_AVAILABLE=11
-VH_OFFICIAL_REPO=OmenTwwnmfm/vaultwarden-1panel-hardening-manager
+VH_OFFICIAL_REPO=OmenTwwnmfm/vaultwarden-hardening-manager
 UPD_ROOT="" UPD_BEFORE="" UPD_TARGET=""
 
 source_root() { cd "$VH_DIR/.." && pwd -P; }
@@ -32,8 +32,22 @@ source_origin_ok() { # source_origin_ok 仓库目录：origin 是否指向官方
   case $url in
     "https://github.com/$VH_OFFICIAL_REPO" | "git@github.com:$VH_OFFICIAL_REPO" | "ssh://git@github.com/$VH_OFFICIAL_REPO") return 0 ;;
   esac
-  log_warn "origin 不是官方仓库（${url:-未设置}），不检查更新"
+  log_warn "origin 不是官方仓库，已停止更新；请核对地址：https://github.com/$VH_OFFICIAL_REPO"
   return 1
+}
+
+source_worktree_ok() {
+  local root=$1 branch status
+  branch=$(git -C "$root" symbolic-ref --short -q HEAD 2>/dev/null || true)
+  [[ $branch == main ]] || { log_warn "当前分支为 ${branch:-分离的 HEAD}，只在 main 分支上更新"; return 1; }
+  if ! status=$(git -C "$root" status --porcelain --untracked-files=no 2>/dev/null); then
+    log_warn "无法检查源码目录状态，未更新：$root"
+    return 1
+  fi
+  if [[ -n $status ]]; then
+    log_warn "源码目录有未提交的修改，未更新：$root"
+    return 1
+  fi
 }
 
 # 检查是否有可快进的新版本，不修改源码。
@@ -42,30 +56,25 @@ source_origin_ok() { # source_origin_ok 仓库目录：origin 是否指向官方
 # 本地提交都已包含在远端（只快进，不合并）。抓取限时 30 秒且禁止交互式输入凭据。
 source_check() {
   UPD_ROOT="" UPD_BEFORE="" UPD_TARGET=""
-  local root branch
+  local root before target
   command -v git >/dev/null 2>&1 || { log_warn "未安装 git，无法检查更新"; return 1; }
   root=$(source_root) || return 1
-  git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { log_warn "$root 不是 git 仓库，无法检查更新"; return 1; }
+  [[ $(git -C "$root" rev-parse --is-inside-work-tree 2>/dev/null) == true ]] || { log_warn "$root 不是 git 工作区，无法检查更新"; return 1; }
   source_origin_ok "$root" || return 1
-  branch=$(git -C "$root" symbolic-ref --short -q HEAD || true)
-  [[ $branch == main ]] || { log_warn "当前分支为 ${branch:-分离的 HEAD}，只在 main 分支上更新"; return 1; }
-  if [[ -n $(git -C "$root" status --porcelain --untracked-files=no 2>/dev/null) ]]; then
-    log_warn "源码目录有未提交的修改，未更新：$root"
-    return 1
-  fi
-  UPD_ROOT=$root
-  UPD_BEFORE=$(git -C "$root" rev-parse HEAD) || return 1
+  source_worktree_ok "$root" || return 1
+  before=$(git -C "$root" rev-parse --verify HEAD) || return 1
   if ! GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes" \
     timeout 30 git -C "$root" fetch --quiet --no-tags origin main </dev/null 2>/dev/null; then
     log_warn "暂时无法连接 GitHub，继续使用本地 v$VH_VERSION"
     return 1
   fi
-  UPD_TARGET=$(git -C "$root" rev-parse FETCH_HEAD) || return 1
-  [[ $UPD_BEFORE == "$UPD_TARGET" ]] && return 0
-  if ! git -C "$root" merge-base --is-ancestor "$UPD_BEFORE" "$UPD_TARGET"; then
+  target=$(git -C "$root" rev-parse --verify 'FETCH_HEAD^{commit}') || return 1
+  [[ $before == "$target" ]] && return 0
+  if ! git -C "$root" merge-base --is-ancestor "$before" "$target"; then
     log_warn "本地有远端没有的提交，无法快进更新"
     return 1
   fi
+  UPD_ROOT=$root UPD_BEFORE=$before UPD_TARGET=$target
   return "$VH_SOURCE_AVAILABLE"
 }
 
@@ -90,8 +99,13 @@ source_verify() {
 
 # 快进到 source_check 找到的新版本。返回 VH_SOURCE_UPDATED = 已更新；1 = 失败（源码保持不变）。
 source_apply() {
-  [[ -n $UPD_ROOT && -n $UPD_TARGET ]] || { log_err "内部错误：未检查更新"; return 1; }
+  local head
+  [[ -n $UPD_ROOT && -n $UPD_BEFORE && -n $UPD_TARGET ]] || { log_err "内部错误：没有待更新的提交"; return 1; }
   source_verify || return 1
+  source_origin_ok "$UPD_ROOT" || return 1
+  source_worktree_ok "$UPD_ROOT" || return 1
+  head=$(git -C "$UPD_ROOT" rev-parse --verify HEAD 2>/dev/null) || head=""
+  [[ $head == "$UPD_BEFORE" ]] || { log_warn "检查更新后当前提交已变化，请重新检查更新"; return 1; }
   git -C "$UPD_ROOT" merge --ff-only --quiet "$UPD_TARGET" || { log_warn "快进更新失败，源码保持不变"; return 1; }
   return "$VH_SOURCE_UPDATED"
 }

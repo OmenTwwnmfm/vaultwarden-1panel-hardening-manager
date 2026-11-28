@@ -26,6 +26,7 @@ public_addr() { [[ $1 == 0.0.0.0 || $1 == '*' || $1 == '[::]' || $1 == :: || $1 
 check_ports() {
   title "端口暴露"
   local fw proto addr host port proc open=() limited=() blocked=()
+  local -A seen=()
   fw=$(fw_type)
   if [[ $fw == none ]]; then
     chk bad "主机防火墙" "未启用，所有监听在所有地址上的端口都对公网开放" "在 1Panel →「主机」→「防火墙」启用，并只放行需要的端口"
@@ -36,15 +37,17 @@ check_ports() {
   while read -r proto addr proc; do
     host=${addr%:*} port=${addr##*:}
     public_addr "$host" || continue
-    proc=$(sed -nE 's/.*\(\("([^"]+)".*/\1/p' <<<"$proc")
     proto=${proto/tcp*/tcp} proto=${proto/udp*/udp}
+    [[ -z ${seen[$proto/$port]+x} ]] || continue
+    seen[$proto/$port]=1
+    proc=$(sed -nE 's/.*\(\("([^"]+)".*/\1/p' <<<"$proc")
     case $(port_scope "$port" "$proto") in
       all) open+=("$port/$proto(${proc:-?})") ;;
       limited) limited+=("$port/$proto(${proc:-?})") ;;
       none) blocked+=("$port/$proto") ;;
       *) open+=("$port/$proto(${proc:-?})?") ;;
     esac
-  done < <(ss -H -tulpn 2>/dev/null | awk '{ p = $5; sub(/.*:/, "", p); if (!seen[$1 FS p]++) print $1, $5, $7 }')
+  done < <(ss -H -tulpn 2>/dev/null | awk '{ print $1, $5, $7 }')
   if ((${#open[@]})); then
     chk warn "对所有 IP 开放的端口" "${open[*]}" "逐个确认是否需要对外；面板、数据库等管理端口建议在 1Panel 防火墙中只放行你的 IP（? 表示无法判断放行范围）"
   else
@@ -259,7 +262,7 @@ check_vw() {
       *) chk bad "备份（vbm）" "最近一次 $st：${when:-?}" "在 vbm 中查看备份日志" ;;
     esac
   else
-    chk bad "备份（vbm）" "未安装 vaultwarden-1panel-backup-manager" "安装 vbm 并配置自动备份"
+    chk bad "备份（vbm）" "未安装 vaultwarden-backup-manager" "安装 vbm 并配置自动备份"
   fi
 }
 

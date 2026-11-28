@@ -93,31 +93,34 @@ test_cmd() { echo "ssh -p ${1:-$(cur_ports | head -n1)} root@$(server_ip)"; }
 # drop-in 文件 00-vhm.conf：sshd 对同一配置项取第一个值，00 前缀保证优先于其他 drop-in
 dropin_del() {
   [[ -f $SSHD_DROPIN ]] || return 0
-  local k tmp
+  local k tmp rc=0
   tmp=$(mktemp) || return 1
-  cp -- "$SSHD_DROPIN" "$tmp"
+  cp -- "$SSHD_DROPIN" "$tmp" || { rm -f -- "$tmp"; return 1; }
   for k in "$@"; do
-    grep -viE "^[[:space:]]*${k}[[:space:]]" "$tmp" >"$tmp.n" || true
-    mv -f -- "$tmp.n" "$tmp"
+    sed -i -E "/^[[:space:]]*${k}([[:space:]=]|$)/Id" "$tmp" || { rm -f -- "$tmp"; return 1; }
   done
-  install -m 600 -- "$tmp" "$SSHD_DROPIN"
+  install -m 600 -- "$tmp" "$SSHD_DROPIN" || rc=1
   rm -f -- "$tmp"
+  return "$rc"
 }
 dropin_add() {
-  install -d -m 755 "$(dirname "$SSHD_DROPIN")"
-  [[ -f $SSHD_DROPIN ]] || printf '# 由 vhm 管理，请勿手动修改；可在 vhm [25] 中回滚\n' >"$SSHD_DROPIN"
-  printf '%s %s\n' "$1" "$2" >>"$SSHD_DROPIN"
+  local dir
+  dir=$(dirname "$SSHD_DROPIN")
+  [[ -d $dir ]] || install -d -m 755 -- "$dir" || return 1
+  [[ -f $SSHD_DROPIN ]] || printf '# 由 vhm 管理，请勿手动修改；可在 vhm [25] 中回滚\n' >"$SSHD_DROPIN" || return 1
+  printf '%s %s\n' "$1" "$2" >>"$SSHD_DROPIN" || return 1
   chmod 600 "$SSHD_DROPIN"
 }
 dropin_set() { dropin_del "$1" && dropin_add "$1" "$2"; }
 
-# 确保主配置在开头包含 drop-in 目录（Debian 11+/Ubuntu 20.04+ 默认已有）
-ensure_include() {
+# 确保主配置包含 drop-in 目录（Debian 11+/Ubuntu 20.04+ 默认已有）
+has_dropin_include() {
   local d
   d=$(dirname "$SSHD_DROPIN")
-  grep -Eq "^[[:space:]]*Include[[:space:]]+$d/\*\.conf" "$SSHD_CONFIG" && return 0
-  change_track "$SSHD_CONFIG" || return 1
-  sed -i "1i Include $d/*.conf" "$SSHD_CONFIG"
+  grep -Eq "^[[:space:]]*Include[[:space:]]+$d/\*\.conf" "$SSHD_CONFIG"
+}
+ensure_include() {
+  has_dropin_include || sed -i "1i Include $(dirname "$SSHD_DROPIN")/*.conf" "$SSHD_CONFIG"
 }
 
 expect_eff() { # expect_eff 配置项（小写） 期望值
@@ -130,28 +133,14 @@ expect_eff() { # expect_eff 配置项（小写） 期望值
   return 1
 }
 
-# 应用当前变更：配置检查 → 重载 → 防锁死确认。失败或未确认均自动回滚
-commit_ssh_change() { # commit_ssh_change 测试命令
-  local out
-  if ! out=$(sshd_test); then
-    log_err "sshd 配置检查未通过，已放弃修改：$out"
-    change_rollback "$CHG_ID"
-    return 1
-  fi
-  # 先设好自动回滚定时器再重载：即使重载后管理器被中断，定时器也会把配置改回来
-  if ! guard_start; then
-    log_err "无法设置自动回滚保护，为安全起见放弃修改"
-    change_rollback "$CHG_ID"
-    return 1
-  fi
+# 保护已启用；重载 SSH 并等待用户测试，失败或未同意均回滚。
+test_ssh_change() {
   if ! ssh_reload; then
     log_err "重载 SSH 服务失败，正在回滚"
-    guard_stop
-    change_rollback "$CHG_ID"
+    guard_abort
     return 1
   fi
-  guard_wait_confirm "$1" || return 1
-  return 0
+  guard_wait_confirm "$1"
 }
 
 # ---------- 登录密钥 ----------
@@ -338,70 +327,106 @@ show_logins() {
 
 # ---------- 端口 ----------
 # 防火墙放行检查（port_allowed / wait_port_allowed）在 vh-common.sh 中，与 1Panel 面板端口共用
-socket_sync_ports() { # Ubuntu 22.10+ 的 ssh.socket：没有 sshd-socket-generator 时由 vhm 写 ListenStream
-  ssh_socket_used || return 0
-  local g
-  for g in /usr/lib/systemd/system-generators/sshd-socket-generator /lib/systemd/system-generators/sshd-socket-generator; do
-    [[ -x $g ]] && return 0
+socket_needs_port_sync() { # Ubuntu 22.10+ 的 ssh.socket：没有 sshd-socket-generator 时由 vhm 写 ListenStream
+  ssh_socket_used || return 1
+  local generator
+  for generator in /usr/lib/systemd/system-generators/sshd-socket-generator /lib/systemd/system-generators/sshd-socket-generator; do
+    [[ -x $generator ]] && return 1
   done
-  change_track "$SSH_SOCKET_DROPIN" || return 1
-  install -d -m 755 "$(dirname "$SSH_SOCKET_DROPIN")"
+  return 0
+}
+
+socket_sync_ports() {
+  local port dir
+  dir=$(dirname "$SSH_SOCKET_DROPIN")
+  [[ -d $dir ]] || install -d -m 755 -- "$dir" || return 1
   {
     echo "# 由 vhm 管理"
     echo "[Socket]"
     echo "ListenStream="
-    for g in "$@"; do echo "ListenStream=$g"; done
+    for port in "$@"; do echo "ListenStream=$port"; done
   } >"$SSH_SOCKET_DROPIN"
 }
 
-set_ports() { # set_ports 端口...：drop-in 中只保留这些端口，并注释主配置中的 Port
+set_ports() { # set_ports 是否写入 socket 配置 端口...
+  local sync_socket=$1
+  shift
   local p
-  dropin_del Port
-  for p in "$@"; do dropin_add Port "$p"; done
-  sed -i -E "s/^([[:space:]]*Port[[:space:]].*)$/${PAM_MARK}\1/I" "$SSHD_CONFIG"
-  socket_sync_ports "$@"
+  dropin_del Port || return 1
+  for p in "$@"; do dropin_add Port "$p" || return 1; done
+  sed -i -E "s/^([[:space:]]*Port[[:space:]=].*)$/${PAM_MARK}\1/I" "$SSHD_CONFIG" || return 1
+  ((sync_socket == 0)) || socket_sync_ports "$@"
+}
+
+effective_ports() {
+  local eff ports
+  eff=$(sshd_eff) || return 1
+  ports=$(awk '$1 == "port" { print $2 }' <<<"$eff" | sort -un) || return 1
+  [[ -n $ports ]] && printf '%s\n' "$ports"
+}
+
+expect_ports() {
+  local want actual
+  want=$(printf '%s\n' "$@" | sort -un) || return 1
+  actual=$(effective_ports) || { log_err "无法通过 sshd -T 核对 SSH 生效端口：$(sshd_eff_err)"; return 1; }
+  [[ $actual == "$want" ]] && return 0
+  log_err "SSH 生效端口为 ${actual//$'\n'/, }，期望 ${want//$'\n'/, }。请检查其他 sshd 配置中的 Port 指令"
+  return 1
 }
 
 change_port() {
-  local cur new p others
-  mapfile -t cur < <(cur_ports)
+  local cur new p others current_ports sync_socket=0
+  local hooks=(sshd)
   title "修改 SSH 端口"
-  echo "当前端口：${cur[*]:-未知}"
+  current_ports=$(effective_ports) || { log_err "无法读取当前 SSH 生效端口：$(sshd_eff_err)"; return 1; }
+  mapfile -t cur <<<"$current_ports"
+  echo "当前端口：${cur[*]}"
   read -r -p "新端口（1024-65535，回车取消）: " new || return 0
   [[ -n $new ]] || return 0
-  [[ $new =~ ^[0-9]+$ ]] && ((new >= 1024 && new <= 65535)) || { log_err "端口需在 1024-65535 之间"; return 1; }
+  [[ $new =~ ^[0-9]{1,5}$ ]] && ((10#$new >= 1024 && 10#$new <= 65535)) || { log_err "端口需在 1024-65535 之间"; return 1; }
+  new=$((10#$new))
   for p in "${cur[@]}"; do [[ $p == "$new" ]] && { log_info "端口未变化"; return 0; }; done
   if [[ -n $(ss -ltnH "sport = :$new" 2>/dev/null) ]]; then
     log_err "端口 $new 已被其他程序占用"
     return 1
   fi
-  others=$(grep -lisE '^[[:space:]]*Port[[:space:]]' "$(dirname "$SSHD_DROPIN")"/*.conf 2>/dev/null | grep -vF "$SSHD_DROPIN" || true)
-  [[ -n $others ]] && log_warn "以下文件也设置了 Port，sshd 会同时监听：$others"
+  others=$(grep -lisE '^[[:space:]]*Port[[:space:]=]' "$(dirname "$SSHD_DROPIN")"/*.conf 2>/dev/null | grep -vF "$SSHD_DROPIN" || true)
+  [[ -n $others ]] && log_warn "以下文件也设置了 Port；如果旧端口不能关闭，本次会回滚：$others"
   wait_port_allowed "$new" || { log_info "已取消"; return 0; }
   echo
   echo "步骤：先同时监听 ${cur[*]} 和 $new → 你用新端口登录确认 → 关闭旧端口。"
   [[ -f $F2B_JAIL ]] && echo "Fail2Ban 的 SSH 防护会自动同步到端口 $new。"
   confirm_yes "确认把 SSH 端口改为 $new？" || return 0
 
-  change_begin "SSH 端口 ${cur[*]} → $new" sshd fail2ban
-  ensure_include || { change_rollback "$CHG_ID"; return 1; }
-  change_track "$SSHD_CONFIG" && change_track "$SSHD_DROPIN" || { change_rollback "$CHG_ID"; return 1; }
-  set_ports "${cur[@]}" "$new" || { change_rollback "$CHG_ID"; return 1; }
-  commit_ssh_change "$(test_cmd "$new")" || return 1
-
-  # 第二步：关闭旧端口
-  set_ports "$new" || { change_rollback "$CHG_ID"; return 1; }
-  if [[ -f $F2B_JAIL ]]; then
-    change_track "$F2B_JAIL" && sed -i -E "s/^port[[:space:]]*=.*/port = $new/" "$F2B_JAIL" && f2b_reload ||
-      log_warn "Fail2Ban 端口同步失败，请在 [16] 重新保存配置"
-  fi
-  if ! ssh_reload; then
-    log_err "关闭旧端口失败，正在回滚"
-    change_rollback "$CHG_ID"
+  if [[ -f $F2B_JAIL ]]; then hooks+=(fail2ban); fi
+  if socket_needs_port_sync; then sync_socket=1; fi
+  change_begin "SSH 端口 ${cur[*]} → $new" "${hooks[@]}"
+  if ! { change_track "$SSHD_CONFIG" && change_track "$SSHD_DROPIN" &&
+    { ((sync_socket == 0)) || change_track "$SSH_SOCKET_DROPIN"; } &&
+    { ((${#hooks[@]} == 1)) || change_track "$F2B_JAIL"; }; }; then
+    log_err "无法保存修改前的配置，未修改 SSH 配置"
+    change_status rolled_back
     return 1
   fi
-  change_status applied
-  log_ok "SSH 端口已改为 $new（旧端口已关闭）。确认无误后可在 1Panel 防火墙中删除旧端口规则"
+  guard_start || return 1
+  if ! { ensure_include && set_ports "$sync_socket" "${cur[@]}" "$new" && expect_ports "${cur[@]}" "$new"; }; then
+    guard_abort
+    return 1
+  fi
+  test_ssh_change "$(test_cmd "$new")" || return 1
+
+  # 第二步：关闭旧端口
+  if ! { set_ports "$sync_socket" "$new" && expect_ports "$new" && ssh_reload; }; then
+    log_err "关闭旧端口失败，正在回滚"
+    guard_abort
+    return 1
+  fi
+  if ((${#hooks[@]} > 1)); then
+    sed -i -E "s/^[[:space:]]*port[[:space:]]*=.*/port = $new/" "$F2B_JAIL" && f2b_reload ||
+      log_warn "Fail2Ban 端口同步失败，请在 [16] 重新保存配置"
+  fi
+  guard_confirm || return 1
+  log_ok "SSH 端口已改为 $new。验证旧端口不再监听后，可删除原防火墙规则"
 }
 
 # ---------- 2FA ----------
@@ -538,7 +563,7 @@ change_root_password() {
 }
 
 configure_auth_mode() {
-  local mode=$1 current newga="" need_keys=0 need_password=0 need_totp=0
+  local mode=$1 current newga="" need_keys=0 need_password=0 need_totp=0 need_include=0
   local method password pubkey kbd permit
   case $mode in
     password) method=password; password=yes; pubkey=no; kbd=no; permit=yes; need_password=1 ;;
@@ -573,10 +598,18 @@ configure_auth_mode() {
   esac
   confirm_yes "将 SSH 登录方式改为：$(auth_mode_label "$mode")？" || { [[ -z $newga ]] || rm -f -- "$newga"; return 0; }
   change_begin "SSH 登录方式：$(auth_mode_label "$mode")" sshd
+  has_dropin_include || need_include=1
+  if ! { { ((need_include == 0)) || change_track "$SSHD_CONFIG"; } && change_track "$PAM_SSHD" && change_track "$SSHD_DROPIN" &&
+    { [[ -z $newga ]] || change_track "$GA_FILE"; }; }; then
+    [[ -z $newga ]] || rm -f -- "$newga"
+    log_err "无法保存修改前的配置，未修改 SSH 配置"
+    change_status rolled_back
+    return 1
+  fi
+  guard_start || { [[ -z $newga ]] || rm -f -- "$newga"; return 1; }
   {
-    ensure_include &&
-      change_track "$PAM_SSHD" && change_track "$SSHD_DROPIN" &&
-      { [[ -z $newga ]] || { change_track "$GA_FILE" && mv -f -- "$newga" "$GA_FILE"; }; } &&
+    { ((need_include == 0)) || ensure_include; } &&
+      { [[ -z $newga ]] || mv -f -- "$newga" "$GA_FILE"; } &&
       pam_set_auth_mode "$mode" &&
       dropin_set UsePAM yes &&
       dropin_set PasswordAuthentication "$password" &&
@@ -586,18 +619,19 @@ configure_auth_mode() {
       dropin_set ChallengeResponseAuthentication "$kbd" &&
       dropin_set AuthenticationMethods "$method" &&
       dropin_set PermitRootLogin "$permit"
-  } || { log_err "写入配置失败，正在回滚"; change_rollback "$CHG_ID"; return 1; }
+  } || { [[ -z $newga ]] || rm -f -- "$newga"; log_err "写入配置失败，正在回滚"; guard_abort; return 1; }
   if ! { expect_eff authenticationmethods "$method" &&
     expect_eff passwordauthentication "$password" &&
     expect_eff pubkeyauthentication "$pubkey" &&
     expect_eff kbdinteractiveauthentication "$kbd" &&
+    expect_eff permitemptypasswords no &&
     expect_eff permitrootlogin "$permit" &&
     expect_eff usepam yes; }; then
-    change_rollback "$CHG_ID"
+    guard_abort
     return 1
   fi
-  commit_ssh_change "$(test_cmd)" || return 1
-  change_status applied
+  test_ssh_change "$(test_cmd)" || return 1
+  guard_confirm || return 1
   log_ok "SSH 登录方式已改为：$(auth_mode_label "$mode")"
 }
 
@@ -624,19 +658,32 @@ auth_mode_menu() {
 
 tfa_rebind() {
   ga_install || return 1
-  local newga
+  local newga guarded=0
   newga=$(ga_bind_new) || return 1
   change_begin "重新绑定 root 动态口令"
-  change_track "$GA_FILE" && mv -f -- "$newga" "$GA_FILE" || { change_rollback "$CHG_ID"; return 1; }
+  if ! change_track "$GA_FILE"; then
+    rm -f -- "$newga"
+    log_err "无法备份动态口令，绑定未更改"
+    change_status rolled_back
+    return 1
+  fi
   if tfa_enabled; then
-    if ! guard_start; then
-      change_rollback "$CHG_ID"
-      return 1
-    fi
+    guard_start || { rm -f -- "$newga"; return 1; }
+    guarded=1
+  fi
+  if ! mv -f -- "$newga" "$GA_FILE"; then
+    rm -f -- "$newga"
+    log_err "无法保存新的动态口令，正在回滚"
+    guard_abort
+    return 1
+  fi
+  if ((guarded)); then
     log_info "旧的动态口令和应急码已失效"
     guard_wait_confirm "$(test_cmd)" || return 1
+    guard_confirm || return 1
+  else
+    change_status applied || { log_err "已更新动态口令，但无法记录变更状态"; return 1; }
   fi
-  change_status applied
   log_ok "已重新绑定"
 }
 

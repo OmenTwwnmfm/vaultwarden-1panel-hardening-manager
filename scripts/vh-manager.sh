@@ -12,19 +12,22 @@ run() {
   pause
 }
 
-first_setup() {
-  install -d -m 700 "$VH_STATE" "$VH_CHANGES"
+first_setup_apply() {
+  install -d -m 700 "$VH_STATE" "$VH_CHANGES" || { log_err "无法初始化变更记录目录"; return 1; }
   if [[ -f "$VH_CONF" ]]; then
     log_info "已存在 $VH_CONF，将重新识别 Vaultwarden 实例"
   else
-    install -m 600 -o root -g root "$VH_DIR/hardening.conf.example" "$VH_CONF"
+    install -m 600 -o root -g root "$VH_DIR/hardening.conf.example" "$VH_CONF" || { log_err "无法生成 $VH_CONF"; return 1; }
     log_ok "已生成 $VH_CONF"
   fi
   bash "$VH_DIR/vh-launcher.sh" deps || true
   vh_legacy_cleanup
   VW_DATA_DIR="" VW_CONTAINER=""
   if detect_instance "$(conf_get VW_DATA_DIR || true)"; then
-    kv_set "$VH_CONF" VW_DATA_DIR "$VW_DATA_DIR" && kv_set "$VH_CONF" VW_CONTAINER "$VW_CONTAINER"
+    if ! kv_set "$VH_CONF" VW_DATA_DIR "$VW_DATA_DIR" || ! kv_set "$VH_CONF" VW_CONTAINER "$VW_CONTAINER"; then
+      log_err "无法保存 Vaultwarden 实例到 $VH_CONF"
+      return 1
+    fi
     log_ok "实例：$VW_CONTAINER  数据目录：$VW_DATA_DIR"
   else
     log_warn "未能确定 Vaultwarden 实例；SSH、1Panel、Fail2Ban、体检等功能不受影响"
@@ -37,7 +40,15 @@ first_setup() {
   if vbm_installed; then
     log_ok "已检测到 vbm：修改 Vaultwarden 设置前会自动调用它做完整备份"
   else
-    log_warn "未检测到 vbm（vaultwarden-1panel-backup-manager），建议先安装再修改 Vaultwarden 设置"
+    log_warn "未检测到 vbm（vaultwarden-backup-manager），建议先安装再修改 Vaultwarden 设置"
+  fi
+}
+
+first_setup() {
+  if confirm_yes "初始化 $VH_STATE 并写入 $VH_CONF？"; then
+    local rc=0
+    (with_lock first_setup_apply) || rc=$?
+    ((rc != VH_EXIT_LOCKED)) || log_warn "首次配置未执行（退出码 $rc）"
   fi
   pause
 }
@@ -175,7 +186,7 @@ def sep():
     print("├" + "─" * W + "┤")
 
 print("╭" + "─" * W + "╮")
-row("VPS & Vaultwarden Hardening Manager", "center")
+row("Vaultwarden Hardening Manager", "center")
 row(f"v{version} · 1Panel Edition · Ubuntu / Debian", "center")
 row("Powered by OmenTwwnmfm", "center")
 row()

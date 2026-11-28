@@ -16,17 +16,27 @@ change_begin() { # change_begin 描述 [回滚钩子...]
   done
   CHG_DIR="$VH_CHANGES/$CHG_ID"
   install -d -m 700 "$VH_STATE" "$VH_CHANGES" "$CHG_DIR" "$CHG_DIR/files" || die "无法创建变更记录目录"
-  : >"$CHG_DIR/files.tsv"
+  : >"$CHG_DIR/files.tsv" || die "无法初始化变更记录"
   {
     printf 'ID=%s\n' "$CHG_ID"
     printf 'TIME=%s\n' "$(date '+%F %T')"
     printf 'DESC=%s\n' "${1//$'\n'/ }"
     printf 'HOOKS=%s\n' "${*:2}"
-  } >"$CHG_DIR/meta"
-  change_status pending
+  } >"$CHG_DIR/meta" || die "无法保存变更记录"
+  change_status pending || die "无法保存变更状态"
 }
 
-change_status() { printf '%s\n' "$1" >"$CHG_DIR/status"; }
+change_write_status() {
+  local dir=$1 status=$2 tmp
+  tmp=$(mktemp "$dir/.status.XXXXXX") || return 1
+  if printf '%s\n' "$status" >"$tmp" && mv -fT -- "$tmp" "$dir/status"; then
+    return 0
+  fi
+  rm -f -- "$tmp"
+  return 1
+}
+
+change_status() { change_write_status "$CHG_DIR" "$1"; }
 
 change_track() { # 修改文件前调用；同一路径只记录一次
   local p=$1 n
@@ -54,7 +64,7 @@ change_restore_files() { # change_restore_files 记录目录
     else
       rm -f -- "$p" || rc=1
     fi
-  done <"$d/files.tsv"
+  done <"$d/files.tsv" || return 1
   return $rc
 }
 
@@ -131,11 +141,11 @@ run_hooks() { # run_hooks 记录目录 钩子...
 
 # 回滚一条变更；按记录加锁，重复调用无副作用（守护定时器与前台可能同时触发）
 change_rollback() {
-  local id=$1 d="$VH_CHANGES/$1" st hooks rc=0
+  local id=$1 d="$VH_CHANGES/$1" st hooks rc=0 acquired_vbm=0
   [[ $id =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ && -d $d ]] || { log_err "找不到变更记录：$id"; return 1; }
   exec 7>"$d/.lock" || return 1
   flock -w 60 7 || { log_err "变更 $id 正在被处理"; exec 7>&-; return 1; }
-  st=$(cat "$d/status" 2>/dev/null)
+  st=$(cat "$d/status" 2>/dev/null) || { log_err "无法读取变更 $id 的状态"; exec 7>&-; return 1; }
   if [[ $st == rolled_back ]]; then
     log_info "变更 $id 已经回滚过"
     exec 7>&-
@@ -147,13 +157,18 @@ change_rollback() {
     return 0
   fi
   hooks=$(change_meta "$id" HOOKS)
+  if [[ " $hooks " == *" vw "* && ${2:-} != vbm-lock-held ]]; then
+    vbm_lock_hold || { exec 7>&-; return 1; }
+    acquired_vbm=1
+  fi
   change_restore_files "$d" || rc=1
   # shellcheck disable=SC2086
   run_hooks "$d" $hooks || rc=1
+  if ((acquired_vbm)); then vbm_lock_release; fi
   if ((rc == 0)); then
-    printf 'rolled_back\n' >"$d/status"
+    change_write_status "$d" rolled_back || { log_err "变更 $id 的文件已恢复，但无法记录回滚状态"; exec 7>&-; return 1; }
   else
-    printf 'rollback_failed\n' >"$d/status"
+    change_write_status "$d" rollback_failed || { log_err "变更 $id 回滚失败，也无法记录状态，请在 [25] 检查"; exec 7>&-; return 1; }
   fi
   exec 7>&-
   if ((rc == 0)); then
@@ -167,20 +182,19 @@ change_rollback() {
 # 用户确认保留时先「认领」变更：在记录锁内把 pending 改为 confirmed。
 # 与定时器回滚共用同一把记录锁且回滚前在锁内复查状态，确认与回滚不会竞态：
 # 认领先完成则自动回滚取消；回滚先完成则认领失败并提示确认太晚。
-# 返回 0 表示认领成功；1 表示已经回滚。
+# 返回 0 表示已保存确认状态。
 change_claim_confirmed() {
-  local id=$1 d="$VH_CHANGES/$1" st
+  local id=$1 d="$VH_CHANGES/$1" st rc=1
   [[ -d $d ]] || return 1
   exec 7>"$d/.lock" || return 1
   flock -w 60 7 || { exec 7>&-; return 1; }
-  st=$(cat "$d/status" 2>/dev/null)
-  if [[ $st == rolled_back || $st == rollback_failed ]]; then
-    exec 7>&-
-    return 1
-  fi
-  [[ $st == pending ]] && printf 'confirmed\n' >"$d/status"
+  st=$(cat "$d/status" 2>/dev/null) || st=""
+  case $st in
+    pending) change_write_status "$d" confirmed && rc=0 ;;
+    confirmed) rc=0 ;;
+  esac
   exec 7>&-
-  return 0
+  return "$rc"
 }
 
 # 是否有更新的变更改过同一批文件（自动回滚此时会覆盖新配置）
@@ -234,7 +248,6 @@ After=network.target ssh.service sshd.service ssh.socket
 [Service]
 Type=oneshot
 ExecStart=/bin/bash $VH_DIR/vh-changes.sh boot-rollback
-SuccessExitStatus=75
 TimeoutStartSec=600
 [Install]
 WantedBy=multi-user.target
@@ -251,17 +264,44 @@ guard_boot_install() {
 # SSH 类变更的防锁死保护：到时未确认则由 systemd 定时器自动回滚（当前会话不受影响）；
 # 保护期内重启时，由开机回滚服务接手（记录目录中的 guard 文件表示该变更受保护）
 guard_start() {
-  command -v systemd-run >/dev/null 2>&1 || { log_err "缺少 systemd-run，无法设置自动回滚保护"; return 1; }
-  guard_boot_install || log_warn "无法安装开机回滚服务 ${GUARD_BOOT_UNIT##*/}；保护期内重启将不会自动回滚，请勿重启"
-  : >"$CHG_DIR/guard" || return 1
-  systemd-run --quiet --unit="vhm-guard-$CHG_ID" --on-active="$GUARD_SECONDS" --timer-property=AccuracySec=1s \
+  if ! command -v systemd-run >/dev/null 2>&1; then
+    log_err "缺少 systemd-run，未修改 SSH 配置"
+  elif ! guard_boot_install; then
+    log_err "无法启用开机回滚服务 ${GUARD_BOOT_UNIT##*/}，未修改 SSH 配置"
+  elif ! : >"$CHG_DIR/guard"; then
+    log_err "无法标记防锁死记录，未修改 SSH 配置"
+  elif systemd-run --quiet --unit="vhm-guard-$CHG_ID" --on-active="$GUARD_SECONDS" --timer-property=AccuracySec=1s \
     --property=TimeoutStartSec=infinity \
     --setenv=VH_CONF="$VH_CONF" --setenv=VH_STATE="$VH_STATE" --setenv=VH_LOG="$VH_LOG" \
-    /bin/bash "$VH_DIR/vh-changes.sh" auto-rollback "$CHG_ID"
+    --setenv=VH_LOCK="$VH_LOCK" --setenv=VH_CHANGES="$VH_CHANGES" \
+    /bin/bash "$VH_DIR/vh-changes.sh" auto-rollback "$CHG_ID"; then
+    return 0
+  else
+    log_err "无法启动自动回滚定时器，未修改 SSH 配置"
+  fi
+  change_status rolled_back || log_err "无法关闭未应用的变更记录，请在 [25] 检查"
+  return 1
 }
 guard_stop() { systemctl stop "vhm-guard-$CHG_ID.timer" >/dev/null 2>&1 || true; }
 
-# 返回 0 表示用户确认保留；否则已回滚
+guard_abort() {
+  change_rollback "$CHG_ID" || return 1
+  guard_stop
+}
+
+guard_confirm() {
+  if ! change_claim_confirmed "$CHG_ID"; then
+    case $(cat "$CHG_DIR/status" 2>/dev/null) in
+      rollback_failed) log_err "自动回滚失败，配置可能处于不一致状态，请立即用 VNC 登录检查并在 [25] 重试回滚。" ;;
+      rolled_back) log_err "确认太晚，已经自动回滚。" ;;
+      *) log_err "无法保存确认状态，回滚保护未取消。请保持当前窗口并检查 [25]。" ;;
+    esac
+    return 1
+  fi
+  guard_stop
+}
+
+# 返回 0 表示用户同意保留，调用者完成修改后再确认状态。
 guard_wait_confirm() {
   local ans="" mins=$((GUARD_SECONDS / 60))
   echo
@@ -271,20 +311,10 @@ guard_wait_confirm() {
   echo "登录成功后回到这里输入 yes 保留更改；输入其他内容会立即回滚；${mins} 分钟内无操作将自动回滚。"
   echo "保护期内机器重启时，开机后会自动回滚这次修改。"
   if read -r -t "$GUARD_SECONDS" -p "新窗口登录成功了吗？输入 yes 保留: " ans && [[ ${ans,,} == yes ]]; then
-    guard_stop
-    if ! change_claim_confirmed "$CHG_ID"; then
-      case $(cat "$CHG_DIR/status" 2>/dev/null) in
-        rollback_failed) log_err "自动回滚失败，配置可能处于不一致状态，请立即用 VNC 登录检查并在 [25] 重试回滚。" ;;
-        rolled_back) log_err "确认太晚，已经自动回滚。" ;;
-        *) log_err "无法确认变更状态（可能被其他进程占用），请保持当前窗口并检查 [25]。" ;;
-      esac
-      return 1
-    fi
     return 0
   fi
   echo
-  guard_stop
   log_warn "未确认，正在回滚……"
-  change_rollback "$CHG_ID"
+  guard_abort
   return 1
 }
