@@ -1,5 +1,23 @@
 # Vaultwarden Hardening Manager
 
+## 项目简介
+
+**安全体检 · SSH 登录模式 · 1Panel / UFW 防火墙 · Fail2Ban 端口同步 · Vaultwarden 管理**
+
+面向 Ubuntu / Debian 上通过 1Panel 应用商店安装 Vaultwarden 的 VPS
+
+![Platform](https://img.shields.io/badge/platform-Ubuntu%20%7C%20Debian-blue)
+![Panel](https://img.shields.io/badge/panel-1Panel-1677ff)
+![SSH](https://img.shields.io/badge/ssh-password%20%7C%20key%20%7C%20TOTP-16a34a)
+![Protection](https://img.shields.io/badge/protection-Fail2Ban-dc2626)
+![Version](https://img.shields.io/badge/version-0.5.1-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![CI](https://github.com/OmenTwwnmfm/vaultwarden-hardening-manager/actions/workflows/ci.yml/badge.svg)
+
+Vaultwarden 把整个家庭或团队的密码库放在一台 VPS 上，这台服务器本身的安全就是密码库的安全。本项目提供一个交互式加固管理器：体检 VPS 当前开放了哪些端口、对哪些 IP 放行、SSH 怎么登录、有没有暴力破解防护；然后一步步完成 SSH 双因素认证、Fail2Ban、系统加固，并管理 Vaultwarden 的注册、后台和安全选项。
+
+项目不替代 1Panel。1Panel 继续负责应用安装、Docker、域名、HTTPS 和反向代理；防火墙规则可以在 1Panel 页面或 vhm `[15]` 中修改，两边读写同一套规则。本项目负责 SSH 登录安全、防火墙规则、Fail2Ban、系统参数和 Vaultwarden 的 `config.json` 设置。兄弟项目 [vaultwarden-backup-manager](https://github.com/OmenTwwnmfm/vaultwarden-backup-manager)（`vbm`）管「数据不丢」，本项目管「门锁不坏」。
+
 ## 快速开始
 
 在 VPS 的 SSH 终端执行：
@@ -27,24 +45,6 @@ sudo bash ./run.sh
 7. `[23]` 启用自动安全更新，`[24]` 加固内核网络参数。
 8. 体检提示 Docker 端口暴露时，在 1Panel 应用参数中取消「端口外部访问」。
 
-## 项目简介
-
-**安全体检 · SSH 登录模式 · 1Panel / UFW 防火墙 · Fail2Ban 端口同步 · Vaultwarden 管理**
-
-面向 Ubuntu / Debian 上通过 1Panel 应用商店安装 Vaultwarden 的 VPS
-
-![Platform](https://img.shields.io/badge/platform-Ubuntu%20%7C%20Debian-blue)
-![Panel](https://img.shields.io/badge/panel-1Panel-1677ff)
-![SSH](https://img.shields.io/badge/ssh-password%20%7C%20key%20%7C%20TOTP-16a34a)
-![Protection](https://img.shields.io/badge/protection-Fail2Ban-dc2626)
-![Version](https://img.shields.io/badge/version-0.5.1-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
-![CI](https://github.com/OmenTwwnmfm/vaultwarden-hardening-manager/actions/workflows/ci.yml/badge.svg)
-
-Vaultwarden 把整个家庭或团队的密码库放在一台 VPS 上，这台服务器本身的安全就是密码库的安全。本项目提供一个交互式加固管理器：体检 VPS 当前开放了哪些端口、对哪些 IP 放行、SSH 怎么登录、有没有暴力破解防护；然后一步步完成 SSH 双因素认证、Fail2Ban、系统加固，并管理 Vaultwarden 的注册、后台和安全选项。
-
-项目不替代 1Panel。1Panel 继续负责应用安装、Docker、域名、HTTPS 和反向代理；防火墙规则可以在 1Panel 页面或 vhm `[15]` 中修改，两边读写同一套规则。本项目负责 SSH 登录安全、防火墙规则、Fail2Ban、系统参数和 Vaultwarden 的 `config.json` 设置。兄弟项目 [vaultwarden-backup-manager](https://github.com/OmenTwwnmfm/vaultwarden-backup-manager)（`vbm`）管「数据不丢」，本项目管「门锁不坏」。
-
 ## 操作确认输入
 
 所有会修改系统的操作都会先显示要改什么，再要求输入 `yes`。大小写不敏感：`yes`、`YES`、`Yes` 都可以继续；其他输入均取消。只读功能（体检、状态、端口一览、用户列表、登录记录）不需要确认，也不会修改任何文件。
@@ -59,7 +59,7 @@ Vaultwarden 把整个家庭或团队的密码库放在一台 VPS 上，这台服
 
 - `[06]` 先选 root / 普通用户，再独立配置四种 SSH 登录方式；`[07]` 按用户管理动态口令。
 - 普通用户可选三项登录验证与 sudo 双项验证方案，验证新会话可用后再关闭 root SSH，保留完整回滚。
-- 增加真实 Linux 认证集成测试，安装与首次操作移到 README 顶部。已有旧仓址安装仍按[使用手册](docs/使用手册.md#仓库改名后的升级)升级。详细变更见 [CHANGELOG.md](CHANGELOG.md)。
+- 增加真实 Linux 认证集成测试。已有旧仓址安装仍按[使用手册](docs/使用手册.md#仓库改名后的升级)升级。
 
 历次版本的完整变更见 [CHANGELOG.md](CHANGELOG.md)。从 0.1.x 升级时，首次进入菜单会自动清理旧版定时巡检。
 
