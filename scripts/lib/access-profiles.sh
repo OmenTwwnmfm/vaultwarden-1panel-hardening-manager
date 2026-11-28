@@ -12,7 +12,7 @@ access_profile_pam() {
 
 _access_profile_modules() {
   local mode=$1 name path found
-  local modules=(pam_succeed_if)
+  local modules=(pam_succeed_if pam_deny pam_permit)
   case $mode in password|password_totp|key_password_totp) modules+=(pam_unix) ;; esac
   case $mode in *_totp) modules+=(pam_google_authenticator) ;; esac
   for name in "${modules[@]}"; do
@@ -164,7 +164,11 @@ def render_helper(entry):
 
 def render_dispatch(profiles):
     names = sorted(profiles)
-    lines = [BEGIN_PAM]
+    # OpenSSH may call setcred without a cached auth chain; pam_deny distinguishes CRED_ERR from AUTH_ERR.
+    lines = [BEGIN_PAM,
+             'auth [success=2 auth_err=2 ignore=ignore default=die] pam_succeed_if.so quiet user = root',
+             'auth [cred_err=ignore default=die] pam_deny.so',
+             'auth [success=done default=die] pam_permit.so']
     # 每个命中的子栈以 required/substack 结果累积；失败不能被后续分支覆盖。
     for name in names:
         lines += ['auth [success=ignore auth_err=1 default=die] pam_succeed_if.so quiet user = ' + name,

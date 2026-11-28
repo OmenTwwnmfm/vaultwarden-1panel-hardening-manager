@@ -86,7 +86,7 @@ cp "$SUDOERS_MAIN" "$T/sudoers-before"
 cp "$PAM_COMMON_AUTH" "$T/common-auth-before"
 access_sudo_apply admin "$T/private/admin/totp" >"$T/output" 2>&1 || { echo "FAIL sudo 策略应用失败"; cat "$T/output"; fail=1; }
 grep -Fxq 'auth substack common-auth' "$PAM_ACCESS_SUDO" || { echo "FAIL 未将密码放在受限子栈内"; fail=1; }
-grep -Fxq 'auth [success=1 auth_err=ignore default=die] pam_succeed_if.so user != admin' "$PAM_ACCESS_SUDO" || { echo "FAIL 没有保持其他账号的密码认证行为或匹配错误未拒绝"; fail=1; }
+grep -Fxq 'auth [success=1 auth_err=ignore ignore=ignore default=die] pam_succeed_if.so user != admin' "$PAM_ACCESS_SUDO" || { echo "FAIL 没有保持其他账号的密码认证与凭据阶段，或匹配错误未拒绝"; fail=1; }
 grep -Fxq "auth required pam_google_authenticator.so user=root secret=$T/private/admin/totp" "$PAM_ACCESS_SUDO" || { echo "FAIL TOTP 没有使用 root 集中密钥"; fail=1; }
 for path in "$PAM_SUDO" "$PAM_SUDO_I"; do
   grep -Fxq 'auth substack vhm-access-sudo' "$path" || { echo "FAIL sudo 或 sudo-i 没有进入认证子栈"; fail=1; }

@@ -96,40 +96,58 @@ for raw in service.read_text().splitlines():
         parsed = re.fullmatch(r'auth\s+(\[[^]]+\]|\S+)\s+(\S+)(?:\s+(.*))?', line)
         assert parsed, line
         auth.append(parsed.groups())
-def authenticate(user, password=True, totp=True, condition_error=False):
+def dispatch(user, password=True, totp=True, condition_error=False, condition_ignore=False, phase='auth'):
     position, required_ok, visited = 0, True, []
     while position < len(auth):
         control, module, args = auth[position]
         if module == 'pam_succeed_if.so':
             name = re.search(r'\buser = (\S+)', args)[1]
-            action = 'service_err' if condition_error else ('success' if user == name else 'auth_err')
-            actions = dict(re.findall(r'(\w+)=(\w+)', control))
-            result = actions.get(action, actions.get('default', 'bad'))
-            if result.isdigit():
-                position += int(result)
-            elif result not in ('ignore', 'ok'):
-                return False, visited
+            # libpam uses the cached authenticate result for routing when it exists.
+            outcome = ('service_err' if condition_error else 'ignore' if condition_ignore or phase == 'uncached-setcred'
+                       else 'success' if user == name else 'auth_err')
+        elif module == 'pam_deny.so':
+            visited.append(module)
+            outcome = 'auth_err' if phase == 'auth' else 'cred_err'
+        elif module == 'pam_permit.so':
+            visited.append(module)
+            outcome = 'success'
         else:
             assert control == 'substack', (control, module)
             visited.append(module)
             content = (directory / module).read_text()
-            if re.search(r'^(?:@include common-auth|auth substack common-auth)$', content, re.M):
-                required_ok &= password
-            if re.search(r'^auth required pam_google_authenticator\.so\b', content, re.M):
-                required_ok &= totp
+            if phase == 'auth':
+                if re.search(r'^(?:@include common-auth|auth substack common-auth)$', content, re.M):
+                    required_ok &= password
+                if re.search(r'^auth required pam_google_authenticator\.so\b', content, re.M):
+                    required_ok &= totp
+            position += 1
+            continue
+        actions = dict(re.findall(r'(\w+)=(\w+)', control))
+        result = actions.get(outcome, actions.get('default', 'bad'))
+        if result.isdigit():
+            position += int(result)
+        elif result == 'done':
+            return required_ok, visited
+        elif result not in ('ignore', 'ok'):
+            return False, visited
         position += 1
     return required_ok, visited
 profiles = json.loads(metadata.read_text())['profiles']
 for user, profile in profiles.items():
     expected = 'vhm-ssh-user-' + user
-    assert authenticate(user) == (True, [expected]), (user, authenticate(user))
+    assert dispatch(user) == (True, [expected]), (user, dispatch(user))
     needs_password = profile['mode'] in ('password', 'password_totp', 'key_password_totp') or profile['mode'] == 'key'
     needs_totp = profile['mode'].endswith('_totp')
-    assert authenticate(user, password=False)[0] == (not needs_password), user
-    assert authenticate(user, totp=False)[0] == (not needs_totp), user
-    assert not authenticate(user, condition_error=True)[0], user
-assert authenticate('unmanaged') == (True, [legacy.name])
-assert not authenticate('unmanaged', password=False)[0]
+    assert dispatch(user, password=False)[0] == (not needs_password), user
+    assert dispatch(user, totp=False)[0] == (not needs_totp), user
+    assert not dispatch(user, condition_error=True)[0], user
+    assert dispatch(user, condition_ignore=True) == (False, ['pam_deny.so']), user
+    assert dispatch(user, phase='cached-setcred') == (True, [expected]), user
+    assert dispatch(user, phase='uncached-setcred') == (True, ['pam_deny.so', 'pam_permit.so']), user
+assert dispatch('unmanaged') == (True, [legacy.name])
+assert not dispatch('unmanaged', password=False)[0]
+assert dispatch('unmanaged', phase='cached-setcred') == (True, [legacy.name])
+assert dispatch('unmanaged', phase='uncached-setcred') == (True, ['pam_deny.so', 'pam_permit.so'])
 assert profiles['carol']['mode'] == 'key_password_totp'
 assert 'auth substack common-auth' in (directory / 'vhm-ssh-user-carol').read_text()
 assert 'nullok' not in (directory / 'vhm-ssh-user-carol').read_text()

@@ -28,7 +28,9 @@ jobs:
         env:
           TEST_IMAGE: ${{ matrix.image }}
         run: |
+          # The root verifier reads the ordinary user's sshd process in the container's PID namespace.
           docker run --rm \
+            --cap-add SYS_PTRACE \
             --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace,readonly" \
             --workdir /workspace \
             --env VHM_ACCESS_INTEGRATION=1 \

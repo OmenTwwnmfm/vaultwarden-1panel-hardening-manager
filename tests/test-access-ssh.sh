@@ -103,6 +103,8 @@ def selected_stacks(user):
                 position += int(result)
             elif result not in ('ignore', 'ok'):
                 raise SystemExit('PAM branch fails unexpectedly')
+        elif module in ('pam_deny.so', 'pam_permit.so'):
+            raise SystemExit('normal authentication reached the uncached setcred gate')
         elif control in ('substack', 'include'):
             visited.append(pathlib.Path(module).name)
         else:

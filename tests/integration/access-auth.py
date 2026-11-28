@@ -152,14 +152,17 @@ def connect(credentials, username, method):
         raise
 
 
-def execute_id(transport):
-    with report_step("authenticated SSH session"):
+def execute_id(transport, username, method):
+    label = f"SSH session for {username} ({method})"
+    with report_step(f"{label}, open channel"):
         channel = transport.open_session(timeout=10)
-        try:
+    try:
+        with report_step(f"{label}, execute command"):
             channel.exec_command("/usr/bin/id -u")
             require(channel.recv_exit_status() == 0, "authenticated command failed")
             return channel.recv(1024).decode().strip()
-        finally:
+    finally:
+        with report_step(f"{label}, close channel"):
             channel.close()
 
 
@@ -184,7 +187,7 @@ def legacy_login(credentials, username, expected, password=False):
             raise IntegrationFailure(f"SSH legacy authentication for {username} ({method}): {type(error).__name__}") from None
         require(success == expected, f"unexpected legacy SSH result for {username} using {method}")
         if success:
-            result = execute_id(transport)
+            result = execute_id(transport, username, method)
             require((result == "0") == (username == "root"), "unexpected legacy account")
     finally:
         transport.close()
@@ -246,7 +249,7 @@ def positive_login(credentials):
     transport, prompts = profile_login(credentials, credentials["user"], "key_password_totp")
     require(transport is not None, "three-factor SSH login was rejected")
     require(prompts["password"] > 0 and prompts["token"] > 0, "SSH skipped a required challenge")
-    require(execute_id(transport) != "0", "managed account unexpectedly is root")
+    require(execute_id(transport, credentials["user"], "key_password_totp") != "0", "managed account unexpectedly is root")
     return transport
 
 
@@ -264,13 +267,13 @@ def wait_marker(channel, marker, timeout=15):
     raise IntegrationFailure("interactive shell did not become ready")
 
 
-def sudo_command(channel, credentials, password_mode="correct", token_mode="correct", login=False, noninteractive=False, username=None):
+def sudo_command(channel, credentials, password_mode="correct", token_mode="correct", login=False, noninteractive=False, username=None, command="/usr/bin/id -u"):
     username = username or credentials["user"]
     arguments = "-n" if noninteractive else "-p VHM_ACCOUNT_PASSWORD:"
     if login:
         arguments += " -i"
     channel.sendall(
-        f"sudo {arguments} -- /usr/bin/id -u; printf '\\nVHM_SUDO_DONE:%s\\n' \"$?\"\n"
+        f"sudo {arguments} -- {command}; printf '\\nVHM_SUDO_DONE:%s\\n' \"$?\"\n"
     )
     pending = ""
     output = ""
@@ -312,13 +315,21 @@ def sudo_command(channel, credentials, password_mode="correct", token_mode="corr
     raise IntegrationFailure("sudo conversation timed out")
 
 
-def sudo_checks(credentials, transport):
+@contextmanager
+def sudo_shell(transport):
     channel = transport.open_session(timeout=10)
     try:
         channel.get_pty(term="dumb", width=120, height=25)
         channel.exec_command("exec /bin/bash --noprofile --norc")
         channel.sendall("unset HISTFILE; PS1=''; stty -echo; printf '\\nVHM_SHELL_READY\\n'\n")
         wait_marker(channel, "\r\nVHM_SHELL_READY\r\n")
+        yield channel
+    finally:
+        channel.close()
+
+
+def sudo_checks(credentials, transport):
+    with sudo_shell(transport) as channel:
         for login in (False, False, True):
             status, prompts, output = sudo_command(channel, credentials, login=login)
             require(status == 0 and re.search(r"(?:^|[\r\n])0[\r\n]", output), "sudo did not run as root")
@@ -331,32 +342,72 @@ def sudo_checks(credentials, transport):
         ):
             status, _prompts, _output = sudo_command(channel, credentials, password_mode, token_mode)
             require(status != 0, "sudo accepted an incomplete or incorrect factor")
-    finally:
-        channel.close()
 
 
 def original_sudo_check(credentials, username):
     transport, _prompts = profile_login(credentials, username, "password")
     require(transport is not None, "unmanaged password SSH login was rejected")
-    channel = transport.open_session(timeout=10)
     try:
-        channel.get_pty(term="dumb", width=120, height=25)
-        channel.exec_command("exec /bin/bash --noprofile --norc")
-        channel.sendall("unset HISTFILE; PS1=''; stty -echo; sudo -k; printf '\\nVHM_SHELL_READY\\n'\n")
-        wait_marker(channel, "\r\nVHM_SHELL_READY\r\n")
-        status, prompts, output = sudo_command(channel, credentials, username=username)
-        require(status == 0 and re.search(r"(?:^|[\r\n])0[\r\n]", output), "unmanaged sudo did not run as root")
-        require(prompts["password"] > 0 and prompts["token"] == 0, "sudo altered another administrator's authentication")
+        with sudo_shell(transport) as channel:
+            channel.sendall("sudo -k; printf '\\nVHM_SUDO_RESET\\n'\n")
+            wait_marker(channel, "\r\nVHM_SUDO_RESET\r\n")
+            status, prompts, output = sudo_command(channel, credentials, username=username)
+            require(status == 0 and re.search(r"(?:^|[\r\n])0[\r\n]", output), "unmanaged sudo did not run as root")
+            require(prompts["password"] > 0 and prompts["token"] == 0, "sudo altered another administrator's authentication")
     finally:
-        channel.close()
         transport.close()
+
+
+def boot_ticks():
+    with Path("/proc/uptime").open() as stream:
+        return int(float(stream.readline().split()[0]) * os.sysconf("SC_CLK_TCK"))
+
+
+def verify_checks(credentials, change, phase):
+    require(change and re.fullmatch(r"[0-9]{8}-[0-9]{6}-[0-9]+", change), "invalid change fixture")
+    record = Path(credentials["work"]) / "state" / "changes" / change
+    marker = record / f"access-verified-{phase}"
+    command = f"/usr/local/bin/vhm access-verify {change} {phase}"
+    require(not marker.exists(), "verification marker already exists")
+
+    if phase == "login":
+        old = positive_login(credentials)
+        try:
+            with sudo_shell(old) as channel:
+                # The server session is already running when we set the cutoff.
+                cutoff = boot_ticks()
+                write_private(record / "access-cutoff", str(cutoff) + "\n")
+                status, prompts, _output = sudo_command(channel, credentials, command=command)
+                require(prompts["password"] > 0 and prompts["token"] > 0, "old session skipped sudo authentication")
+                require(status != 0 and not marker.exists(), "old SSH session was allowed to verify the change")
+        finally:
+            old.close()
+    else:
+        cutoff = boot_ticks()
+        write_private(record / "access-cutoff", str(cutoff) + "\n")
+    time.sleep(0.05)
+
+    fresh = positive_login(credentials)
+    try:
+        with sudo_shell(fresh) as channel:
+            status, prompts, _output = sudo_command(channel, credentials, command=command)
+            require(prompts["password"] > 0 and prompts["token"] > 0, "verification skipped either sudo factor")
+            require(status == 0 and marker.is_file(), "fresh SSH session failed to verify the change")
+    finally:
+        fresh.close()
+
+    content = marker.read_text().strip()
+    require(re.fullmatch(r"[0-9]+:[0-9]+", content), "verification marker lacks an SSH process and timestamp")
+    require(int(content.split(":", 1)[1]) > cutoff, "verification marker refers to an old session")
+    info = marker.stat()
+    require(info.st_uid == 0 and info.st_mode & 0o777 == 0o600, "verification marker is not root-private")
 
 
 def expect_profile(credentials, username, mode, **options):
     transport, prompts = profile_login(credentials, username, mode, **options)
     require(transport is not None, f"SSH profile was rejected for {username} using {mode}")
     try:
-        require((execute_id(transport) == "0") == (username == "root"), "profile authenticated an unexpected account")
+        require((execute_id(transport, username, mode) == "0") == (username == "root"), "profile authenticated an unexpected account")
         password_required = mode in ("password_totp", "key_password_totp")
         require((prompts["password"] > 0) == password_required, "profile used another account's password route")
         require((prompts["token"] > 0) == mode.endswith("_totp"), "profile used another account's TOTP route")
@@ -434,16 +485,23 @@ def check(arguments):
             original_sudo_check(credentials, credentials["other"])
     elif arguments.stage in ("profiles", "profiles-updated"):
         profiles_check(credentials, updated=arguments.stage == "profiles-updated")
+    elif arguments.stage in ("verify-login", "verify-final"):
+        with report_step(arguments.stage):
+            verify_checks(credentials, arguments.change, arguments.stage.removeprefix("verify-"))
     print(f"PASS access-auth {arguments.stage}")
 
 
 def main():
     logging.getLogger("paramiko").setLevel(logging.CRITICAL)
     parser = argparse.ArgumentParser()
-    parser.add_argument("stage", choices=("fixture", "baseline", "stage-one", "stage-two", "rollback", "profiles", "profiles-updated"))
+    parser.add_argument(
+        "stage",
+        choices=("fixture", "baseline", "stage-one", "stage-two", "verify-login", "verify-final", "rollback", "profiles", "profiles-updated"),
+    )
     parser.add_argument("work")
     parser.add_argument("--key-file")
     parser.add_argument("--seed-file")
+    parser.add_argument("--change")
     arguments = parser.parse_args()
     require(os.geteuid() == 0 and Path("/.dockerenv").exists(), "run only in a disposable Docker container")
     if arguments.stage == "fixture":

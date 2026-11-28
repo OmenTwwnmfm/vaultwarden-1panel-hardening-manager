@@ -42,6 +42,18 @@ useradd --create-home --shell /bin/bash --groups sudo vhmaccess
 useradd --create-home --shell /bin/bash --groups sudo vhmlegacy
 useradd --create-home --shell /bin/bash vhmkey
 install -d -m 755 /run/sshd
+install -d -m 700 "$work/project/scripts/lib"
+install -m 600 VERSION "$work/project/VERSION"
+install -m 600 scripts/*.sh "$work/project/scripts/"
+install -m 600 scripts/lib/*.sh "$work/project/scripts/lib/"
+test ! -e /usr/local/bin/vhm
+cat >/usr/local/bin/vhm <<EOF
+#!/bin/bash
+export VH_STATE='$VH_STATE' VH_CHANGES='$VH_CHANGES' VH_LOG=/dev/null
+export VH_LOCK='$VH_LOCK' VH_CONF='$VH_CONF'
+exec bash '$work/project/scripts/vh-launcher.sh' "\$@"
+EOF
+chmod 755 /usr/local/bin/vhm
 ssh-keygen -q -t ed25519 -N '' -f "$work/hostkey"
 cat >"$SSHD_CONFIG" <<EOF
 Port 2222
@@ -104,7 +116,7 @@ restart_sshd() {
 stage=baseline
 start_sshd
 python3 tests/integration/access-auth.py baseline "$work"
-stage=stage-one
+stage='stage-one'
 change_begin 'Integration access configuration'
 record=$CHG_DIR
 change_track "$SSHD_DROPIN"
@@ -115,19 +127,26 @@ access_ssh_preflight vhmaccess
 access_sudo_preflight vhmaccess
 access_ssh_apply vhmaccess
 access_ssh_expect vhmaccess
-restart_sshd
-python3 tests/integration/access-auth.py "$stage" "$work"
-
-stage=stage-two
 access_sudo_apply vhmaccess "$ACCESS_GA_FILE"
 access_sudo_verify vhmaccess "$ACCESS_GA_FILE"
+restart_sshd
+python3 tests/integration/access-auth.py "$stage" "$work"
+stage='verify-login'
+printf '%s\n' vhmaccess >"$record/access-user"
+printf '%s\n' login >"$record/access-phase"
+python3 tests/integration/access-auth.py "$stage" "$work" --change "$CHG_ID"
+
+stage='stage-two'
 visudo --check >/dev/null 2>&1
 access_disable_root vhmaccess
 access_ssh_expect vhmaccess
 restart_sshd
 python3 tests/integration/access-auth.py "$stage" "$work"
+stage='verify-final'
+printf '%s\n' final >"$record/access-phase"
+python3 tests/integration/access-auth.py "$stage" "$work" --change "$CHG_ID"
 
-stage=strong-admin-rollback
+stage='strong-admin-rollback'
 change_restore_files "$record"
 visudo --check >/dev/null 2>&1
 restart_sshd
@@ -152,7 +171,7 @@ restart_sshd
 python3 tests/integration/access-auth.py "$stage" "$work"
 
 # Updating one user must preserve root key+TOTP and the other user's key login.
-stage=profiles-updated
+stage='profiles-updated'
 access_profile_preflight vhmaccess password
 access_profile_apply vhmaccess password '' ''
 access_profile_expect root key_totp "$ACCESS_KEYS_DIR/root"
@@ -161,7 +180,7 @@ access_profile_expect vhmkey key "$ACCESS_KEYS_DIR/vhmkey"
 restart_sshd
 python3 tests/integration/access-auth.py "$stage" "$work"
 
-stage=profile-rollback
+stage='profile-rollback'
 change_restore_files "$profile_record"
 restart_sshd
 python3 tests/integration/access-auth.py rollback "$work"

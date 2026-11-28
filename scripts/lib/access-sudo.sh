@@ -116,9 +116,10 @@ def active_lines(content):
             yield stripped
 
 def helper_content(secret_file):
+    # pam_succeed_if 的 setcred 返回 PAM_IGNORE；没有认证缓存时仍应正常设置凭据。
     return (header + '# user: ' + user + '\n'
             'auth substack common-auth\n'
-            'auth [success=1 auth_err=ignore default=die] pam_succeed_if.so user != ' + user + '\n'
+            'auth [success=1 auth_err=ignore ignore=ignore default=die] pam_succeed_if.so user != ' + user + '\n'
             'auth required pam_google_authenticator.so user=root secret=' + secret_file + '\n')
 
 def managed_content():
