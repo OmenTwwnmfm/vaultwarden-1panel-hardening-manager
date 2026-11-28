@@ -158,7 +158,7 @@ change_rollback() {
     return 0
   fi
   if [[ ${VH_ROLLBACK_PENDING_ONLY:-0} != 1 ]] && newer=$(change_newer_overlap "$id" ssh-auth); then
-    log_err "回滚 $id 会覆盖较新的 SSH/PAM 认证变更 $newer。请先按从新到旧的顺序回滚重叠的 SSH 变更；本次未恢复文件。"
+    log_err "较新的登录或提权变更 $newer 修改了相同文件或依赖此授权。请先回滚 $newer；本次未恢复文件。"
     exec 7>&-
     return 1
   fi
@@ -220,7 +220,7 @@ change_ssh_auth_path() {
     "$SSHD_CONFIG"|"$SSHD_DROPIN"|"$SSH_SOCKET_DROPIN"|"$PAM_SSHD"|"$ROOT_KEYS"|"$GA_FILE"|\
     "$ACCESS_STATE"|"${ACCESS_PROFILES_STATE:-$VH_STATE/ssh-profiles.json}"|"$PAM_ACCESS_SSH"|"$PAM_ACCESS_LEGACY"|\
     "${PAM_PROFILE_PREFIX:-${PAM_ACCESS_SSH%/*}/vhm-ssh-user-}"*|"$ACCESS_KEYS_DIR/"*|"$ACCESS_SECRETS_DIR/"*|\
-    "$PAM_SUDO"|"$PAM_SUDO_I"|"$PAM_ACCESS_SUDO"|"$SUDOERS_ACCESS") return 0 ;;
+    "$PAM_SUDO"|"$PAM_SUDO_I"|"$PAM_ACCESS_SUDO"|"$SUDOERS_ACCESS"|"$SUDOERS_DIR/90-vhm-admin-"*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -241,7 +241,8 @@ change_newer_overlap() {
         rollback_failed) [[ $scope == ssh-auth ]] || continue ;;
         *) continue ;;
       esac
-      if awk -F'\t' -v p="$p" '$5 == p { found = 1 } END { exit !found }' "$d/files.tsv" 2>/dev/null; then
+      if awk -F'\t' -v p="$p" '$5 == p { found = 1 } END { exit !found }' "$d/files.tsv" 2>/dev/null ||
+        [[ $scope == ssh-auth && -f $d/admin-required && $(<"$d/admin-required") == "$p" ]]; then
         if [[ $scope == ssh-auth ]]; then printf '%s\n' "$other"; fi
         return 0
       fi

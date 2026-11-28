@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # shellcheck disable=SC2034
-# 普通管理用户的 sudo 密码 + TOTP；只收紧已有管理员的认证，不添加 sudo 授权。
+# 显式授予 sudo，以及单独为已有管理员启用密码 + TOTP。
 
 PAM_SUDO=${PAM_SUDO:-/etc/pam.d/sudo}
 PAM_SUDO_I=${PAM_SUDO_I:-/etc/pam.d/sudo-i}
@@ -49,7 +49,7 @@ _access_sudo_identity() { # 输出 yes/no：该本地普通用户是否属于 su
   if [[ " $groups " == *" sudo "* ]]; then printf 'yes\n'; else printf 'no\n'; fi
 }
 
-_access_sudo_policy() { # check/apply 用户 sudo组成员 yes/no [集中保存的 TOTP 文件]
+_access_sudo_policy() { # 操作 用户 sudo组成员 yes/no [集中保存的 TOTP 文件]
   python3 - "$1" "$2" "$3" "${4:-}" "$(_access_sudo_owner_uid)" \
     "$PAM_SUDO" "$PAM_SUDO_I" "$PAM_ACCESS_SUDO" "$PAM_COMMON_AUTH" \
     "$SUDOERS_MAIN" "$SUDOERS_DIR" "$SUDOERS_ACCESS" "$NSSWITCH_CONF" "$SUDO_CONF" <<'PY'
@@ -65,6 +65,8 @@ from pathlib import Path
  common_auth, sudoers_main, sudoers_dir, sudoers_managed, nsswitch, sudo_conf) = sys.argv[1:]
 owner = int(owner)
 header = '# Managed by vaultwarden-hardening-manager; do not edit.\n'
+grant = mode in ('grant-check', 'grant-verify')
+managed_user = user
 
 def refuse(message):
     raise ValueError(message)
@@ -117,15 +119,18 @@ def active_lines(content):
 
 def helper_content(secret_file):
     # pam_succeed_if 的 setcred 返回 PAM_IGNORE；没有认证缓存时仍应正常设置凭据。
-    return (header + '# user: ' + user + '\n'
+    return (header + '# user: ' + managed_user + '\n'
             'auth substack common-auth\n'
-            'auth [success=1 auth_err=ignore ignore=ignore default=die] pam_succeed_if.so user != ' + user + '\n'
+            'auth [success=1 auth_err=ignore ignore=ignore default=die] pam_succeed_if.so user != ' + managed_user + '\n'
             'auth required pam_google_authenticator.so user=root secret=' + secret_file + '\n')
 
 def managed_content():
-    return (header + '# user: ' + user + '\n'
-            'Defaults:' + user + ' authenticate, !rootpw, !targetpw, !runaspw, timestamp_timeout=0\n'
-            'Defaults:' + user + ' pam_service="sudo", pam_login_service="sudo-i", listpw=always, verifypw=always\n')
+    return (header + '# user: ' + managed_user + '\n'
+            'Defaults:' + managed_user + ' authenticate, !rootpw, !targetpw, !runaspw, timestamp_timeout=0\n'
+            'Defaults:' + managed_user + ' pam_service="sudo", pam_login_service="sudo-i", listpw=always, verifypw=always\n')
+
+def grant_file():
+    return Path(sudoers_dir) / ('90-vhm-admin-' + user)
 
 def check_common_auth():
     lines = [' '.join(line.split()) for line in active_lines(text(checked(common_auth)))]
@@ -139,11 +144,15 @@ def render_service(value, login=False):
     path = checked(value, missing=login)
     helper_name = Path(pam_helper).name
     if not path.exists():
+        if grant:
+            refuse('无法确认 sudo-i 的密码认证，请先核对 PAM 策略')
         return (header + 'auth substack ' + helper_name + '\n'
                 'account include sudo\n' + 'session include sudo\n')
     result = []
     auth_count = 0
     for original in text(path).splitlines():
+        if grant and original.rstrip().endswith('\\'):
+            refuse('不支持含续行的 sudo PAM 策略')
         line = original.split('#', 1)[0].strip()
         if not line:
             result.append(original)
@@ -158,6 +167,11 @@ def render_service(value, login=False):
             elif parts[1] in ('common-account', 'common-password', 'common-session', 'common-session-noninteractive'):
                 # 限定类型，避免 @include 的非认证文件意外引入另一条 auth 路径。
                 category = parts[1].split('-')[1]
+                if grant:
+                    included = text(checked(path.parent / parts[1]))
+                    if any(not re.match(r'^-?' + category + r'\s', line) or '\\' in line
+                           for line in active_lines(included)):
+                        refuse('sudo PAM include 含额外规则，需先人工审核：' + parts[1])
                 result.append(category + ' include ' + parts[1])
             else:
                 refuse('不支持的 PAM include：' + value)
@@ -260,6 +274,12 @@ def check_sudoers():
         refuse('托管 sudoers 文件必须位于 sudoers.d，文件名不能含点或以 ~ 结尾')
     if managed.exists() and text(managed) != managed_content():
         refuse('托管 sudoers 文件属于其他用户或已被修改；请先人工审核/回滚')
+    grant_path = checked(grant_file(), missing=True) if grant else None
+    if mode == 'grant-check' and grant_path.exists():
+        refuse('目标授权文件已存在，未覆盖：' + str(grant_path))
+    if mode == 'grant-verify' and (not grant_path.exists() or
+            text(grant_path) != header + user + ' ALL=(ALL:ALL) PASSWD: ALL\n'):
+        refuse('未能确认写入了预期的授权规则')
     seen, active = set(), set()
     managed_directory_included = False
     full_admin = False
@@ -308,12 +328,14 @@ def check_sudoers():
             if ((match['who'] == '%sudo' and sudo_member == 'yes') or
                     (match['who'] == user and match['tag'])):
                 full_admin = True
+            if mode == 'grant-check' and (match['who'] == user or full_admin):
+                refuse('账号已有 sudo 授权，未添加重复规则')
         active.remove(path)
 
     walk(sudoers_main)
     if not managed_directory_included:
         refuse('sudoers 未包含指定的 sudoers.d 目录，托管策略不会生效')
-    if not full_admin:
+    if mode != 'grant-check' and not full_admin:
         refuse('用户尚无标准 sudo 组或明确的用户 PASSWD:ALL 管理授权；本功能不会自动授予 ALL')
 
 def check_policy_sources():
@@ -328,6 +350,7 @@ def check_policy_sources():
             refuse('sudo.conf 有自定义插件、插件目录或其他设置，需先人工审核')
 
 def check_existing_helper():
+    global managed_user
     helper = checked(pam_helper, missing=True)
     if not re.fullmatch(r'[A-Za-z0-9_-]+', helper.name) or helper.name in ('sudo', 'sudo-i', 'common-auth'):
         refuse('托管 PAM 文件名称不受支持')
@@ -335,6 +358,15 @@ def check_existing_helper():
         refuse('sudo、sudo-i、common-auth 与托管 PAM 文件必须位于同一 PAM 目录')
     if Path(pam_sudo).name != 'sudo' or Path(pam_sudo_i).name != 'sudo-i' or Path(common_auth).name != 'common-auth':
         refuse('不支持重命名的 sudo PAM 服务')
+    if grant:
+        defaults = checked(sudoers_managed, missing=True)
+        if helper.exists() != defaults.exists():
+            refuse('现有密码 + TOTP 配置不完整，请先人工审核')
+        if defaults.exists():
+            match = re.search(r'^# user: ([a-z_][a-z0-9_-]{0,31})$', text(defaults), re.M)
+            if not match or match[1] == 'root':
+                refuse('无法确认现有密码 + TOTP 配置归属')
+            managed_user = match[1]
     if helper.exists():
         content = text(helper)
         match = re.search(r'^auth required pam_google_authenticator\.so user=root secret=(/[^\n]+)$', content, re.M)
@@ -366,7 +398,7 @@ def atomic_write(value, content, permissions):
             os.unlink(tmp)
 
 try:
-    if mode not in ('check', 'apply', 'verify'):
+    if mode not in ('check', 'apply', 'verify', 'grant-check', 'grant-verify'):
         refuse('内部 sudo 操作无效')
     check_policy_sources()
     check_common_auth()
@@ -374,6 +406,9 @@ try:
     sudo_content = render_service(pam_sudo)
     login_content = render_service(pam_sudo_i, login=True)
     check_sudoers()
+    if grant and Path(pam_helper).exists() and (text(Path(pam_sudo)) != sudo_content or
+            text(Path(pam_sudo_i)) != login_content):
+        refuse('现有密码 + TOTP 认证入口已被修改，请先人工审核')
     if mode in ('apply', 'verify'):
         check_secret()
     if mode == 'verify':
@@ -393,13 +428,12 @@ except (ValueError, OSError) as error:
 PY
 }
 
-access_sudo_preflight() { # 在 change_begin 前调用，不写配置
+_access_sudo_context() { # 核对系统 sudo 与账户，输出该账号是否属于 sudo 组
   local user=$1 command_name member version
   for command_name in python3 getent passwd id sudo visudo; do
     command -v "$command_name" >/dev/null 2>&1 || { log_err "缺少 $command_name，未修改 sudo 配置"; return 1; }
   done
   member=$(_access_sudo_identity "$user") || return 1
-  _access_sudo_modules || return 1
   version=$(LC_ALL=C sudo -V) || { log_err "无法读取 sudo 编译配置"; return 1; }
   grep -Eq "^Authentication methods:[[:space:]]*'pam'[[:space:]]*$" <<<"$version" || {
     log_err "sudo 未确认使用标准 PAM 认证，未修改配置"; return 1;
@@ -408,6 +442,13 @@ access_sudo_preflight() { # 在 change_begin 前调用，不写配置
     log_err "sudo 的实际策略文件与预期不一致，未修改配置"; return 1;
   }
   visudo -c -f "$SUDOERS_MAIN" >/dev/null || { log_err "现有完整 sudoers 检查失败，未修改配置"; return 1; }
+  printf '%s\n' "$member"
+}
+
+access_sudo_preflight() { # 在 change_begin 前调用，不写配置
+  local user=$1 member
+  member=$(_access_sudo_context "$user") || return 1
+  _access_sudo_modules || return 1
   _access_sudo_policy check "$user" "$member"
 }
 
@@ -432,3 +473,42 @@ access_sudo_verify() { # 只读核对实际受管文件、完整策略与集中�
   member=$(_access_sudo_identity "$user") || return 1
   _access_sudo_policy verify "$user" "$member" "$secret"
 }
+
+access_grant_sudo() ( # 已在 with_lock 中；只写此次用户的独立授权文件
+  local user=$1 member target candidate
+  member=$(_access_sudo_context "$user") || return 1
+  if LC_ALL=C sudo -n -l -U "$user" >/dev/null 2>&1; then
+    log_info "$user 已有 sudo 授权，未更改规则。"
+    return 0
+  fi
+  _access_sudo_policy grant-check "$user" "$member" || return 1
+  VH_ASSUME_YES=0 confirm_yes "授予 $user 完整 sudo 权限？该用户可用自己的账户密码以 root 身份执行任意命令，相当于获得系统管理权。" || return 0
+  member=$(_access_sudo_context "$user") || return 1
+  if LC_ALL=C sudo -n -l -U "$user" >/dev/null 2>&1; then
+    log_info "$user 已有 sudo 授权，未更改规则。"
+    return 0
+  fi
+  _access_sudo_policy grant-check "$user" "$member" || return 1
+
+  target="$SUDOERS_DIR/90-vhm-admin-$user"
+  candidate=$(mktemp "$SUDOERS_DIR/.vhm-admin.XXXXXX") || { log_err '无法创建临时 sudoers 文件'; return 1; }
+  trap 'rm -f -- "$candidate"' EXIT
+  if ! { printf '# Managed by vaultwarden-hardening-manager; do not edit.\n%s ALL=(ALL:ALL) PASSWD: ALL\n' "$user" >"$candidate" &&
+    chown root:root "$candidate" && chmod 440 "$candidate" && visudo -c -f "$candidate" >/dev/null; }; then
+    log_err '候选 sudoers 文件检查失败，未授予权限'
+    return 1
+  fi
+  change_begin "显式授予 $user 完整 sudo 权限" || return 1
+  if [[ -e $target || -L $target ]] || ! change_track "$target" || ! ln -T -- "$candidate" "$target"; then
+    change_status rolled_back || log_err '无法记录未应用的授权变更，请在 [25] 检查'
+    log_err '无法安全安装独立 sudoers 文件，未授予权限'
+    return 1
+  fi
+  if ! { visudo -c -f "$SUDOERS_MAIN" >/dev/null && _access_sudo_policy grant-verify "$user" "$member" &&
+    LC_ALL=C sudo -n -l -U "$user" -u root -- /usr/bin/id >/dev/null 2>&1 && change_status applied; }; then
+    log_err '无法确认授权已正确生效，正在回滚'
+    change_rollback "$CHG_ID" || log_err "无法自动回滚，请在 [25] 核对变更 $CHG_ID"
+    return 1
+  fi
+  log_ok "已授予 $user 完整 sudo 权限；变更 $CHG_ID 可在 [25] 回滚。"
+)

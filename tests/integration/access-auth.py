@@ -255,18 +255,23 @@ def positive_login(credentials):
     return transport
 
 
-def wait_marker(channel, marker, timeout=15):
-    output = ""
+def wait_match(channel, pattern, label, timeout=15):
+    output = b""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if channel.recv_ready():
-            output += channel.recv(4096).decode("utf-8", errors="replace")
-            if marker in output:
-                return
+            output = (output + channel.recv(4096))[-8192:]
+            match = pattern.search(output)
+            if match is not None:
+                return match
         elif channel.closed:
             break
         time.sleep(0.05)
-    raise IntegrationFailure("interactive shell did not become ready")
+    raise IntegrationFailure(f"interactive shell did not reach {label}")
+
+
+def wait_marker(channel, marker, timeout=15):
+    wait_match(channel, re.compile(re.escape(marker.encode("utf-8"))), "the expected prompt", timeout)
 
 
 @dataclass(frozen=True)
@@ -296,6 +301,7 @@ def sudo_result(status, prompts, output):
         "no_new_privileges": "no new privileges" in lower or "no_new_privs" in lower,
         "setuid_error": "setuid" in lower or "effective uid is not 0" in lower,
         "account_error": "pam account management" in lower or "account validation" in lower,
+        "sudo_denied": "not in the sudoers file" in lower or "not allowed to run sudo" in lower or "not allowed to execute" in lower,
         "old_session": "请关闭连接复用，建立本阶段开始后的新 SSH 连接" in output,
         "unknown_session": "无法确认来自该用户的新 SSH 会话" in output,
         "wrong_sudo_context": "必须在新 SSH 会话中由" in output or "请直接执行向导给出的 sudo vhm access-verify" in output,
@@ -311,11 +317,13 @@ SUDO_CHALLENGE = re.compile(
 )
 
 
-def sudo_command(channel, credentials, password_mode="correct", token_mode="correct", login=False, noninteractive=False, username=None, command="/usr/bin/id -u"):
+def sudo_command(channel, credentials, password_mode="correct", token_mode="correct", login=False, noninteractive=False, username=None, command="/usr/bin/id -u", invalidate=False):
     username = username or credentials["user"]
     arguments = "-n" if noninteractive else ""
     if login:
         arguments += " -i"
+    if invalidate:
+        arguments += " -k"
     channel.sendall(
         f"sudo {arguments} -- {command}; printf '\\nVHM_SUDO_DONE:%s\\n' \"$?\"\n"
     )
@@ -398,6 +406,211 @@ def original_sudo_check(credentials, username):
             require(result.passwords > 0 and result.tokens == 0, "sudo altered another administrator's authentication: " + result.detail())
     finally:
         transport.close()
+
+
+def ssh_login_checks(credentials):
+    command = "/usr/local/bin/vhm test-ssh-login"
+    console = subprocess.run([*command.split(), "未识别"], capture_output=True, check=False, timeout=10)
+    require(console.returncode == 0, "console was reported as an SSH login")
+
+    root, _prompts = profile_login(credentials, "root", "key")
+    require(root is not None, "root SSH login failed before identity check")
+    try:
+        channel = root.open_session(timeout=10)
+        try:
+            channel.exec_command(command + " root")
+            require(channel.recv_exit_status() == 0, "root SSH login identity was not preserved")
+        finally:
+            channel.close()
+    finally:
+        root.close()
+
+    username = credentials["other"]
+    ordinary, _prompts = profile_login(credentials, username, "password")
+    require(ordinary is not None, "ordinary SSH login failed before identity check")
+    try:
+        with sudo_shell(ordinary) as channel:
+            result = sudo_command(channel, credentials, username=username, command=f"{command} '普通用户 {username}'")
+            require(result.status == 0 and result.passwords > 0,
+                    "sudo did not preserve the original SSH login identity: " + result.detail())
+    finally:
+        ordinary.close()
+
+
+def create_user_checks(credentials):
+    from pwd import getpwnam
+
+    username = "vhmcreated"
+    password = secrets.token_urlsafe(24)
+    root, _prompts = profile_login(credentials, "root", "key")
+    require(root is not None, "root SSH login failed before account creation")
+    try:
+        with sudo_shell(root) as channel:
+            channel.sendall("/usr/local/bin/vhm test-create-user; printf '\\nVHM_CREATE_DONE:%s\\n' \"$?\"\n")
+            wait_marker(channel, "选择要配置的用户类型: ")
+            channel.sendall(f"2\n{username}\nyes\n")
+            wait_marker(channel, "New password:")
+            channel.sendall(password + "\n")
+            wait_marker(channel, "Retype new password:")
+            channel.sendall(password + "\n")
+            wait_marker(channel, "请选择：")
+            channel.sendall("0\n")
+            wait_marker(channel, "\r\nVHM_CREATE_DONE:0\r\n")
+    finally:
+        root.close()
+
+    account = getpwnam(username)
+    home = Path(account.pw_dir)
+    require(1000 <= account.pw_uid < 65534 and account.pw_shell == "/bin/bash", "created account is not a normal login user")
+    require(home == Path("/home") / username and home.is_dir() and not home.is_symlink() and home.stat().st_uid == account.pw_uid,
+            "created account does not own its home directory")
+    groups = subprocess.run(["id", "-Gn", "--", username], capture_output=True, text=True, check=False, timeout=10)
+    require(groups.returncode == 0 and groups.stdout.split() == [username], "created account has unexpected group membership")
+
+    credentials["accounts"][username] = {"password": password}
+    ordinary, _prompts = profile_login(credentials, username, "password")
+    require(ordinary is not None, "created account could not log in with its configured password")
+    try:
+        require(execute_id(ordinary, username, "password") == str(account.pw_uid), "created account logged in with an unexpected UID")
+        with sudo_shell(ordinary) as channel:
+            result = sudo_command(channel, credentials, username=username)
+            require(result.status != 0 and result.hints["sudo_denied"], "created account was not denied sudo authorization: " + result.detail())
+    finally:
+        ordinary.close()
+
+    local_admin_checks(credentials, username)
+
+
+MENU_DONE = re.compile(rb"\r\nVHM_MENU_DONE:([0-9]+)\r\n")
+ROOT_PHASE = re.compile(
+    rb"sudo -k /usr/local/bin/vhm access-verify ([0-9]{8}-[0-9]{6}-[0-9]+) (login|final)\r?\n.*?"
+    + re.escape("新窗口验证完成后输入 yes（其他输入回滚）: ".encode("utf-8")),
+    re.DOTALL,
+)
+
+
+def menu_action(channel, command, username, action):
+    channel.sendall(f"{command}; printf '\\nVHM_MENU_DONE:%s\\n' \"$?\"\n")
+    wait_marker(channel, "选择要配置的用户类型: ")
+    channel.sendall(f"2\n{username}\n")
+    wait_marker(channel, "请选择：")
+    channel.sendall(f"{action}\n")
+    wait_marker(channel, "输入 yes 继续（其他输入均取消）: ")
+
+
+def menu_done(channel, label, timeout=15):
+    return int(wait_match(channel, MENU_DONE, label, timeout).group(1))
+
+
+@contextmanager
+def password_shell(credentials, username):
+    transport, _prompts = profile_login(credentials, username, "password")
+    require(transport is not None, "ordinary SSH password login was rejected")
+    try:
+        with sudo_shell(transport) as channel:
+            yield channel
+    finally:
+        transport.close()
+
+
+def pam_snapshot():
+    return {path.name: path.read_bytes() for path in Path("/etc/pam.d").iterdir() if path.is_file()}
+
+
+def local_admin_checks(credentials, username):
+    pam = pam_snapshot()
+    ssh_config = Path("/etc/ssh/sshd_config")
+    original_ssh = ssh_config.read_bytes()
+    grant = Path("/etc/sudoers.d") / f"90-vhm-admin-{username}"
+    require(not grant.exists(), "sudo authorization existed before [7]")
+
+    root, _prompts = profile_login(credentials, "root", "key")
+    require(root is not None, "root SSH login failed before administrator workflows")
+    try:
+        with sudo_shell(root) as channel:
+            for answer in ("no", "yes"):
+                menu_action(channel, "/usr/local/bin/vhm test-create-user", username, 7)
+                require(not grant.exists(), "sudo authorization was written before confirmation")
+                channel.sendall(answer + "\n")
+                status = menu_done(channel, "sudo grant result")
+                if answer == "no":
+                    require(not grant.exists(), "cancelled sudo grant still wrote authorization")
+                else:
+                    require(status == 0 and grant.is_file(), "confirmed sudo grant did not write authorization")
+
+            info = grant.stat()
+            require((info.st_uid, info.st_gid, info.st_mode & 0o777) == (0, 0, 0o440), "sudo grant is not root-owned 0440")
+            quiet_run(["visudo", "--check"])
+            groups = subprocess.check_output(["id", "-Gn", "--", username], text=True, timeout=10).split()
+            require(groups == [username], "sudo grant changed account groups")
+            require(pam_snapshot() == pam and ssh_config.read_bytes() == original_ssh, "sudo grant changed PAM or SSH")
+            with password_shell(credentials, username) as ordinary:
+                refused = sudo_command(ordinary, credentials, username=username, noninteractive=True, invalidate=True)
+                require(refused.status != 0, "new sudo authorization did not require a password")
+                result = sudo_command(ordinary, credentials, username=username, invalidate=True)
+                require(result.status == 0 and result.ran_as_root and result.passwords > 0 and result.tokens == 0,
+                        "new authorization did not use existing sudo password policy: " + result.detail())
+            print("PASS access-auth sudo-grant")
+
+            root_switch_checks(credentials, channel, username, ssh_config, original_ssh, grant)
+    finally:
+        root.close()
+
+
+def root_phase(channel, phase):
+    match = wait_match(channel, ROOT_PHASE, f"root SSH switch {phase} prompt", timeout=20)
+    require(match.group(2).decode("ascii") == phase, "root SSH switch requested an unexpected verification phase")
+    return match.group(1).decode("ascii")
+
+
+def root_switch_verify(credentials, username, record, phase):
+    marker = record / f"access-verified-{phase}"
+    require(not marker.exists(), "root SSH verification was recorded before the new login")
+    time.sleep(0.05)
+    with password_shell(credentials, username) as ordinary:
+        command = f"/usr/local/bin/vhm access-verify {record.name} {phase}"
+        result = sudo_command(ordinary, credentials, username=username, command=command, invalidate=True)
+        require(result.status == 0 and result.passwords > 0 and result.tokens == 0 and marker.is_file(),
+                f"root SSH switch {phase} failed real sudo verification: " + result.detail())
+
+
+def root_switch_checks(credentials, control, username, ssh_config, original_ssh, grant):
+    changes = Path(credentials["work"]) / "state" / "changes"
+    original_pam = pam_snapshot()
+    original_grant = grant.read_bytes()
+    for scenario, seconds in (("unverified", 90), ("timeout", 20), ("confirmed", 90)):
+        menu_action(control, f"/usr/local/bin/vhm test-root-switch {seconds}", username, 8)
+        control.sendall("yes\n")
+        change = root_phase(control, "login")
+        record = changes / change
+        legacy_login(credentials, "root", True)
+        if scenario != "unverified":
+            root_switch_verify(credentials, username, record, "login")
+        control.sendall("yes\n")
+
+        if scenario != "unverified":
+            require(root_phase(control, "final") == change, "root SSH switch changed transaction between phases")
+            require(pam_snapshot() == original_pam and grant.read_bytes() == original_grant,
+                    "root SSH switch changed PAM or sudo policy during the transition")
+            legacy_login(credentials, "root", False)
+            legacy_login(credentials, "root", False, password=True)
+            if scenario == "confirmed":
+                root_switch_verify(credentials, username, record, "final")
+                control.sendall("yes\n")
+
+        status = menu_done(control, f"root SSH switch {scenario} result", timeout=seconds + 15)
+        if scenario == "confirmed":
+            require(status == 0 and (record / "status").read_text().strip() == "confirmed",
+                    "root SSH switch was not saved after both verifications")
+            legacy_login(credentials, "root", False)
+            control.sendall(f"/usr/local/bin/vhm test-root-rollback {change}; printf '\\nVHM_MENU_DONE:%s\\n' \"$?\"\n")
+            require(menu_done(control, "root SSH switch cleanup") == 0, "confirmed root SSH switch could not be rolled back")
+        require((record / "status").read_text().strip() == "rolled_back" and ssh_config.read_bytes() == original_ssh,
+                f"root SSH switch {scenario} did not restore configuration")
+        require(pam_snapshot() == original_pam and grant.read_bytes() == original_grant,
+                "root SSH rollback changed PAM or sudo policy")
+        legacy_login(credentials, "root", True)
+        print(f"PASS access-auth root-switch-{scenario}")
 
 
 def boot_ticks():
@@ -501,6 +714,12 @@ def check(arguments):
         legacy_login(credentials, "root", True, password=True)
         legacy_login(credentials, credentials["other"], True)
         original_sudo_check(credentials, credentials["user"])
+    elif arguments.stage == "login-identity":
+        with report_step(arguments.stage):
+            ssh_login_checks(credentials)
+    elif arguments.stage == "create-user":
+        with report_step(arguments.stage):
+            create_user_checks(credentials)
     elif arguments.stage == "stage-one":
         legacy_login(credentials, "root", True)
         legacy_login(credentials, "root", True, password=True)
@@ -539,14 +758,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "stage",
-        choices=("fixture", "baseline", "stage-one", "stage-two", "verify-login", "verify-final", "rollback", "profiles", "profiles-updated"),
+        choices=("fixture", "baseline", "login-identity", "create-user", "stage-one", "stage-two", "verify-login", "verify-final", "rollback", "profiles", "profiles-updated"),
     )
     parser.add_argument("work")
     parser.add_argument("--key-file")
     parser.add_argument("--seed-file")
     parser.add_argument("--change")
     arguments = parser.parse_args()
-    require(os.geteuid() == 0 and Path("/.dockerenv").exists(), "run only in a disposable Docker container")
+    require(os.geteuid() == 0 and Path("/.dockerenv").exists() and os.environ.get("VHM_ACCESS_INTEGRATION") == "1",
+            "run only in a disposable Docker container with VHM_ACCESS_INTEGRATION=1")
     if arguments.stage == "fixture":
         fixture(arguments)
     else:

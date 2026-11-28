@@ -84,6 +84,26 @@ change_rollback "$old_ssh_id" >/dev/null 2>&1 && { echo 'FAIL 较新的认证变
 change_rollback "$new_ssh_id" >/dev/null && change_rollback "$old_ssh_id" >/dev/null || { echo 'FAIL 未允许按顺序回滚 SSH 变更'; fail=1; }
 [[ $(<"$SSHD_CONFIG") == 'original ssh' && $(<"$PAM_SSHD") == 'original pam' && ! -e $ACCESS_STATE ]] || { echo 'FAIL 按顺序回滚未恢复原认证配置'; fail=1; }
 
+# Closing root SSH can depend on a sudo grant without copying or rewriting its file.
+SUDOERS_DIR="$T/sudoers.d"
+mkdir "$SUDOERS_DIR"
+grant="$SUDOERS_DIR/90-vhm-admin-alice"
+change_begin '授予 alice sudo' >/dev/null
+grant_id=$CHG_ID
+change_track "$grant"
+printf 'alice ALL=(ALL:ALL) PASSWD: ALL\n' >"$grant"
+change_status applied
+change_begin '验证 alice 后关闭 root SSH' sshd >/dev/null
+root_close_id=$CHG_ID
+change_track "$SSHD_CONFIG"
+printf '%s\n' "$grant" >"$CHG_DIR/admin-required"
+printf 'PermitRootLogin no\n' >"$SSHD_CONFIG"
+change_status confirmed
+change_rollback "$grant_id" >"$T/overlap-output" 2>&1 && { echo 'FAIL 允许先撤销唯一的 sudo 授权'; fail=1; }
+[[ -f $grant ]] && grep -Fq "$root_close_id" "$T/overlap-output" || { echo 'FAIL 未保护或解释 sudo 授权依赖'; fail=1; }
+change_rollback "$root_close_id" >/dev/null && [[ -f $grant && $(<"$SSHD_CONFIG") == 'original ssh' ]] &&
+  change_rollback "$grant_id" >/dev/null && [[ ! -e $grant ]] || { echo 'FAIL 未恢复 SSH 后单独撤销 sudo'; fail=1; }
+
 # Non-SSH history retains the previous manual overlap behavior.
 printf 'original\n' >"$T/firewall.conf"
 change_begin '旧防火墙变更' >/dev/null

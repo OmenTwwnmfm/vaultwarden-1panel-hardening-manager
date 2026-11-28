@@ -125,7 +125,7 @@ def read_state():
     if root_policy not in ('', *ROOT_POLICIES):
         refuse('受管 root 登录开关无效')
     profiles = data['profiles']
-    if not isinstance(profiles, dict) or not profiles or len(profiles) > 64:
+    if not isinstance(profiles, dict) or len(profiles) > 64 or (not profiles and root_policy != 'no'):
         refuse('SSH profile 用户数量无效（最多 64 个）')
     for name, entry in profiles.items():
         if (not valid_user(name) or not isinstance(entry, dict) or
@@ -222,7 +222,7 @@ def split_managed(content, begin, end):
 def check_ssh(profiles, root_policy):
     original = text(checked(ssh_config))
     base, block = split_managed(original, BEGIN_SSH, END_SSH)
-    if profiles:
+    if profiles or root_policy:
         if block != render_ssh(profiles, root_policy) or not original.rstrip().endswith(END_SSH):
             refuse('SSH 受管 Match 块被修改或不在主配置尾部')
     elif block:
@@ -317,6 +317,13 @@ def atomic_write(value, content, permissions):
         if os.path.exists(temporary):
             os.unlink(temporary)
 
+def ensure_state_parent():
+    # change_begin 通常已创建 VH_STATE；不修改既有目录权限。
+    state_parent = Path(state_file).parent
+    if not state_parent.exists():
+        state_parent.mkdir(mode=0o700, parents=True)
+    checked(state_file, missing=True, private=True)
+
 def write_ssh_state(base, profiles, root_policy):
     state = {'version': 1, 'profiles': profiles}
     if root_policy:
@@ -326,6 +333,17 @@ def write_ssh_state(base, profiles, root_policy):
 
 try:
     profiles, root_policy = read_state()
+    if operation == 'root-policy':
+        if not root_policy:
+            sys.exit(1)
+        print(root_policy)
+        sys.exit(0)
+    if operation in ('root-check', 'root-apply'):
+        ssh_base = check_ssh(profiles, root_policy)
+        if operation == 'root-apply' and root_policy != 'no':
+            ensure_state_parent()
+            write_ssh_state(ssh_base, profiles, 'no')
+        sys.exit(0)
     if operation == 'get':
         if user in profiles:
             print(profiles[user]['mode'])
@@ -351,7 +369,7 @@ try:
                 requested_root_policy != ('prohibit-password' if mode == 'key' else 'yes')):
             refuse('仅能在明确配置 root 登录方式时设置对应的 root 登录开关')
         if root_policy == 'no':
-            refuse('普通管理员方案已经关闭 root SSH；请先回滚原迁移')
+            refuse('本工具已关闭 root SSH；请先回滚关闭 root SSH 的变更')
     profile_path(user)
     ssh_base = check_ssh(profiles, root_policy)
     retained, insertion, old_auth = check_pam(profiles)
@@ -388,11 +406,7 @@ try:
         checked(pam_legacy, missing=True)
     if target.exists() and user not in profiles:
         refuse('已有同名每用户 PAM 文件，拒绝覆盖')
-    state_parent = Path(state_file).parent
-    if not state_parent.exists():
-        # 调用方通常已由 change_begin 创建 VH_STATE；不调整既有系统目录权限。
-        state_parent.mkdir(mode=0o700, parents=True)
-    checked(state_file, missing=True)
+    ensure_state_parent()
     if not profiles:
         atomic_write(pam_legacy, HEADER + '\n'.join(old_auth) + '\n', 0o644)
     atomic_write(target, render_helper(updated[user]), 0o644)
@@ -421,6 +435,14 @@ access_profile_track() {
 access_profile_apply() { _access_profile_policy apply "$1" "$2" "${3:-}" "${4:-}" "${5:-}"; }
 access_profile_disable_root() { _access_profile_policy disable-root "$1" key_password_totp; }
 access_profile_verify() { _access_profile_policy verify "$1" "$2" "${3:-}" "${4:-}"; }
+
+access_root_policy() { _access_profile_policy root-policy; }
+access_root_preflight() {
+  sshd_test >/dev/null || { log_err "现有 SSH 配置未通过 sshd -t"; return 1; }
+  _access_profile_policy root-check
+}
+access_root_track() { change_track "$SSHD_CONFIG" && change_track "$(access_profile_state)"; }
+access_root_apply() { _access_profile_policy root-apply; }
 
 access_profile_expect() { # 真实 sshd -T -C 验收，不允许退回全局显示结果
   local user=$1 mode=$2 key=${3:-} method password=no pubkey=no kbd=no addr eff actual setting expected

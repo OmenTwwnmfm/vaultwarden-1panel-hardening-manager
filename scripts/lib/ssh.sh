@@ -11,6 +11,61 @@ access_user() {
 }
 access_active() { [[ -n $(access_user) ]]; }
 
+# 显示原始 SSH 登录账户；sudo/su 后仍沿用实际连接进程的身份，不读取登录环境变量。
+ssh_login_user() { _ssh_login_identity; }
+
+_ssh_login_identity() { # [预期用户名 UID]；传入时返回 sshd-pid:start-ticks
+  python3 - "$@" 2>/dev/null <<'PY'
+import os
+import pwd
+import re
+import stat
+import sys
+
+title = re.compile(rb'(sshd(?:-session)?): ([A-Za-z0-9_][A-Za-z0-9_.-]{0,63}\$?)(?:@(?:notty|pts/[0-9]+(?:,pts/[0-9]+)*))?')
+expected = sys.argv[1:]
+pid = os.getppid()
+seen = set()
+while pid > 1 and pid not in seen and len(seen) < 128:
+    seen.add(pid)
+    path = f'/proc/{pid}'
+    try:
+        with open(path + '/status', encoding='ascii', errors='replace') as stream:
+            status = dict(line.split(':', 1) for line in stream if ':' in line)
+        pid = int(status['PPid'])
+        executable = re.sub(r' \(deleted\)$', '', os.path.basename(os.readlink(path + '/exe')))
+        if executable not in ('sshd', 'sshd-session'):
+            continue
+        binary = os.stat(path + '/exe')
+        if not stat.S_ISREG(binary.st_mode) or binary.st_uid != 0 or binary.st_mode & 0o022:
+            continue
+        with open(path + '/cmdline', 'rb') as stream:
+            command, separator, _ = stream.read(2048).partition(b'\0')
+        match = title.fullmatch(command.rstrip(b' ')) if separator else None
+        if not match:
+            continue
+        program, username = (value.decode('ascii') for value in match.groups())
+        if program != executable:
+            continue
+        real_uid, effective_uid = map(int, status['Uid'].split()[:2])
+        account = pwd.getpwnam(username)
+        if account.pw_name != username or account.pw_uid != real_uid or real_uid != effective_uid:
+            continue
+        if expected:
+            if expected != [username, str(real_uid)]:
+                sys.exit(1)
+            with open(path + '/stat', encoding='ascii', errors='replace') as stream:
+                started = stream.read().rsplit(')', 1)[1].split()[19]
+            print(f'{path.rsplit("/", 1)[1]}:{int(started)}')
+        else:
+            print(username)
+        sys.exit(0)
+    except (OSError, IndexError, KeyError, ValueError):
+        continue
+sys.exit(1)
+PY
+}
+
 # 变更验收必须按指定用户和真实连接上下文核对；失败不能退回无 Match 上下文的 -T。
 sshd_eff_for() { # sshd_eff_for 用户 [来源地址]
   local user=$1 addr=${2:-} local_addr local_port out
@@ -129,7 +184,7 @@ ssh_pam_auth_file() {
   user=$(access_user) || user=root
   if access_profile_get "$user" >/dev/null 2>&1; then
     access_profile_pam "$user"
-  elif [[ -f $(access_profile_state) ]]; then
+  elif [[ -f $(access_profile_state) && -f $PAM_ACCESS_LEGACY ]]; then
     printf '%s\n' "$PAM_ACCESS_LEGACY"
   else
     printf '%s\n' "$PAM_SSHD"

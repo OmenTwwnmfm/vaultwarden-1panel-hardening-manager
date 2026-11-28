@@ -58,7 +58,7 @@ vhm $VH_VERSION — Vaultwarden Hardening Manager
   vw-users             Vaultwarden 用户列表（只读）
   changes              列出变更记录
   rollback <变更ID>    回滚一条变更
-  access-verify <ID> <阶段>  按 [06] 迁移向导验证新的普通用户 SSH / sudo 会话
+  access-verify <ID> <阶段>  按 [06] 向导验证新的普通用户 SSH / sudo 会话
   diagnose             脱敏诊断报告
   deps                 依赖检查
   version              显示版本

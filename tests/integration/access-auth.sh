@@ -36,7 +36,7 @@ trap 'cleanup "$?"' EXIT
 export VH_STATE="$work/state" VH_CHANGES="$work/state/changes" VH_LOG=/dev/null
 export VH_LOCK="$work/lock" VH_CONF="$work/hardening.conf"
 export SSHD_CONFIG=/etc/ssh/sshd_config PAM_SSHD=/etc/pam.d/sshd
-unset SSH_CONNECTION SSH_CLIENT
+unset SSH_CONNECTION SSH_CLIENT SSH_TTY
 
 useradd --create-home --shell /bin/bash --groups sudo vhmaccess
 useradd --create-home --shell /bin/bash --groups sudo vhmlegacy
@@ -51,9 +51,66 @@ cat >/usr/local/bin/vhm <<EOF
 #!/bin/bash
 export VH_STATE='$VH_STATE' VH_CHANGES='$VH_CHANGES' VH_LOG=/dev/null
 export VH_LOCK='$VH_LOCK' VH_CONF='$VH_CONF'
+case \${1:-} in
+  test-ssh-login)
+    unset SSH_CONNECTION SSH_CLIENT SSH_TTY
+    exec bash -c '
+      source "\$1"
+      ((EUID == 0)) || exit 2
+      menu=\$(render_menu)
+      grep -Eq "^│ +当前 SSH 登录用户：\$2 +│\$" <<<"\$menu"
+    ' test-ssh-login '$work/project/scripts/vh-manager.sh' "\${2:-}"
+    ;;
+  test-create-user)
+    exec bash '$work/project/scripts/vh-access.sh' auth-menu
+    ;;
+  test-root-switch|test-root-rollback)
+    exec bash '$work/root-switch-fixture.sh' "\$@"
+    ;;
+esac
 exec bash '$work/project/scripts/vh-launcher.sh' "\$@"
 EOF
 chmod 755 /usr/local/bin/vhm
+cat >"$work/root-switch-fixture.sh" <<'EOF'
+#!/bin/bash
+set -Eeuo pipefail
+work=$(dirname "${BASH_SOURCE[0]}")
+source "$work/project/scripts/vh-access.sh"
+
+# Only systemd is substituted. The menu, deadlines, verification and rollback are real.
+guard_start() { : >"$CHG_DIR/guard"; }
+guard_stop() { :; }
+ssh_reload() {
+  sshd_test >/dev/null || return 1
+  python3 - "$work" <<'PY'
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+work = Path(sys.argv[1])
+with (work / "sshd.log").open("rb") as log:
+    log.seek(0, os.SEEK_END)
+    os.kill(int((work / "sshd-master.pid").read_text()), signal.SIGHUP)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if b"Server listening on 127.0.0.1 port 2222" in log.readline():
+            sys.exit(0)
+        time.sleep(0.05)
+sys.exit("FAIL access-auth: SSH listener did not reload")
+PY
+}
+
+need_root
+case $1 in
+  test-root-switch)
+    GUARD_SECONDS=$2
+    with_lock access_auth_menu
+    ;;
+  test-root-rollback) with_lock change_rollback "$2" ;;
+esac
+EOF
 ssh-keygen -q -t ed25519 -N '' -f "$work/hostkey"
 cat >"$SSHD_CONFIG" <<EOF
 Port 2222
@@ -91,6 +148,7 @@ start_sshd() {
   /usr/sbin/sshd -t -f "$SSHD_CONFIG"
   /usr/sbin/sshd -D -e -f "$SSHD_CONFIG" 2>"$work/sshd.log" &
   sshd_pid=$!
+  printf '%s\n' "$sshd_pid" >"$work/sshd-master.pid"
   python3 - <<'PY'
 import socket
 import time
@@ -133,6 +191,10 @@ expect_inert_dropin
 access_expect_for root 127.0.0.1 permitrootlogin yes
 start_sshd
 python3 tests/integration/access-auth.py baseline "$work"
+stage='login-identity'
+python3 tests/integration/access-auth.py "$stage" "$work"
+stage='create-user'
+python3 tests/integration/access-auth.py "$stage" "$work"
 stage='stage-one'
 change_begin 'Integration access configuration'
 record=$CHG_DIR

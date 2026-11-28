@@ -86,6 +86,42 @@ apply bob key
 awk '$1 == "Match" { user = $3 } $1 == "PermitRootLogin" && user == "root" && $2 == "no" { found = 1 } END { exit !found }' "$SSHD_CONFIG" || fail 'ordinary profile reopened disabled root SSH'
 access_profile_apply root key "$work/keys/root" '' prohibit-password >"$work/output" 2>&1 && fail 'root reopened without rolling back administrator migration'
 
+fixture standalone-root
+printf 'Port 2222\nPermitRootLogin yes\nSubsystem sftp internal-sftp\n' >"$SSHD_CONFIG"
+cp "$SSHD_CONFIG" "$work/sshd-before"
+PAM_SSHD="$work/missing-pam" PAM_COMMON_AUTH="$work/missing-common-auth"
+VH_CHANGES="$work/state/changes"
+access_root_preflight || fail 'standalone root preflight required PAM'
+[[ ! -e $ACCESS_PROFILES_STATE ]] || fail 'standalone root preflight wrote state'
+change_begin 'Standalone root gate' sshd >/dev/null
+access_root_track || fail 'standalone root snapshot'
+[[ $(awk -F '\t' '{print $5}' "$CHG_DIR/files.tsv") == "$SSHD_CONFIG"$'\n'"$ACCESS_PROFILES_STATE" ]] || fail 'standalone root gate tracked unrelated files'
+access_root_apply || fail 'standalone root gate with no profiles or PAM'
+[[ $(access_root_policy) == no && -z $(access_profile_list) ]] || fail 'standalone root gate metadata'
+grep -Fxq 'PermitRootLogin yes' "$SSHD_CONFIG" || fail 'standalone root gate changed the global policy'
+grep -Eq '^[[:space:]]+PermitRootLogin no$' "$SSHD_CONFIG" || fail 'standalone root gate did not disable root SSH'
+[[ ! -e $PAM_SSHD && ! -e $PAM_ACCESS_LEGACY ]] || fail 'standalone root gate wrote PAM'
+access_root_preflight && access_root_apply || fail 'existing standalone gate could not be rechecked'
+change_restore_files "$CHG_DIR" || fail 'standalone root rollback'
+cmp -s "$SSHD_CONFIG" "$work/sshd-before" && [[ ! -e $ACCESS_PROFILES_STATE ]] || fail 'standalone root rollback did not restore the initial state'
+
+fixture root-then-profile
+cp "$PAM_SSHD" "$work/pam-before"
+access_root_preflight && access_root_apply || fail 'standalone root gate before first profile'
+cmp -s "$PAM_SSHD" "$work/pam-before" || fail 'standalone root gate changed existing PAM'
+apply alice password_totp
+[[ $(access_root_policy) == no && $(access_profile_get alice) == password_totp ]] || fail 'first profile lost standalone root gate'
+access_profile_apply root password '' '' yes >"$work/output" 2>&1 && fail 'root mode re-enabled standalone root gate'
+
+fixture profile-then-root
+access_profile_apply root key "$work/keys/root" '' prohibit-password || fail 'configure root before standalone gate'
+apply bob key
+cp "$PAM_SSHD" "$work/pam-before"
+cp "$(access_profile_pam bob)" "$work/bob-before"
+access_root_preflight && access_root_apply || fail 'standalone root gate with existing profiles'
+[[ $(access_root_policy) == no && $(access_profile_get root) == key && $(access_profile_get bob) == key ]] || fail 'standalone gate overwrote profiles'
+cmp -s "$PAM_SSHD" "$work/pam-before" && cmp -s "$(access_profile_pam bob)" "$work/bob-before" || fail 'standalone root gate rewrote profile PAM'
+
 fixture coexist
 apply root key_totp
 apply alice password_totp
@@ -202,6 +238,8 @@ fixture unmanaged-match
 printf 'Include %s/nested.conf\n' "$work" >"$work/sshd_config.d/local.conf"
 printf 'Match User bob\n  PasswordAuthentication yes\n' >"$work/nested.conf"
 access_profile_preflight alice key >"$work/output" 2>&1 && fail 'unmanaged recursive Match accepted'
+access_root_preflight >"$work/output" 2>&1 && fail 'standalone root preflight accepted unmanaged recursive Match'
+access_root_apply >"$work/output" 2>&1 && fail 'standalone root apply accepted unmanaged recursive Match'
 
 fixture unsafe-pam
 printf 'Auth sufficient pam_permit.so\n' >>"$PAM_SSHD"

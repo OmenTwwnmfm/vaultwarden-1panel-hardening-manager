@@ -104,7 +104,12 @@ auto_update_source() { # 每次启动菜单时按 AUTO_UPDATE 检查一次
 
 # 状态面板：每项都容错，读不到就显示「未知」
 status_args() {
-  local port tfa pa pk f2b vw="未识别" panel="未安装"
+  local port tfa pa pk f2b login_user vw="未识别" panel="未安装"
+  if ! login_user=$(ssh_login_user); then
+    login_user="未识别"
+  elif [[ $login_user != root ]]; then
+    login_user="普通用户 $login_user"
+  fi
   port=$(sshd_get port 2>/dev/null | paste -sd, -)
   if tfa_enabled 2>/dev/null; then
     tfa="已启用"
@@ -141,7 +146,8 @@ status_args() {
     esac
     vw="$sig · $adm"
   fi
-  printf '%s\n' "$VH_VERSION" "SSH 端口：${port:-未知} · 密码登录：$pa · 密钥登录：$pk · 2FA：$tfa" \
+  printf '%s\n' "$VH_VERSION" "当前 SSH 登录用户：$login_user" \
+    "SSH 端口：${port:-未知} · 密码登录：$pa · 密钥登录：$pk · 2FA：$tfa" \
     "1Panel：$panel · 防火墙：$(fw_label)" "Fail2Ban：$f2b · Vaultwarden：$vw"
 }
 
@@ -190,7 +196,7 @@ sections = [
         "[03] SSH 状态（端口、登录方式、2FA、当前会话）",
         "[04] 管理登录密钥（列出 / 添加 / 删除）",
         "[05] 修改 SSH 端口",
-        "[06] SSH 登录方式（按用户选择：密码、密钥及 TOTP 组合）",
+        "[06] SSH 登录方式（账号、认证、sudo 与 root SSH）",
         "[07] 2FA 管理（二维码 / 重新绑定 / 应急码 / 关闭）",
         "[08] 登录记录（成功、失败、来源 IP）"]),
     ("03 · 1Panel 面板", [

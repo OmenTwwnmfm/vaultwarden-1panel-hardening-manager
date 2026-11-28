@@ -20,16 +20,26 @@ passwd() { printf 'admin %s 2026-11-28 0 99999 7 -1\n' "${FIXTURE_PASSWORD_STATU
 id() {
   if [[ $1 == -nG && $2 == admin ]]; then printf '%s\n' "${FIXTURE_GROUPS:-admin sudo}"; else command id "$@"; fi
 }
-sudo() { printf "Sudoers path: %s\nAuthentication methods: '%s'\n" "$SUDOERS_MAIN" "${FIXTURE_AUTH_METHOD:-pam}"; }
+sudo() {
+  case "$*" in
+    -V) printf "Sudoers path: %s\nAuthentication methods: '%s'\n" "$SUDOERS_MAIN" "${FIXTURE_AUTH_METHOD:-pam}" ;;
+    '-n -l -U admin') [[ ${FIXTURE_SUDO_PRESENT:-0} == 1 || -f $grant_rule ]] ;;
+    '-n -l -U admin -u root -- /usr/bin/id') [[ ${FIXTURE_SUDO_VERIFY_FAIL:-0} == 0 && -f $grant_rule ]] ;;
+    *) return 1 ;;
+  esac
+}
 visudo() {
   printf '%s\n' "$*" >>"$T/visudo-calls"
   [[ ${FIXTURE_VISUDO_FAIL:-0} == 0 ]] || return 1
-  [[ ${FIXTURE_VISUDO_FAIL_AFTER_WRITE:-0} != 1 || ! -f $SUDOERS_ACCESS ]]
+  [[ ${FIXTURE_VISUDO_FAIL_AFTER_WRITE:-0} != 1 || ! -f $SUDOERS_ACCESS ]] || return 1
+  [[ ${FIXTURE_GRANT_SYNTAX_FAIL:-0} != 1 || $3 != "$SUDOERS_DIR"/.vhm-admin.* ]] || return 1
+  [[ ${FIXTURE_GRANT_CONFIG_FAIL:-0} != 1 || $3 != "$SUDOERS_MAIN" || ! -f $grant_rule ]]
 }
 change_track() { printf '%s\n' "$1" >>"$T/tracked"; }
+grant_rule="$SUDOERS_DIR/90-vhm-admin-admin"
 
 reset_fixture() {
-  rm -rf -- "$T/pam.d" "$SUDOERS_DIR" "$T/private" "$SUDOERS_MAIN" "$T/extra" "$T/link" "$T/visudo-calls" "$T/tracked"
+  rm -rf -- "$T/pam.d" "$SUDOERS_DIR" "$T/private" "$SUDOERS_MAIN" "$T/extra" "$T/link" "$T/visudo-calls" "$T/tracked" "$T/record"
   mkdir -p "$T/pam.d" "$SUDOERS_DIR" "$T/private/admin" || exit 1
   chmod 700 "$T/private" "$T/private/admin" || exit 1
   printf 'admin:x:1000:1000:Administrator:/home/admin:/bin/bash\n' >"$ACCESS_PASSWD_FILE"
@@ -55,6 +65,8 @@ auth include sudo
 account include sudo
 session include sudo
 EOF
+  printf 'account required pam_unix.so\n' >"$T/pam.d/common-account"
+  printf 'session required pam_unix.so\n' >"$T/pam.d/common-session-noninteractive"
   printf 'Defaults env_reset\nDefaults mail_badpass\nDefaults secure_path="/usr/sbin:/usr/bin:/sbin:/bin"\nDefaults use_pty\nroot ALL=(ALL:ALL) ALL\n%%sudo ALL=(ALL:ALL) ALL\n@includedir %s\n' "$SUDOERS_DIR" >"$SUDOERS_MAIN"
   chmod 440 "$SUDOERS_MAIN"
   python3 - <<'PY' >"$T/private/admin/totp"
@@ -66,6 +78,7 @@ print('" TOTP_AUTH')
 PY
   chmod 600 "$T/private/admin/totp"
   unset FIXTURE_PASSWORD_STATUS FIXTURE_GROUPS FIXTURE_AUTH_METHOD FIXTURE_VISUDO_FAIL FIXTURE_VISUDO_FAIL_AFTER_WRITE
+  unset FIXTURE_SUDO_PRESENT FIXTURE_SUDO_VERIFY_FAIL FIXTURE_GRANT_SYNTAX_FAIL FIXTURE_GRANT_CONFIG_FAIL
 }
 
 expect_refused() {
@@ -187,6 +200,71 @@ done
 reset_fixture
 FIXTURE_VISUDO_FAIL_AFTER_WRITE=1
 access_sudo_apply admin "$T/private/admin/totp" >"$T/output" 2>&1 && { echo "FAIL 忽略了修改后完整 sudoers 验证错误"; fail=1; }
+
+# 使用真实确认提示和策略解析器，模拟 sudo 与变更记录的系统操作。
+export VH_LOG=/dev/null C_B='' C_G='' C_R='' C_Y='' C_0='' VH_ASSUME_YES=1
+# shellcheck source=scripts/lib/base.sh
+source scripts/lib/base.sh
+chown() { [[ $1 == root:root && $2 == "$SUDOERS_DIR"/.vhm-admin.* ]]; }
+change_begin() { CHG_ID=grant-fixture; printf 'pending\n' >"$T/record"; }
+change_status() { printf '%s\n' "$1" >"$T/record"; }
+change_rollback() {
+  [[ $1 == grant-fixture && $(cat "$T/tracked") == "$grant_rule" ]] || return 1
+  rm -f -- "$grant_rule" && change_status rolled_back
+}
+reset_grant_fixture() { reset_fixture; FIXTURE_GROUPS='admin'; }
+grant_call() { access_grant_sudo admin >"$T/output" 2>&1; }
+assert_no_grant_write() {
+  [[ ! -e $grant_rule && ! -e $T/tracked && ! -e $T/record ]] || { echo "FAIL $1 写入了授权或变更记录"; fail=1; }
+}
+
+reset_grant_fixture
+grant_call <<<no || { echo 'FAIL 取消授权没有正常结束'; fail=1; }
+grep -Fq '以 root 身份执行任意命令' "$T/output" || { echo 'FAIL 未解释授权等同完整管理权'; fail=1; }
+assert_no_grant_write '手动取消'
+grant_call </dev/null || { echo 'FAIL EOF 没有正常取消授权'; fail=1; }
+assert_no_grant_write '未明确确认'
+
+reset_grant_fixture
+FIXTURE_SUDO_PRESENT=1
+grant_call <<<yes || { echo 'FAIL 已授权用户未正常跳过'; fail=1; }
+grep -Fq '已有 sudo 授权' "$T/output" || { echo 'FAIL 未解释现有授权'; fail=1; }
+assert_no_grant_write '已有授权'
+
+reset_grant_fixture
+printf 'admin ALL=(ALL:ALL) NOPASSWD: ALL\n' >"$SUDOERS_DIR/custom-admin"
+grant_call <<<yes && { echo 'FAIL 免密策略允许叠加授权'; fail=1; }
+assert_no_grant_write '免密策略'
+reset_grant_fixture
+printf 'auth sufficient pam_permit.so\n' >>"$T/pam.d/common-account"
+grant_call <<<yes && { echo 'FAIL 拒绝检查账户 include 中的认证旁路'; fail=1; }
+assert_no_grant_write '自定义 PAM'
+
+reset_grant_fixture
+FIXTURE_GRANT_SYNTAX_FAIL=1
+grant_call <<<yes && { echo 'FAIL 候选 visudo 错误时未拒绝'; fail=1; }
+assert_no_grant_write '候选语法错误'
+for failure in config effective; do
+  reset_grant_fixture
+  if [[ $failure == config ]]; then FIXTURE_GRANT_CONFIG_FAIL=1; else FIXTURE_SUDO_VERIFY_FAIL=1; fi
+  grant_call <<<yes && { echo "FAIL $failure 核验失败仍报告成功"; fail=1; }
+  [[ ! -e $grant_rule && $(cat "$T/record") == rolled_back ]] || { echo "FAIL $failure 核验失败未回滚"; fail=1; }
+done
+
+reset_grant_fixture
+cp "$PAM_SUDO" "$T/grant-pam-before"
+cp "$PAM_SUDO_I" "$T/grant-pam-i-before"
+cp "$SUDOERS_MAIN" "$T/grant-sudoers-before"
+grant_call <<<yes || { echo 'FAIL 明确确认后未能授予 sudo'; cat "$T/output"; fail=1; }
+grep -Fxq 'admin ALL=(ALL:ALL) PASSWD: ALL' "$grant_rule" || { echo 'FAIL 授权规则不是账户密码保护的完整权限'; fail=1; }
+[[ $(stat -c '%a' "$grant_rule") == 440 && $(cat "$T/tracked") == "$grant_rule" && $(cat "$T/record") == applied ]] || {
+  echo 'FAIL 未用独立 0440 文件记录授予权限'; fail=1;
+}
+[[ ! -e $SUDOERS_ACCESS && ! -e $PAM_ACCESS_SUDO ]] && cmp -s "$PAM_SUDO" "$T/grant-pam-before" &&
+  cmp -s "$PAM_SUDO_I" "$T/grant-pam-i-before" && cmp -s "$SUDOERS_MAIN" "$T/grant-sudoers-before" || {
+  echo 'FAIL 显式授权改动了其他用户策略或 PAM'; fail=1;
+}
+access_sudo_preflight admin >"$T/output" 2>&1 || { echo 'FAIL 新授权不能用于已有的 TOTP 迁移'; cat "$T/output"; fail=1; }
 
 ((fail == 0)) && echo 'PASS access-sudo'
 exit "$fail"

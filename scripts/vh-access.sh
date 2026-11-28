@@ -1,22 +1,34 @@
 #!/usr/bin/env bash
-# 可选的普通用户 SSH 三项验证与 sudo 双项验证迁移。只操作已有管理员，不创建或扩权账户。
+# 按用户配置 SSH；可创建普通账户。三项验证和 sudo 迁移只接受已有管理员。
 set -Euo pipefail
 VH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=scripts/vh-ssh.sh
 source "$VH_DIR/vh-ssh.sh"
 
 ACCESS_PASSWD_FILE=${ACCESS_PASSWD_FILE:-/etc/passwd}
+ACCESS_SHELLS_FILE=${ACCESS_SHELLS_FILE:-/etc/shells}
 
-access_set_user() {
-  local user=$1 entry resolved uid gid home shell
-  [[ $user =~ ^[a-z_][a-z0-9_-]{0,31}$ && $user != root ]] || { log_err "请选择普通本地用户（不支持 root）"; return 1; }
-  entry=$(awk -F: -v u="$user" '$1 == u { print }' "$ACCESS_PASSWD_FILE") || return 1
-  resolved=$(getent passwd "$user") || return 1
-  [[ -n $entry && $entry == "$resolved" && $entry != *$'\n'* ]] || { log_err "用户必须来自本地 passwd 数据库"; return 1; }
+access_user_name_ok() { [[ $1 =~ ^[a-z_][a-z0-9_-]{0,31}$ && $1 != root ]]; }
+access_login_shell_ok() {
+  [[ $1 == /* && -x $1 && $1 != */nologin && $1 != */false ]] && grep -Fxq -- "$1" "$ACCESS_SHELLS_FILE"
+}
+
+access_set_user() { # 仅本地和 NSS 都确认不存在时返回 2
+  local user=$1 entry resolved rc uid gid home shell
+  access_user_name_ok "$user" || { log_err '用户名须以小写字母或下划线开头，最多 32 个小写字母、数字、下划线或短横线；root 请单独选择'; return 1; }
+  entry=$(awk -F: -v u="$user" '$1 == u { print }' "$ACCESS_PASSWD_FILE") || { log_err '无法读取本地账户文件'; return 1; }
+  if resolved=$(getent passwd "$user"); then
+    [[ -n $entry && $entry == "$resolved" && $entry != *$'\n'* ]] || { log_err "$user 不是唯一可确认的本地账号"; return 1; }
+  else
+    rc=$?
+    if ((rc == 2)) && [[ -z $entry ]]; then log_warn "未找到用户 $user"; return 2; fi
+    log_err "无法通过系统账户数据库确认 $user"
+    return 1
+  fi
   IFS=: read -r _ _ uid gid _ home shell <<<"$entry"
-  [[ $uid =~ ^[0-9]+$ && $gid =~ ^[0-9]+$ && $uid -ge 1000 && $uid -lt 65534 && $home == /* ]] || { log_err "请选择 UID 1000–65533 的普通用户"; return 1; }
+  [[ $uid =~ ^[1-9][0-9]{3,4}$ && $gid =~ ^[0-9]+$ && $uid -lt 65534 && $home == /* ]] || { log_err "请选择 UID 1000–65533 的普通用户"; return 1; }
   awk -F: -v uid="$uid" '$3 == uid { n++ } END { exit n != 1 }' "$ACCESS_PASSWD_FILE" || { log_err '该 UID 对应多个账户，请先人工整理'; return 1; }
-  grep -Fxq -- "$shell" /etc/shells && [[ $shell != */nologin && $shell != */false ]] || { log_err "该用户没有可用的交互 shell"; return 1; }
+  access_login_shell_ok "$shell" || { log_err "$user 没有可用的交互 shell"; return 1; }
   ACCESS_USER=$user ACCESS_UID=$uid
   ACCESS_KEY_FILE="$ACCESS_KEYS_DIR/$user"
   ACCESS_GA_FILE="$ACCESS_SECRETS_DIR/$user/totp"
@@ -68,8 +80,12 @@ access_ssh_expect() {
 }
 
 access_disable_root() {
-  local user=$1 addr connection_text=${SSH_CONNECTION:-}
-  access_profile_disable_root "$user" && access_ssh_expect "$user" || return 1
+  local user=$1
+  access_profile_disable_root "$user" && access_ssh_expect "$user" && access_root_ssh_closed
+}
+
+access_root_ssh_closed() {
+  local addr connection_text=${SSH_CONNECTION:-}
   for addr in "${connection_text%% *}" 203.0.113.1 2001:db8::1; do
     [[ -n $addr ]] || continue
     access_expect_for root "$addr" permitrootlogin no || return 1
@@ -94,18 +110,84 @@ access_context() {
   fi
 }
 
+access_list_users() {
+  local user uid home shell users=()
+  [[ -r $ACCESS_PASSWD_FILE && -r $ACCESS_SHELLS_FILE ]] || return 0
+  while IFS=: read -r user _ uid _ _ home shell; do
+    access_user_name_ok "$user" && [[ $uid =~ ^[1-9][0-9]{3,4}$ && $uid -lt 65534 && $home == /* ]] &&
+      access_login_shell_ok "$shell" && users+=("$user")
+  done <"$ACCESS_PASSWD_FILE"
+  if ((${#users[@]})); then printf '  本机普通用户：%s\n' "${users[*]}"; else echo '  当前没有可选的本机普通用户'; fi
+}
+
+access_password_terminal() { [[ -t 0 ]]; }
+
+access_has_password() {
+  local status
+  status=$(LC_ALL=C passwd -S "$1" 2>/dev/null) || return 1
+  [[ $(awk '{print $1, $2}' <<<"$status") == "$1 P" ]]
+}
+
+access_create_user() { # 仅 [06] 在确认用户名不存在后调用
+  local user=$1 home="/home/$1" tool gid group_name groups
+  access_user_name_ok "$user" || return 1
+  for tool in useradd passwd id; do
+    command -v "$tool" >/dev/null 2>&1 || { log_err "缺少 $tool，无法创建用户"; return 1; }
+  done
+  if [[ -e $home || -L $home ]]; then
+    log_err "$home 已存在，请换一个用户名或在系统中人工核对后创建"
+    return 1
+  fi
+  access_safe_path "$home" && access_login_shell_ok /bin/bash || { log_err '用户主目录路径或 /bin/bash 不符合创建要求'; return 1; }
+  VH_ASSUME_YES=0 confirm_yes "创建本地普通用户 $user 并设置密码？不会授予 sudo；单独配置前，该账号沿用现有默认 SSH 规则。" || return 1
+  access_password_terminal || { log_err '创建用户需要交互终端，以便通过系统 passwd 安全设置密码'; return 1; }
+  if ! useradd --create-home --home-dir "$home" --user-group --shell /bin/bash -- "$user"; then
+    log_err "系统未确认创建 $user 成功；请运行 getent passwd $user 检查。向导未设置密码或更改 SSH 配置。"
+    return 1
+  fi
+  if ! { access_set_user "$user" && gid=$(id -g "$user") && group_name=$(id -gn "$user") && groups=$(id -G "$user") &&
+    [[ $gid =~ ^[1-9][0-9]*$ && $group_name == "$user" && $groups == "$gid" ]]; }; then
+    log_err "$user 已创建，但未通过普通账号或独立用户组校验。请人工核对；向导未设置密码或更改 SSH 配置。"
+    return 1
+  fi
+  if command -v sudo >/dev/null 2>&1 && LC_ALL=C sudo -n -l -U "$user" >/dev/null 2>&1; then
+    log_err "$user 已创建，但现有 sudo 规则允许该用户使用 sudo。请先人工核对授权；向导未设置密码或更改 SSH 配置。"
+    return 1
+  fi
+  log_info "请按系统提示为 $user 设置密码。"
+  if ! passwd "$user" || ! access_has_password "$user"; then
+    log_warn "$user 已创建，但未确认可用密码。请先运行 passwd $user 或在 [06] 选该用户后用 [5] 设置密码；SSH 配置未改动。"
+    return 1
+  fi
+  log_ok "已创建普通用户 $user。请选择该用户的 SSH 登录方式。"
+}
+
 access_choose_user() {
-  local choice user
+  local action=${1:-select} choice user rc
   echo '  [1] root    [2] 普通用户    [0] 返回' >&2
   read -r -p '选择要配置的用户类型: ' choice || return 1
   case $choice in
     1) printf 'root\n' ;;
     2)
-      read -r -p '已有普通用户的用户名: ' user || return 1
-      access_set_user "$user" >&2 || return 1
+      access_list_users >&2
+      if [[ $action == create ]]; then
+        read -r -p '普通用户名（不存在时可选择创建，回车返回）: ' user || return 1
+      else
+        read -r -p '已有普通用户名（回车返回）: ' user || return 1
+      fi
+      [[ -n $user ]] || return 1
+      rc=0
+      access_set_user "$user" >&2 || rc=$?
+      case $rc in
+        0) ;;
+        2) [[ $action == create ]] || { log_warn '此处只选择已有用户；可到 [06] 创建普通用户。' >&2; return 1; }
+           access_create_user "$user" >&2 || return 1 ;;
+        *) return 1 ;;
+      esac
       printf '%s\n' "$user"
       ;;
-    *) return 1 ;;
+    0 | '') return 1 ;;
+    *) log_warn '请选择 1、2 或 0' >&2; return 1 ;;
   esac
 }
 
@@ -120,7 +202,7 @@ access_read_public_key() {
 }
 
 access_profile_configure() (
-  local user=$1 mode=$2 path eff temp_dir newga="" keytmp="" password_status permit=""
+  local user=$1 mode=$2 path eff temp_dir newga="" keytmp="" permit=""
   access_context "$user" || return 1
   if access_active && { [[ $user == root ]] || [[ $user == "$(access_user)" ]]; }; then
     log_err '该账户属于已启用的普通管理员安全方案，请先在 [25] 回滚原迁移，再更换登录方式。'
@@ -131,8 +213,7 @@ access_profile_configure() (
   if [[ $mode == *_totp ]]; then ga_install || return 1; fi
   access_profile_preflight "$user" "$mode" || return 1
   if [[ $mode == password* ]]; then
-    password_status=$(LC_ALL=C passwd -S "$user" 2>/dev/null | awk '{print $2}')
-    [[ $password_status == P ]] || { log_err "$user 尚无可用账户密码，请先设置密码"; return 1; }
+    access_has_password "$user" || { log_err "$user 尚无可用账户密码，请先设置密码"; return 1; }
   fi
   temp_dir=$(mktemp -d) || return 1
   trap 'rm -rf -- "$temp_dir"' EXIT
@@ -150,6 +231,10 @@ access_profile_configure() (
   for path in "$ACCESS_KEY_FILE" "$ACCESS_GA_FILE"; do access_safe_path "$path" || return 1; done
   echo "只更改 $user 的 SSH 登录方式为：$(auth_mode_label "$mode")。其他用户保留各自配置。"
   if [[ $user == root ]]; then
+    if [[ $(access_root_policy 2>/dev/null) == no ]]; then
+      log_err 'vhm 已关闭 root SSH，恢复请在 [25] 回滚该记录。'
+      return 1
+    fi
     permit=yes
     [[ $mode != key ]] || permit=prohibit-password
     echo '此选项会允许 root 按所选方式通过 SSH 登录。'
@@ -184,7 +269,7 @@ access_profile_configure() (
 access_auth_menu() {
   local user choice
   title 'SSH 登录方式：按用户配置'
-  user=$(access_choose_user) || return 0
+  user=$(access_choose_user create) || return 0
   title "$user 的 SSH 登录方式"
   echo "已单独配置：$(access_profile_get "$user" 2>/dev/null || echo '沿用原 SSH 配置')"
   echo '  [1] 密码登录（不建议）'
@@ -192,7 +277,11 @@ access_auth_menu() {
   echo '  [3] 密码 + 2FA（TOTP）'
   echo '  [4] 密钥 + 2FA（TOTP）'
   echo "  [5] 修改 $user 的系统密码"
-  [[ $user == root ]] || echo '  [6] 普通管理员：密钥 + 密码 + TOTP；sudo 每次密码 + TOTP；验证后禁 root SSH'
+  if [[ $user != root ]]; then
+    echo '  [6] 普通管理员（须已有 sudo 权限）：密钥 + 密码 + TOTP；sudo 每次密码 + TOTP；验证后禁 root SSH'
+    echo "  [7] 授予 $user sudo 管理权限（需确认）"
+    echo '  [8] 验证此用户的 SSH 和 sudo，再关闭 root SSH'
+  fi
   echo '  [0] 返回'
   read -r -p '请选择：' choice || return 0
   case $choice in
@@ -202,6 +291,8 @@ access_auth_menu() {
     4) access_profile_configure "$user" key_totp ;;
     5) confirm_yes "通过 passwd 修改 $user 的账户密码？不保存密码，不能回滚。" && passwd "$user" ;;
     6) [[ $user == root ]] || access_setup "$user" ;;
+    7) [[ $user == root ]] || access_grant_sudo "$user" ;;
+    8) [[ $user == root ]] || access_disable_root_menu "$user" ;;
   esac
 }
 
@@ -241,35 +332,12 @@ access_profile_tfa_menu() (
   esac
 )
 
-# 用 /proc 中真实的 sshd 进程识别会话，sudo env_reset 无需保留 SSH_CONNECTION。
-# 新连接的 sshd 子进程必须比当前阶段更晚启动，拒绝旧会话/ControlMaster 复用。
-access_session() { # access_session 用户 UID；输出 sshd-pid:start-ticks
-  python3 - "$1" "$2" "$$" <<'PY'
-import os, sys
-user, uid, pid = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-seen = set()
-while pid > 1 and pid not in seen:
-    seen.add(pid)
-    try:
-        status = dict(line.split(':', 1) for line in open(f'/proc/{pid}/status') if ':' in line)
-        exe = os.path.basename(os.readlink(f'/proc/{pid}/exe'))
-        args = open(f'/proc/{pid}/cmdline', 'rb').read().replace(b'\0', b' ').decode(errors='replace')
-        euid = int(status['Uid'].split()[1])
-        stat = open(f'/proc/{pid}/stat').read().rsplit(')', 1)[1].split()
-        if exe in ('sshd', 'sshd-session') and euid == uid and f'{user}@' in args:
-            print(f'{pid}:{stat[19]}')
-            sys.exit(0)
-        pid = int(status['PPid'].strip())
-    except (OSError, ValueError, KeyError):
-        break
-sys.exit(1)
-PY
-}
+access_session() { _ssh_login_identity "$1" "$2"; }
 
 access_ticks() { python3 -c 'import os; print(int(float(open("/proc/uptime").read().split()[0]) * os.sysconf("SC_CLK_TCK")))'; }
 
 access_verify() {
-  local id=${1:-} phase=${2:-} dir user session cutoff
+  local id=${1:-} phase=${2:-} dir user session cutoff kind=strong
   need_root
   [[ $id =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ && $phase =~ ^(login|final)$ ]] || { log_err "无效的迁移验证参数"; return 1; }
   dir="$VH_CHANGES/$id"
@@ -281,37 +349,97 @@ access_verify() {
   session=$(access_session "$user" "$ACCESS_UID") || { log_err "无法确认来自该用户的新 SSH 会话，请勿从 root shell 或复用连接执行"; return 1; }
   cutoff=$(cat "$dir/access-cutoff") || return 1
   [[ $cutoff =~ ^[0-9]+$ && ${session##*:} -gt $cutoff ]] || { log_err "请关闭连接复用，建立本阶段开始后的新 SSH 连接"; return 1; }
-  access_profile_verify "$user" key_password_totp "$ACCESS_KEY_FILE" "$ACCESS_GA_FILE" &&
-    access_ssh_expect "$user" && access_sudo_verify "$user" "$ACCESS_GA_FILE" || return 1
-  [[ $phase != final ]] || access_expect_for root 203.0.113.1 permitrootlogin no || return 1
-  printf '%s\n' "$session" | access_write "$dir/access-verified-$phase" 600 || return 1
+  if [[ -f $dir/access-kind ]]; then kind=$(cat "$dir/access-kind") || return 1; fi
+  case $kind in
+    strong)
+      access_profile_verify "$user" key_password_totp "$ACCESS_KEY_FILE" "$ACCESS_GA_FILE" &&
+        access_ssh_expect "$user" && access_sudo_verify "$user" "$ACCESS_GA_FILE" || return 1
+      ;;
+    root-ssh) access_sudo_can_manage "$user" || return 1 ;;
+    *) return 1 ;;
+  esac
+  [[ $phase != final ]] || access_root_ssh_closed || return 1
+  (
+    exec 7>"$dir/.lock" && flock -w 5 7 || exit 1
+    [[ $(cat "$dir/status") == pending && $(cat "$dir/access-phase") == "$phase" && $(cat "$dir/access-cutoff") == "$cutoff" ]] || exit 1
+    printf '%s\n' "$session" | access_write "$dir/access-verified-$phase" 600
+  ) || { log_err '迁移阶段已结束，请回到原窗口。'; return 1; }
   log_ok "普通用户的新 SSH 会话和 sudo 调用已验证，请回到原窗口继续"
 }
 
 access_wait_verify() {
-  local phase=$1 ans user=$ACCESS_USER port remaining
+  local phase=$1 kind=${2:-strong} ans user=$ACCESS_USER port remaining
   [[ -n ${ACCESS_DEADLINE:-} ]] || ACCESS_DEADLINE=$((SECONDS + GUARD_SECONDS))
   remaining=$((ACCESS_DEADLINE - SECONDS))
-  ((remaining > 0)) || { log_err '迁移保护时间已到，正在回滚'; guard_abort; return 1; }
+  ((remaining > 0)) || { log_err '迁移保护时间已到，正在回滚'; return 1; }
   port=$(cur_ports | head -n1)
   printf '%s\n' "$user" >"$CHG_DIR/access-user" &&
-    printf '%s\n' "$phase" >"$CHG_DIR/access-phase" &&
-    access_ticks >"$CHG_DIR/access-cutoff" || return 1
+    access_ticks >"$CHG_DIR/access-cutoff" &&
+    printf '%s\n' "$phase" | access_write "$CHG_DIR/access-phase" 600 || return 1
   echo
   echo "保持本窗口；另开一个新的 SSH 连接（禁用连接复用）："
   echo "  ssh -o ControlMaster=no -o ControlPath=none -p $port $user@$(server_ip)"
-  echo "依次通过公钥、账户密码和动态验证码，然后直接执行："
-  echo "  sudo /usr/local/bin/vhm access-verify $CHG_ID $phase"
-  echo "sudo 必须再次要求账户密码和动态验证码；验证码已用于登录时，请等下一组。"
-  echo "不要进入 sudo -i / su；确认每项都被要求后回到这里。"
+  if [[ $kind == root-ssh ]]; then
+    echo '按该账户现有的 SSH 和 sudo 规则完成验证，然后回到本窗口。'
+    echo "  sudo -k /usr/local/bin/vhm access-verify $CHG_ID $phase"
+    echo '请直接运行上面的 sudo 命令，不要先进入 root shell。'
+  else
+    echo "依次通过公钥、账户密码和动态验证码，然后直接执行："
+    echo "  sudo /usr/local/bin/vhm access-verify $CHG_ID $phase"
+    echo "sudo 必须再次要求账户密码和动态验证码；验证码已用于登录时，请等下一组。"
+    echo "不要进入 sudo -i / su；确认每项都被要求后回到这里。"
+  fi
   echo "本次迁移的保护时间共 $GUARD_SECONDS 秒，当前剩余 $remaining 秒。"
   read -r -t "$remaining" -p "新窗口验证完成后输入 yes（其他输入回滚）: " ans || ans=""
   if [[ ${ans,,} != yes || ! -s $CHG_DIR/access-verified-$phase || $(cat "$CHG_DIR/status") != pending ]] || ((SECONDS >= ACCESS_DEADLINE)); then
     log_err "新会话验证未完成，正在回滚"
-    guard_abort
     return 1
   fi
 }
+
+access_sudo_can_manage() {
+  if ! command -v sudo >/dev/null 2>&1 || ! LC_ALL=C sudo -n -l -U "$1" -u root -- /bin/sh >/dev/null 2>&1; then
+    log_err "$1 没有可确认的 root 管理权限。请先通过 [7] 授权，或由管理员核对现有 sudo 规则。"
+    return 1
+  fi
+}
+
+access_record_admin_dependency() { # 告诉 [25] 此变更依赖已由 vhm 授予的 sudo 权限，不修改该文件
+  local grant="$SUDOERS_DIR/90-vhm-admin-$1"
+  [[ ! -f $grant ]] || printf '%s\n' "$grant" >"$CHG_DIR/admin-required"
+}
+
+access_root_cutover() (
+  # 与自动回滚共用记录锁，避免保护到期时仍在写入配置。
+  exec 7>"$CHG_DIR/.lock" && flock -w 5 7 || return 1
+  [[ $(cat "$CHG_DIR/status") == pending ]] && ((SECONDS < ACCESS_DEADLINE)) || return 1
+  access_root_apply && access_root_ssh_closed && ssh_reload
+)
+
+access_disable_root_menu() (
+  local user=$1
+  access_set_user "$user" && access_root_preflight || return 1
+  if access_root_ssh_closed >/dev/null 2>&1; then
+    log_info 'root SSH 已关闭。通过 vhm 关闭的记录可在 [25] 回滚。'
+    return 0
+  fi
+  access_sudo_can_manage "$user" || return 1
+  VH_ASSUME_YES=0 confirm_yes "已打开 VPS 控制台并保留当前窗口，验证 $user 后关闭 root SSH？root 账号及现有 sudo 规则保留。" || return 0
+  change_begin "验证普通管理员 $user 后关闭 root SSH" sshd
+  if ! access_root_track || ! access_record_admin_dependency "$user" || ! printf 'root-ssh\n' >"$CHG_DIR/access-kind"; then
+    change_status rolled_back
+    log_err '无法保存完整记录，未更改 SSH。'
+    return 1
+  fi
+  ACCESS_DEADLINE=$((SECONDS + GUARD_SECONDS))
+  guard_start || return 1
+  if ! access_wait_verify login root-ssh || ! access_root_cutover || ! access_wait_verify final root-ssh; then
+    guard_abort
+    return 1
+  fi
+  guard_confirm || return 1
+  log_ok "root SSH 已关闭；$user 的新 SSH 连接和 sudo 已验证。可在 [25] 回滚。"
+)
 
 access_setup() (
   local user=${1:-} keytmp newga temp_dir original_root
@@ -320,11 +448,14 @@ access_setup() (
     return 0
   fi
   title "普通用户 SSH：密钥 + 密码 + TOTP；sudo：密码 + TOTP"
-  echo "使用已有的普通 sudo 管理员，不创建用户、不修改其系统密码。"
-  echo "没有管理员时，请先通过系统 adduser / usermod 配置，并确认已设置账户密码。"
+  echo '此方案要求已有完整 sudo 管理权限的本地普通用户。'
   if [[ -z $user ]]; then read -r -p "普通管理员用户名（回车取消）: " user || return 0; fi
   [[ -n $user ]] || return 0
   access_set_user "$user" || return 1
+  if ! command -v sudo >/dev/null 2>&1 || ! LC_ALL=C sudo -n -l -U "$user" >/dev/null 2>&1; then
+    log_err "$user 没有可确认的 sudo 管理权限。只配置 SSH 请使用 [06] 的 [1]–[4]；启用管理员方案前可在 [7] 授权。"
+    return 1
+  fi
   ga_install && access_sudo_preflight "$user" && access_ssh_preflight "$user" || return 1
   local path
   for path in "$SSHD_CONFIG" "$PAM_SSHD" "$PAM_ACCESS_SSH" "$PAM_ACCESS_LEGACY" \
@@ -344,7 +475,7 @@ access_setup() (
   confirm_yes "已打开 VNC 应急控制台，开始迁移？" || return 0
   original_root=$(sshd_eff_for root) || return 1
   change_begin "普通管理员 $user：SSH 三项验证、sudo 双项验证、关闭 root SSH" sshd
-  if ! access_track; then change_status rolled_back; log_err "无法完整备份配置，未开始迁移"; return 1; fi
+  if ! access_track || ! access_record_admin_dependency "$user"; then change_status rolled_back; log_err "无法完整备份配置，未开始迁移"; return 1; fi
   guard_start || return 1
   ACCESS_DEADLINE=$((SECONDS + GUARD_SECONDS))
   if ! { install -d -o root -g root -m 755 "$ACCESS_KEYS_DIR" &&
