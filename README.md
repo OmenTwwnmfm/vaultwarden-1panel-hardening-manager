@@ -37,7 +37,7 @@ sudo bash ./run.sh
 ![Panel](https://img.shields.io/badge/panel-1Panel-1677ff)
 ![SSH](https://img.shields.io/badge/ssh-password%20%7C%20key%20%7C%20TOTP-16a34a)
 ![Protection](https://img.shields.io/badge/protection-Fail2Ban-dc2626)
-![Version](https://img.shields.io/badge/version-0.5.0-blue)
+![Version](https://img.shields.io/badge/version-0.5.1-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![CI](https://github.com/OmenTwwnmfm/vaultwarden-hardening-manager/actions/workflows/ci.yml/badge.svg)
 
@@ -50,6 +50,10 @@ Vaultwarden 把整个家庭或团队的密码库放在一台 VPS 上，这台服
 所有会修改系统的操作都会先显示要改什么，再要求输入 `yes`。大小写不敏感：`yes`、`YES`、`Yes` 都可以继续；其他输入均取消。只读功能（体检、状态、端口一览、用户列表、登录记录）不需要确认，也不会修改任何文件。
 
 ## 功能特点
+
+### v0.5.1 更新说明
+
+- 启动和 `[27]` 均先展示当前版本、目标版本及本次变更，输入 `yes` 才更新。仍在运行 v0.5.0 且设置了 `AUTO_UPDATE="apply"` 时，先将其改为 `"notify"` 再启动，让这一次升级也经过确认。
 
 ### v0.5.0 更新说明
 
@@ -176,7 +180,8 @@ Vaultwarden 把整个家庭或团队的密码库放在一台 VPS 上，这台服
 
 - 每次通过 `sudo bash ./run.sh` 启动时，都会自动安装或修复 `/usr/local/bin/vhm`。
 - 之后在任意目录执行 `sudo vhm` 即可进入菜单。
-- 每次启动菜单时，vhm 检查 GitHub main：有新版本时列出待更新的提交，输入 `yes` 才快进并重启菜单；本地有改动、不在 main 分支或网络不可用时保留当前版本，可用 `[27]` 手动重试。更新方式由配置文件中的 `AUTO_UPDATE` 决定（`notify` / `apply` / `off`）。
+- 启动菜单时，vhm 默认检查官方仓库的 `main` 分支。发现可更新的源码时，先显示当前版本、目标版本及目标提交新增的更新日志；没有新增日志时显示提交摘要。输入 `yes` 才更新并重新加载菜单，未确认时保留当前源码。
+- `/etc/vaultwarden-hardening.conf` 中的 `AUTO_UPDATE="notify"`（默认）在启动时检查并询问，旧值 `"apply"` 也按 `notify` 处理。`AUTO_UPDATE="off"` 只跳过启动检查，仍可在 `[27]` 手动检查、预览并确认。本地已跟踪文件有改动、当前不在 `main` 或网络不可用时会保留当前版本。
 - `vhm` 指向当初克隆的项目目录。移动项目目录后，在新位置重新运行一次 `sudo bash ./run.sh`，进入菜单时会自动把 vhm 的 systemd 单元改到新位置。
 
 ## 文件与路径

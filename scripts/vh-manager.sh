@@ -58,16 +58,17 @@ restart_menu() {
   exec bash "$VH_DIR/vh-launcher.sh" menu
 }
 
-# 列出待更新的提交，输入 yes 后快进；返回 0 表示已更新
+# 预览目标提交后要求明确确认；返回 0 表示已更新
 offer_update() {
-  local rc=0
+  local rc=0 target_label
+  target_label=$(source_commit_label "$UPD_TARGET")
   echo
-  echo "发现新版本 v$(source_target_version)（当前 v$VH_VERSION），包含以下提交："
-  source_show_pending
-  confirm_yes "更新到新版本？更新后菜单会重新加载" || return 1
+  echo "发现更新：当前 $(source_commit_label "$UPD_BEFORE") → $target_label"
+  source_show_pending || return 1
+  VH_ASSUME_YES=0 confirm_yes '更新到上述版本？更新后菜单会重新加载' || return 1
   source_apply || rc=$?
   ((rc == VH_SOURCE_UPDATED)) || return 1
-  log_ok "已更新到 v$(cat "$VH_DIR/../VERSION")，重新进入菜单"
+  log_ok "已更新到 $target_label，重新进入菜单"
 }
 
 update_source() { # 菜单 [27]
@@ -85,31 +86,19 @@ update_source() { # 菜单 [27]
 auto_update_source() { # 每次启动菜单时按 AUTO_UPDATE 检查一次
   [[ ${VHM_AUTO_UPDATE_CHECKED:-0} == 1 ]] && return 0
   export VHM_AUTO_UPDATE_CHECKED=1
-  local mode rc=0
-  mode=$(update_mode)
-  [[ $mode == off ]] && return 0
+  local rc=0
+  [[ $(update_mode) == off ]] && return 0
   log_info "正在检查 GitHub 更新……"
   source_check || rc=$?
   if ((rc != VH_SOURCE_AVAILABLE)); then
     ((rc == 0)) || sleep 2
     return 0
   fi
-  if [[ $mode == apply ]]; then
-    rc=0
-    source_apply || rc=$?
-    if ((rc == VH_SOURCE_UPDATED)); then
-      log_ok "AUTO_UPDATE=apply：已自动更新到 v$(cat "$VH_DIR/../VERSION")，重新进入菜单"
-      sleep 2
-      restart_menu
-    fi
-    sleep 2
-    return 0
-  fi
   if offer_update; then
     sleep 2
     restart_menu
   fi
-  log_info "保持当前 v$VH_VERSION；可随时在 [27] 更新，或在 $VH_CONF 中设置 AUTO_UPDATE=off 关闭检查"
+  log_info "本次未更新；可随时在 [27] 检查更新，或在 $VH_CONF 中设置 AUTO_UPDATE=off 关闭启动检查"
   sleep 2
 }
 
@@ -240,6 +229,7 @@ print("╰" + "─" * W + "╯")
 PYMENU
 }
 
+[[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
 while true; do
   auto_update_source
   [[ -t 1 ]] && clear

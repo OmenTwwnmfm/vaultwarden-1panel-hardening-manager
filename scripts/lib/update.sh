@@ -3,8 +3,8 @@
 # 项目源码更新：检查 GitHub main、展示待更新内容、确认后快进；由 vh-common.sh 加载，不要单独执行
 #
 # 更新方式由配置文件中的 AUTO_UPDATE 决定：
-#   notify（默认）进入菜单时检查，有新版本时列出提交，输入 yes 才更新
-#   apply         进入菜单时检查并自动快进（0.3.x 的行为）
+#   notify（默认）进入菜单时检查，有更新时先展示内容，输入 yes 才更新
+#   apply         旧配置值，按 notify 处理
 #   off           不自动检查，只能在 [27] 手动检查
 # UPDATE_REQUIRE_SIGNED=1 时，只接受 git verify-commit 校验通过的新版本。
 
@@ -18,8 +18,8 @@ source_root() { cd "$VH_DIR/.." && pwd -P; }
 update_mode() {
   local m
   m=$(conf_get AUTO_UPDATE 2>/dev/null || true)
-  case ${m:-notify} in
-    off | notify | apply) echo "${m:-notify}" ;;
+  case $m in
+    off) echo off ;;
     *) echo notify ;;
   esac
 }
@@ -78,15 +78,39 @@ source_check() {
   return "$VH_SOURCE_AVAILABLE"
 }
 
-source_target_version() { git -C "$UPD_ROOT" show "$UPD_TARGET:VERSION" 2>/dev/null | tr -d '[:space:]'; }
+source_commit_label() {
+  local commit=$1 version
+  if version=$(git -C "$UPD_ROOT" show "$commit:VERSION" 2>/dev/null) && [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    printf 'v%s（%.12s）\n' "$version" "$commit"
+  else
+    printf '提交 %.12s\n' "$commit"
+  fi
+}
 
-source_show_pending() { # 列出待更新的提交（最多 20 条）
-  local log n
-  log=$(git -C "$UPD_ROOT" log --oneline --no-decorate "$UPD_BEFORE..$UPD_TARGET" 2>/dev/null) || log=""
-  n=$(grep -c . <<<"$log")
-  head -n 20 <<<"$log" | sed 's/^/    /'
-  ((n > 20)) && echo "    ……共 $n 个提交"
-  echo "  更新日志：https://github.com/$VH_OFFICIAL_REPO/blob/main/CHANGELOG.md"
+source_preview_text() { LC_ALL=C tr -d '\000-\011\013-\037\177'; } # 保留换行与 UTF-8，删除终端控制字符
+
+source_show_pending() {
+  local notes log
+  notes=$(git -C "$UPD_ROOT" --no-pager diff --no-ext-diff --no-textconv --no-color --no-renames -U0 \
+    "$UPD_BEFORE" "$UPD_TARGET" -- CHANGELOG.md 2>/dev/null | source_preview_text | awk '
+      /^@@ / { hunk=1; next }
+      hunk && /^\+/ && substr($0, 2) ~ /[^[:space:]]/ { if (++n <= 16) print "    " substr($0, 2) }
+      END { if (n > 16) print "    ……" }
+    ') || notes=""
+  log=$(git -C "$UPD_ROOT" --no-pager log --oneline --no-decorate --no-color --no-show-signature -n 21 \
+    "$UPD_BEFORE..$UPD_TARGET" 2>/dev/null | source_preview_text) || log=""
+  if [[ -z $notes && -z $log ]]; then
+    log_warn '无法读取更新内容，已取消本次更新'
+    return 1
+  fi
+  if [[ -n $notes ]]; then
+    printf '  更新内容（CHANGELOG）：\n%s\n' "$notes"
+  fi
+  if [[ -n $log ]]; then
+    echo '  待更新提交：'
+    awk 'NR <= 20 { print "    " $0 } END { if (NR > 20) print "    ……" }' <<<"$log"
+  fi
+  echo "  完整更新日志：https://github.com/$VH_OFFICIAL_REPO/blob/$UPD_TARGET/CHANGELOG.md"
 }
 
 source_verify() {
