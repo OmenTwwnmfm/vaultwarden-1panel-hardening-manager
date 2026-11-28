@@ -21,6 +21,11 @@ SSH_SOCKET_DROPIN=${SSH_SOCKET_DROPIN:-/etc/systemd/system/ssh.socket.d/00-vhm.c
 PAM_SSHD=${PAM_SSHD:-/etc/pam.d/sshd}
 GA_FILE=${GA_FILE:-/root/.google_authenticator}
 ROOT_KEYS=${ROOT_KEYS:-/root/.ssh/authorized_keys}
+ACCESS_STATE=${ACCESS_STATE:-$VH_STATE/access.conf}
+ACCESS_KEYS_DIR=${ACCESS_KEYS_DIR:-/etc/ssh/vhm-authorized-keys}
+ACCESS_SECRETS_DIR=${ACCESS_SECRETS_DIR:-/etc/security/vhm-access}
+PAM_ACCESS_SSH=${PAM_ACCESS_SSH:-/etc/pam.d/vhm-access-ssh}
+PAM_ACCESS_LEGACY=${PAM_ACCESS_LEGACY:-/etc/pam.d/vhm-access-ssh-legacy}
 F2B_JAIL=${F2B_JAIL:-/etc/fail2ban/jail.d/vhm-sshd.local}
 SYSCTL_FILE=${SYSCTL_FILE:-/etc/sysctl.d/90-vhm-hardening.conf}
 AUTO_UPGRADES=${AUTO_UPGRADES:-/etc/apt/apt.conf.d/20auto-upgrades}
@@ -46,6 +51,10 @@ source "$VH_DIR/lib/vaultwarden.sh"
 source "$VH_DIR/lib/changes.sh"
 # shellcheck source=scripts/lib/ssh.sh
 source "$VH_DIR/lib/ssh.sh"
+# shellcheck source=scripts/lib/access-sudo.sh
+source "$VH_DIR/lib/access-sudo.sh"
+# shellcheck source=scripts/lib/access-profiles.sh
+source "$VH_DIR/lib/access-profiles.sh"
 # shellcheck source=scripts/lib/firewall.sh
 source "$VH_DIR/lib/firewall.sh"
 # shellcheck source=scripts/lib/panel.sh

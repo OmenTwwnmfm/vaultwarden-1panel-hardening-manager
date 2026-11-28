@@ -9,6 +9,7 @@ reports/
 *.log
 report-*.json
 plan-*.json
+.testtmp/
 
 # 编辑器
 .vscode/

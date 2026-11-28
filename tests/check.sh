@@ -2,7 +2,7 @@
 set -Euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
-for script in run.sh scripts/*.sh scripts/lib/*.sh tests/*.sh; do
+for script in run.sh scripts/*.sh scripts/lib/*.sh tests/*.sh tests/integration/*.sh; do
   bash -n "$script" || exit 1
 done
 

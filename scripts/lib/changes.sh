@@ -83,6 +83,7 @@ change_ids() { # 从新到旧
 
 change_protected() { # 0=受保护（不能删）
   local id=$1 d="$VH_CHANGES/$1"
+  [[ $(conf_get ACCESS_CHANGE "$ACCESS_STATE" 2>/dev/null) != "$id" ]] || return 0
   systemctl is-active --quiet "vhm-guard-$id.timer" 2>/dev/null && return 0
   [[ $(cat "$d/status" 2>/dev/null) == pending && -n $(find "$d" -maxdepth 0 -mmin -60 2>/dev/null) ]] && return 0
   return 1

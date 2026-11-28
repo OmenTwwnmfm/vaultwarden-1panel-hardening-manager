@@ -9,9 +9,35 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with: { fetch-depth: 0 }
       - name: shellcheck
-        run: shellcheck -x run.sh scripts/*.sh scripts/lib/*.sh tests/*.sh
+        run: shellcheck -x run.sh scripts/*.sh scripts/lib/*.sh tests/*.sh tests/integration/*.sh
       - name: bash syntax and tests
         run: bash tests/check.sh
       - name: gitleaks
         uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
         env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+  access-auth:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu:24.04, debian:12]
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Real SSH, PAM and sudo authentication
+        env:
+          TEST_IMAGE: ${{ matrix.image }}
+        run: |
+          docker run --rm \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace,readonly" \
+            --workdir /workspace \
+            --env VHM_ACCESS_INTEGRATION=1 \
+            "$TEST_IMAGE" bash -euc '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq >/dev/null
+              apt-get install -y --no-install-recommends bash ca-certificates git openssh-server openssh-client libpam-google-authenticator sudo python3 python3-venv util-linux procps >/dev/null
+              python3 -m venv /opt/vhm-auth-python
+              /opt/vhm-auth-python/bin/pip --disable-pip-version-check --quiet install "paramiko>=3,<4"
+              export PATH=/opt/vhm-auth-python/bin:$PATH
+              bash tests/integration/access-auth.sh
+            '

@@ -1,6 +1,33 @@
-<div align="center">
-
 # Vaultwarden Hardening Manager
+
+## 快速开始
+
+在 VPS 的 SSH 终端执行：
+
+```bash
+sudo git clone https://github.com/OmenTwwnmfm/vaultwarden-hardening-manager /opt/vaultwarden-hardening-manager
+cd /opt/vaultwarden-hardening-manager
+sudo bash ./run.sh
+```
+
+安装后，在任意目录执行 `sudo vhm` 即可再次打开菜单。已有安装仍使用旧仓址时，请看[仓库改名后的升级步骤](docs/使用手册.md#仓库改名后的升级)。
+
+想先看看当前风险，可以直接在菜单选 `[02]`，或退出菜单后运行 `sudo vhm checkup`。体检是只读操作；修改范围和回滚方式见[安全与影响说明](docs/安全与影响说明.md)。
+
+> **修改 SSH 前请先打开 VPS 服务商的 VNC 控制台。** VNC 不受 SSH 配置影响，可用于登录失败时的恢复。
+
+首次配置的推荐顺序：
+
+1. `[01]` 检查依赖、识别 Vaultwarden 实例（已安装 vbm 时复用其实例）。
+2. `[02]` 运行安全体检，先看哪些项是「危险」。
+3. `[04]` 确认现有 root 登录密钥；准备普通用户时先创建本地账户并设置其密码。
+4. `[15]` 管理防火墙规则，`[16]` 启用 Fail2Ban。
+5. `[06]` 先选 root 或普通用户，再选择该用户的 SSH 登录方式。普通管理员还可选「密钥 + 密码 + TOTP，sudo 再验密码 + TOTP」；向导验证新会话后才关闭 root SSH。
+6. `[19]` 关闭开放注册，`[20]` 不用时关闭后台，`[22]` 应用推荐安全选项。
+7. `[23]` 启用自动安全更新，`[24]` 加固内核网络参数。
+8. 体检提示 Docker 端口暴露时，在 1Panel 应用参数中取消「端口外部访问」。
+
+## 项目简介
 
 **安全体检 · SSH 登录模式 · 1Panel / UFW 防火墙 · Fail2Ban 端口同步 · Vaultwarden 管理**
 
@@ -10,23 +37,13 @@
 ![Panel](https://img.shields.io/badge/panel-1Panel-1677ff)
 ![SSH](https://img.shields.io/badge/ssh-password%20%7C%20key%20%7C%20TOTP-16a34a)
 ![Protection](https://img.shields.io/badge/protection-Fail2Ban-dc2626)
-![Version](https://img.shields.io/badge/version-0.4.1-blue)
+![Version](https://img.shields.io/badge/version-0.5.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![CI](https://github.com/OmenTwwnmfm/vaultwarden-hardening-manager/actions/workflows/ci.yml/badge.svg)
-
-![vhm 主菜单预览，显示演示环境中的 SSH、1Panel、Fail2Ban 和 Vaultwarden 状态](docs/menu-preview.png)
-
-</div>
-
----
-
-## 项目简介
 
 Vaultwarden 把整个家庭或团队的密码库放在一台 VPS 上，这台服务器本身的安全就是密码库的安全。本项目提供一个交互式加固管理器：体检 VPS 当前开放了哪些端口、对哪些 IP 放行、SSH 怎么登录、有没有暴力破解防护；然后一步步完成 SSH 双因素认证、Fail2Ban、系统加固，并管理 Vaultwarden 的注册、后台和安全选项。
 
 项目不替代 1Panel。1Panel 继续负责应用安装、Docker、域名、HTTPS 和反向代理；防火墙规则可以在 1Panel 页面或 vhm `[15]` 中修改，两边读写同一套规则。本项目负责 SSH 登录安全、防火墙规则、Fail2Ban、系统参数和 Vaultwarden 的 `config.json` 设置。兄弟项目 [vaultwarden-backup-manager](https://github.com/OmenTwwnmfm/vaultwarden-backup-manager)（`vbm`）管「数据不丢」，本项目管「门锁不坏」。
-
-> **修改 SSH 前请先打开 VPS 服务商控制台的 VNC。** 本工具对每次 SSH 修改都有 5 分钟自动回滚保护，但 VNC 是最后的应急入口，不受 SSH 配置影响。
 
 ## 操作确认输入
 
@@ -34,17 +51,19 @@ Vaultwarden 把整个家庭或团队的密码库放在一台 VPS 上，这台服
 
 ## 功能特点
 
-### v0.4.1 更新说明
+### v0.5.0 更新说明
 
-- GitHub 仓库改名为 `vaultwarden-hardening-manager`。已有安装请按[使用手册](docs/使用手册.md#仓库改名后的升级)更新 `origin`，可继续使用现有安装目录。
-- 修复首次配置可能改变配置文件父目录权限的问题。修改 Vaultwarden 设置前，核对 vbm 备份的是当前选中的数据目录。
-- 加强 SSH 变更的回滚保护，源码更新在应用前复查本地状态。详细变更见 [CHANGELOG.md](CHANGELOG.md)。
+- `[06]` 先选 root / 普通用户，再独立配置四种 SSH 登录方式；`[07]` 按用户管理动态口令。
+- 普通用户可选三项登录验证与 sudo 双项验证方案，验证新会话可用后再关闭 root SSH，保留完整回滚。
+- 增加真实 Linux 认证集成测试，安装与首次操作移到 README 顶部。已有旧仓址安装仍按[使用手册](docs/使用手册.md#仓库改名后的升级)升级。详细变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 历次版本的完整变更见 [CHANGELOG.md](CHANGELOG.md)。从 0.1.x 升级时，首次进入菜单会自动清理旧版定时巡检。
 
 ### 菜单结构
 
 主菜单分为八类，顶部状态面板显示 SSH 端口、2FA、密码登录、防火墙、Fail2Ban 封禁数，以及 Vaultwarden 的注册与后台状态。
+
+![vhm 主菜单预览，显示演示环境中的 SSH、1Panel、Fail2Ban 和 Vaultwarden 状态](docs/menu-preview.png)
 
 | 分类 | 菜单 |
 |---|---|
@@ -79,13 +98,15 @@ Vaultwarden 把整个家庭或团队的密码库放在一台 VPS 上，这台服
 
 ### SSH 登录方式与 2FA
 
-- [06] 可选密码登录（不建议）、密钥登录、密码 + 动态口令、密钥 + 动态口令（推荐），也可修改 root 系统密码。
-- 启用密钥 + 动态口令时，root 登录必须同时通过 SSH 密钥和手机验证器上的 6 位动态口令。
+- [06] 先选择 root 或一个已有的普通本地用户，再为该用户选择密码登录（不建议）、密钥登录、密码 + 动态口令、密钥 + 动态口令。每个用户独立配置，其他用户保留原认证方式；也可通过系统 `passwd` 修改所选账户密码。
+- 普通用户子菜单的 `[6]` 是可选的管理员方案：SSH 必须通过公钥、账户密码和 TOTP；新会话中验证 `sudo` 可用后才关闭 root SSH，再用最终配置建立新连接确认。它要求用户已有标准 sudo 管理授权，不自动创建用户或扩大权限。
+- 该方案的每次新 sudo 提权调用都重新验证账户密码和 TOTP，`timestamp_timeout=0` 关闭缓存。已打开的 root shell、root 权限程序和 vhm 菜单内的操作不会逐条重新认证；需要每条命令都受控时，还需单独设计 sudo 命令授权范围。
 - 使用 `libpam-google-authenticator`，支持 Google Authenticator、Microsoft Authenticator、2FAS 等任意 TOTP 验证器。
 - 不使用 `nullok`：没有绑定动态口令就无法登录，不留「没绑定就跳过」的后门。
 - 绑定时在终端显示二维码（同时给出可手动输入的密钥和 `otpauth://` 链接），先校验一次动态口令，再显示 5 个一次性应急码。
-- `[07]` 可以重新显示绑定二维码（在新手机或第二个验证器上添加同一账号）、重新绑定（换新密钥）、查看剩余应急码或关闭 2FA。
-- 启用前检查 root 至少有一个登录密钥、系统时间已同步，并提示其他用户和 1Panel「终端」功能会受到的影响。
+- `[07]` 按用户显示二维码、重新绑定或查看应急码。普通模式可关闭 2FA 并切换为密钥登录；管理员方案通过 `[25]` 回滚整次迁移来退出，避免遗留无法登录或提权的配置。
+- 普通管理员的 SSH 与 sudo 共用其独立的 TOTP 绑定，保留验证码防重放；登录后紧接 sudo 时，请等验证器的下一组验证码。公钥和种子由 root 集中管理，不复用 root 的种子。
+- 自动配置只接受可确认的 Debian / Ubuntu PAM 和 SSH 配置；自定义 Match、复杂 sudoers、NOPASSWD 或外部授权源会被拒绝，并提示人工审核。1Panel 网页终端须支持所选认证组合，容器终端不受影响。
 
 ### 防锁死保护
 
@@ -157,27 +178,6 @@ Vaultwarden 把整个家庭或团队的密码库放在一台 VPS 上，这台服
 - 之后在任意目录执行 `sudo vhm` 即可进入菜单。
 - 每次启动菜单时，vhm 检查 GitHub main：有新版本时列出待更新的提交，输入 `yes` 才快进并重启菜单；本地有改动、不在 main 分支或网络不可用时保留当前版本，可用 `[27]` 手动重试。更新方式由配置文件中的 `AUTO_UPDATE` 决定（`notify` / `apply` / `off`）。
 - `vhm` 指向当初克隆的项目目录。移动项目目录后，在新位置重新运行一次 `sudo bash ./run.sh`，进入菜单时会自动把 vhm 的 systemd 单元改到新位置。
-
-## 快速开始
-
-```bash
-sudo git clone https://github.com/OmenTwwnmfm/vaultwarden-hardening-manager /opt/vaultwarden-hardening-manager
-cd /opt/vaultwarden-hardening-manager
-sudo bash ./run.sh
-```
-
-第一次也可以先只做体检、不动系统：进入菜单选 `[02]`，或退出后运行 `sudo vhm checkup`。体检是只读的，不会修改任何文件；先看清哪些项是「危险」，再决定改什么。会改哪些文件、哪些事明确不会做、怎么回滚，见 [安全与影响说明](docs/安全与影响说明.md)。
-
-推荐顺序：
-
-1. `[01]` 首次配置：检查依赖、识别 Vaultwarden 实例（已安装 vbm 时复用其实例）。
-2. `[02]` 安全体检，先看哪些项是「危险」。
-3. `[04]` 确认 root 的登录密钥都是你自己的。
-4. `[15]` 管理防火墙规则，`[16]` 启用 Fail2Ban。
-5. `[06]` 选择 SSH 登录方式，使用动态口令时另开窗口测试登录后再确认。
-6. `[19]` 关闭开放注册，`[20]` 不用时关闭后台，`[22]` 应用推荐安全选项。
-7. `[23]` 自动安全更新，`[24]` 内核网络参数。
-8. 体检提示 Docker 端口暴露时，在 1Panel 应用参数中取消「端口外部访问」。
 
 ## 文件与路径
 

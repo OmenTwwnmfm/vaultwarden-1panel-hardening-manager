@@ -47,7 +47,7 @@ sys.stdout.buffer.write(("\n".join(rows) + "\n").encode("utf-8"))
 PY
 )
 
-ga_label() { echo "root@$(hostname)"; }
+ga_label() { echo "${GA_ACCOUNT:-root}@$(hostname)"; }
 
 ga_uri() { # ga_uri 密钥文件：输出 otpauth:// 链接
   python3 - "$1" "$GA_ISSUER" "$(ga_label)" <<'PY'
@@ -88,7 +88,7 @@ server_ip() {
 
 cur_ports() { sshd_get port | sort -un; }
 
-test_cmd() { echo "ssh -p ${1:-$(cur_ports | head -n1)} root@$(server_ip)"; }
+test_cmd() { echo "ssh -p ${1:-$(cur_ports | head -n1)} $(access_user || echo root)@$(server_ip)"; }
 
 # drop-in 文件 00-vhm.conf：sshd 对同一配置项取第一个值，00 前缀保证优先于其他 drop-in
 dropin_del() {
@@ -240,6 +240,10 @@ del_key() {
 }
 
 keys_menu() {
+  if access_active || access_profile_get root >/dev/null 2>&1; then
+    log_info "已按用户配置 SSH，公钥使用 $ACCESS_KEYS_DIR/<用户名>（root 管理，644）。此处不修改旧 root 密钥；如需替换，可先在 [25] 回滚对应登录方式，再通过 [06] 重新配置。"
+    return 0
+  fi
   while true; do
     title "root 登录密钥（$ROOT_KEYS）"
     list_keys
@@ -283,11 +287,27 @@ show_status() {
   else
     printf '  %-22s %s\n' "2FA" "未启用"
   fi
-  printf '  %-22s %s\n' "root 2FA 绑定" "$([[ -f $GA_FILE ]] && echo "已绑定（应急码剩余 $(grep -cE '^[0-9]{8}$' "$GA_FILE")）" || echo 未绑定)"
-  load_keys
-  printf '  %-22s %s\n' "root 授权密钥" "${#KEY_FP[@]} 个"
+  if access_active; then
+    local user
+    user=$(access_user)
+    printf '  %-22s %s\n' "普通管理员" "$user（密钥 + 账户密码 + TOTP）"
+    printf '  %-22s %s\n' "动态口令绑定" "$([[ -f $ACCESS_SECRETS_DIR/$user/totp ]] && echo 已绑定 || echo 缺失)"
+    printf '  %-22s %s\n' "sudo" "每次新调用验证密码 + TOTP，无认证缓存（配置需保持未被手动修改）"
+  else
+    printf '  %-22s %s\n' "root 2FA 绑定" "$([[ -f $GA_FILE ]] && echo "已绑定（应急码剩余 $(grep -cE '^[0-9]{8}$' "$GA_FILE")）" || echo 未绑定)"
+    load_keys
+    printf '  %-22s %s\n' "root 授权密钥" "${#KEY_FP[@]} 个"
+  fi
   printf '  %-22s %s\n' "时间同步" "$(time_synced && echo 已同步 || echo 未同步（动态口令会失败）)"
   [[ -f $SSHD_DROPIN ]] && printf '  %-22s %s\n' "vhm 配置文件" "$SSHD_DROPIN"
+  if [[ -f $(access_profile_state) ]]; then
+    echo
+    echo '独立用户登录方式（[06] 修改）：'
+    local profile_user profile_mode
+    while IFS=$'\t' read -r profile_user profile_mode; do
+      [[ -n $profile_user ]] && printf '  %s：%s\n' "$profile_user" "$(auth_mode_label "$profile_mode")"
+    done < <(access_profile_list)
+  fi
   echo
   echo "当前登录会话："
   who 2>/dev/null | sed 's/^/  /'
@@ -547,7 +567,7 @@ auth_mode_label() {
     key) echo "密钥登录" ;;
     password_totp) echo "密码 + 动态口令" ;;
     key_totp) echo "密钥 + 动态口令（推荐）" ;;
-    key_password_totp) echo "密钥 + 密码 + 动态口令（PAM 含 common-auth，需改为密钥 + 动态口令）" ;;
+    key_password_totp) echo "密钥 + 账户密码 + 动态口令" ;;
     totp_only) echo "仅动态口令（未包含系统密码，建议改为密码 + 动态口令）" ;;
     mixed) echo "密码或密钥（未限制）" ;;
     *) echo "自定义配置" ;;
@@ -563,6 +583,10 @@ change_root_password() {
 }
 
 configure_auth_mode() {
+  if access_active || [[ -f $(access_profile_state) ]]; then
+    log_err "已按用户配置 SSH。请通过 [06] 选择用户再更改登录方式；管理员方案需先在 [25] 回滚迁移。"
+    return 1
+  fi
   local mode=$1 current newga="" need_keys=0 need_password=0 need_totp=0 need_include=0
   local method password pubkey kbd permit
   case $mode in
@@ -636,24 +660,7 @@ configure_auth_mode() {
 }
 
 auth_mode_menu() {
-  title "SSH 登录方式"
-  echo "当前方式：$(auth_mode_label "$(ssh_auth_mode)")"
-  echo
-  echo "  [1] 密码登录（不建议）"
-  echo "  [2] 密钥登录"
-  echo "  [3] 密码登录 + 动态口令"
-  echo "  [4] 密钥登录 + 动态口令（推荐）"
-  echo "  [5] 修改 root 系统密码"
-  echo "  [0] 返回"
-  local choice
-  read -r -p "请选择：" choice || return 0
-  case $choice in
-    1) configure_auth_mode password ;;
-    2) configure_auth_mode key ;;
-    3) configure_auth_mode password_totp ;;
-    4) configure_auth_mode key_totp ;;
-    5) change_root_password ;;
-  esac
+  bash "$VH_DIR/vh-access.sh" auth-menu
 }
 
 tfa_rebind() {
@@ -718,6 +725,14 @@ tfa_disable() {
 }
 
 tfa_manage() {
+  if access_active || [[ -f $(access_profile_state) ]]; then
+    bash "$VH_DIR/vh-access.sh" 2fa-menu
+    return
+  fi
+  tfa_legacy_manage
+}
+
+tfa_legacy_manage() {
   title "2FA 管理"
   if tfa_enabled; then
     log_ok "2FA 已启用：$(auth_mode_label "$(ssh_auth_mode)")"

@@ -3,6 +3,30 @@
 # SSH 生效配置读取、服务重载与 2FA 状态；由 vh-common.sh 加载，不要单独执行
 
 # ---------- SSH ----------
+access_user() {
+  local user
+  user=$(conf_get ACCESS_USER "$ACCESS_STATE") || return 1
+  [[ $user =~ ^[a-z_][a-z0-9_-]{0,31}$ && $user != root ]] || return 1
+  printf '%s\n' "$user"
+}
+access_active() { [[ -n $(access_user) ]]; }
+
+# 变更验收必须按指定用户和真实连接上下文核对；失败不能退回无 Match 上下文的 -T。
+sshd_eff_for() { # sshd_eff_for 用户 [来源地址]
+  local user=$1 addr=${2:-} local_addr local_port out
+  local connection=()
+  read -r -a connection <<<"${SSH_CONNECTION:-}"
+  [[ -n $addr ]] || addr=${connection[0]:-203.0.113.1}
+  [[ $user =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || return 1
+  [[ $addr =~ ^[0-9a-fA-F:.]+$ ]] || addr=203.0.113.1
+  local_addr=${connection[2]:-127.0.0.1}
+  local_port=${connection[3]:-22}
+  mkdir -p /run/sshd 2>/dev/null
+  out=$("$SSHD_BIN" -T -C "user=$user,host=vhm-check,addr=$addr,laddr=$local_addr,lport=$local_port" 2>/dev/null) || return 1
+  [[ -n $out ]] || return 1
+  awk '{ $1 = tolower($1); print }' <<<"$out"
+}
+
 if [[ -z ${SSHD_BIN:-} ]]; then
   if [[ -x /usr/sbin/sshd ]]; then SSHD_BIN=/usr/sbin/sshd; else SSHD_BIN=$(command -v sshd 2>/dev/null || echo /usr/sbin/sshd); fi
 fi
@@ -10,7 +34,7 @@ sshd_test() { mkdir -p /run/sshd 2>/dev/null; "$SSHD_BIN" -t 2>&1; }
 # 生效配置：优先按当前 SSH 客户端的真实来源地址计算（让 Match 块生效）；
 # 从控制台 / VNC 运行时没有来源地址，用一个文档保留地址代替。不支持 -C 时退回 sshd -T。
 sshd_eff() {
-  local out addr
+  local out addr user
   mkdir -p /run/sshd 2>/dev/null
   addr=${SSH_CONNECTION:-}
   addr=${addr%% *}
@@ -18,7 +42,8 @@ sshd_eff() {
     addr=$(who am i 2>/dev/null | awk '{ print $NF }' | tr -d '()')
   fi
   [[ $addr =~ ^[0-9a-fA-F:.]+$ ]] || addr=203.0.113.1
-  out=$("$SSHD_BIN" -T -C user=root,host=vhm-check,addr="$addr" 2>/dev/null) || out=""
+  user=$(access_user) || user=root
+  out=$("$SSHD_BIN" -T -C "user=$user,host=vhm-check,addr=$addr" 2>/dev/null) || out=""
   [[ -n $out ]] || out=$("$SSHD_BIN" -T 2>/dev/null) || out=""
   # OpenSSH 10.x 的 sshd -T 输出配置名用驼峰（Port、PasswordAuthentication），旧版是全小写；统一转成小写
   [[ -n $out ]] && awk '{ $1 = tolower($1); print }' <<<"$out"
@@ -99,7 +124,22 @@ ssh_reload() {
   fi
 }
 
-tfa_pam_lines() { grep -E '^[[:space:]]*auth[[:space:]]+required[[:space:]]+pam_google_authenticator\.so' "$PAM_SSHD" 2>/dev/null; }
+ssh_pam_auth_file() {
+  local user
+  user=$(access_user) || user=root
+  if access_profile_get "$user" >/dev/null 2>&1; then
+    access_profile_pam "$user"
+  elif [[ -f $(access_profile_state) ]]; then
+    printf '%s\n' "$PAM_ACCESS_LEGACY"
+  else
+    printf '%s\n' "$PAM_SSHD"
+  fi
+}
+tfa_pam_lines() {
+  local pam
+  pam=$(ssh_pam_auth_file)
+  grep -E '^[[:space:]]*auth[[:space:]]+required[[:space:]]+pam_google_authenticator\.so' "$pam" 2>/dev/null
+}
 # 带 nullok 时未绑定动态口令也可以跳过，不能算真正启用
 tfa_pam_on() {
   local lines
@@ -118,16 +158,17 @@ tfa_enabled() {
 }
 
 ssh_auth_mode() {
-  local methods password pubkey tfa common_auth
+  local methods password pubkey tfa common_auth pam
   methods=$(sshd_get authenticationmethods)
   password=$(sshd_get passwordauthentication)
   pubkey=$(sshd_get pubkeyauthentication)
   tfa=$(tfa_pam_on && echo yes || echo no)
+  pam=$(ssh_pam_auth_file)
   common_auth=no
-  if grep -Eq '^[[:space:]]*(@include[[:space:]]+common-auth|auth[[:space:]]+substack[[:space:]]+common-auth)' "$PAM_SSHD" 2>/dev/null; then common_auth=yes; fi
+  if grep -Eq '^[[:space:]]*(@include[[:space:]]+common-auth|auth[[:space:]]+substack[[:space:]]+common-auth)' "$pam" 2>/dev/null; then common_auth=yes; fi
   if [[ $tfa == yes && $methods == *publickey,keyboard-interactive* ]]; then
     if [[ $common_auth == yes ]]; then echo key_password_totp; else echo key_totp; fi
-  elif [[ $tfa == yes && $methods == keyboard-interactive ]]; then
+  elif [[ $tfa == yes && ( $methods == keyboard-interactive || $methods == keyboard-interactive:pam ) ]]; then
     if [[ $common_auth == yes ]]; then echo password_totp; else echo totp_only; fi
   elif [[ $methods == publickey && $pubkey == yes ]]; then echo key
   elif [[ $methods == password && $password == yes ]]; then echo password
