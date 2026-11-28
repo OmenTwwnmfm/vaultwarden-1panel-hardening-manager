@@ -129,7 +129,7 @@ access_has_password() {
 }
 
 access_create_user() { # 仅 [06] 在确认用户名不存在后调用
-  local user=$1 home="/home/$1" tool gid group_name groups
+  local user=$1 home="/home/$1" tool gid group_name groups sudo_status=0
   access_user_name_ok "$user" || return 1
   for tool in useradd passwd id; do
     command -v "$tool" >/dev/null 2>&1 || { log_err "缺少 $tool，无法创建用户"; return 1; }
@@ -150,9 +150,13 @@ access_create_user() { # 仅 [06] 在确认用户名不存在后调用
     log_err "$user 已创建，但未通过普通账号或独立用户组校验。请人工核对；向导未设置密码或更改 SSH 配置。"
     return 1
   fi
-  if command -v sudo >/dev/null 2>&1 && LC_ALL=C sudo -n -l -U "$user" >/dev/null 2>&1; then
-    log_err "$user 已创建，但现有 sudo 规则允许该用户使用 sudo。请先人工核对授权；向导未设置密码或更改 SSH 配置。"
-    return 1
+  if command -v sudo >/dev/null 2>&1; then
+    access_sudo_list_rules "$user" || sudo_status=$?
+    case $sudo_status in
+      0) log_err "$user 已创建，但现有 sudo 规则允许该用户使用 sudo。请先人工核对授权；向导未设置密码或更改 SSH 配置。"; return 1 ;;
+      1) ;;
+      *) log_err "$user 已创建，但无法核对现有 sudo 权限。请先人工核对授权；向导未设置密码或更改 SSH 配置。"; return 1 ;;
+    esac
   fi
   log_info "请按系统提示为 $user 设置密码。"
   if ! passwd "$user" || ! access_has_password "$user"; then
@@ -452,7 +456,7 @@ access_setup() (
   if [[ -z $user ]]; then read -r -p "普通管理员用户名（回车取消）: " user || return 0; fi
   [[ -n $user ]] || return 0
   access_set_user "$user" || return 1
-  if ! command -v sudo >/dev/null 2>&1 || ! LC_ALL=C sudo -n -l -U "$user" >/dev/null 2>&1; then
+  if ! access_sudo_can_manage "$user" >/dev/null 2>&1; then
     log_err "$user 没有可确认的 sudo 管理权限。只配置 SSH 请使用 [06] 的 [1]–[4]；启用管理员方案前可在 [7] 授权。"
     return 1
   fi

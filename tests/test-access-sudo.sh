@@ -23,7 +23,17 @@ id() {
 sudo() {
   case "$*" in
     -V) printf "Sudoers path: %s\nAuthentication methods: '%s'\n" "$SUDOERS_MAIN" "${FIXTURE_AUTH_METHOD:-pam}" ;;
-    '-n -l -U admin') [[ ${FIXTURE_SUDO_PRESENT:-0} == 1 || -f $grant_rule ]] ;;
+    '-n -l -U admin')
+      [[ $LC_ALL == C ]] || return 1
+      if [[ ${FIXTURE_SUDO_UNKNOWN:-0} == 1 ]]; then
+        printf 'User admin-other may run the following commands on testhost:\n' >&2
+      elif [[ ${FIXTURE_SUDO_PRESENT:-0} == 1 || -f $grant_rule ]]; then
+        printf 'User admin may run the following commands on testhost:\n    (ALL : ALL) ALL\n'
+      else
+        # The exit status alone may report success for this denial.
+        printf 'User admin is not allowed to run sudo on testhost.\n' >&2
+      fi
+      ;;
     '-n -l -U admin -u root -- /usr/bin/id') [[ ${FIXTURE_SUDO_VERIFY_FAIL:-0} == 0 && -f $grant_rule ]] ;;
     *) return 1 ;;
   esac
@@ -78,7 +88,7 @@ print('" TOTP_AUTH')
 PY
   chmod 600 "$T/private/admin/totp"
   unset FIXTURE_PASSWORD_STATUS FIXTURE_GROUPS FIXTURE_AUTH_METHOD FIXTURE_VISUDO_FAIL FIXTURE_VISUDO_FAIL_AFTER_WRITE
-  unset FIXTURE_SUDO_PRESENT FIXTURE_SUDO_VERIFY_FAIL FIXTURE_GRANT_SYNTAX_FAIL FIXTURE_GRANT_CONFIG_FAIL
+  unset FIXTURE_SUDO_PRESENT FIXTURE_SUDO_UNKNOWN FIXTURE_SUDO_VERIFY_FAIL FIXTURE_GRANT_SYNTAX_FAIL FIXTURE_GRANT_CONFIG_FAIL
 }
 
 expect_refused() {
@@ -230,6 +240,13 @@ FIXTURE_SUDO_PRESENT=1
 grant_call <<<yes || { echo 'FAIL 已授权用户未正常跳过'; fail=1; }
 grep -Fq '已有 sudo 授权' "$T/output" || { echo 'FAIL 未解释现有授权'; fail=1; }
 assert_no_grant_write '已有授权'
+
+reset_grant_fixture
+FIXTURE_SUDO_UNKNOWN=1
+grant_call <<<yes && { echo 'FAIL 无法识别 sudo 输出时仍继续授权'; fail=1; }
+grep -Fq '无法确认 admin 当前的 sudo 授权' "$T/output" || { echo 'FAIL 未解释 sudo 授权查询失败'; fail=1; }
+grep -Fq 'admin-other' "$T/output" && { echo 'FAIL 输出了未识别的 sudo 响应'; fail=1; }
+assert_no_grant_write '授权查询异常'
 
 reset_grant_fixture
 printf 'admin ALL=(ALL:ALL) NOPASSWD: ALL\n' >"$SUDOERS_DIR/custom-admin"

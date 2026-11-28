@@ -428,6 +428,21 @@ except (ValueError, OSError) as error:
 PY
 }
 
+access_sudo_list_rules() { # 0=已有授权，1=明确无授权，2=无法确认
+  local user=$1 output line allowed=0 denied=0
+  # 部分 sudo 版本在无授权时也返回 0；只识别当前账号的明确结果。
+  output=$(LC_ALL=C sudo -n -l -U "$user" 2>&1) || true
+  while IFS= read -r line; do
+    case $line in
+      "User $user may run the following commands on "?*) allowed=1 ;;
+      "User $user is not allowed to run sudo on "?*) denied=1 ;;
+    esac
+  done <<<"$output"
+  if ((allowed && !denied)); then return 0; fi
+  if ((denied && !allowed)); then return 1; fi
+  return 2
+}
+
 _access_sudo_context() { # 核对系统 sudo 与账户，输出该账号是否属于 sudo 组
   local user=$1 command_name member version
   for command_name in python3 getent passwd id sudo visudo; do
@@ -475,20 +490,21 @@ access_sudo_verify() { # 只读核对实际受管文件、完整策略与集中�
 }
 
 access_grant_sudo() ( # 已在 with_lock 中；只写此次用户的独立授权文件
-  local user=$1 member target candidate
-  member=$(_access_sudo_context "$user") || return 1
-  if LC_ALL=C sudo -n -l -U "$user" >/dev/null 2>&1; then
-    log_info "$user 已有 sudo 授权，未更改规则。"
-    return 0
-  fi
-  _access_sudo_policy grant-check "$user" "$member" || return 1
-  VH_ASSUME_YES=0 confirm_yes "授予 $user 完整 sudo 权限？该用户可用自己的账户密码以 root 身份执行任意命令，相当于获得系统管理权。" || return 0
-  member=$(_access_sudo_context "$user") || return 1
-  if LC_ALL=C sudo -n -l -U "$user" >/dev/null 2>&1; then
-    log_info "$user 已有 sudo 授权，未更改规则。"
-    return 0
-  fi
-  _access_sudo_policy grant-check "$user" "$member" || return 1
+  local user=$1 member target candidate phase status
+  for phase in confirm apply; do
+    member=$(_access_sudo_context "$user") || return 1
+    status=0
+    access_sudo_list_rules "$user" || status=$?
+    case $status in
+      0) log_info "$user 已有 sudo 授权，未更改规则。"; return 0 ;;
+      1) ;;
+      *) log_err "无法确认 $user 当前的 sudo 授权，未修改规则。"; return 1 ;;
+    esac
+    _access_sudo_policy grant-check "$user" "$member" || return 1
+    if [[ $phase == confirm ]]; then
+      VH_ASSUME_YES=0 confirm_yes "授予 $user 完整 sudo 权限？该用户可用自己的账户密码以 root 身份执行任意命令，相当于获得系统管理权。" || return 0
+    fi
+  done
 
   target="$SUDOERS_DIR/90-vhm-admin-$user"
   candidate=$(mktemp "$SUDOERS_DIR/.vhm-admin.XXXXXX") || { log_err '无法创建临时 sudoers 文件'; return 1; }

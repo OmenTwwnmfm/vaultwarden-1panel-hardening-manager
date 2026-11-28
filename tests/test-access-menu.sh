@@ -23,7 +23,14 @@ getent() {
     *) awk -F: -v name="$2" '$1 == name { print; found=1 } END { if (!found) exit 2 }' "$ACCESS_PASSWD_FILE" ;;
   esac
 }
-sudo() { [[ $* == "-n -l -U ${fixture_sudo_user:-none}" ]]; }
+sudo() {
+  [[ $1 == -n && $2 == -l && $3 == -U && $# == 4 ]] || return 1
+  if [[ $4 == "${fixture_sudo_user:-none}" ]]; then
+    printf 'User %s may run the following commands on fixture:\n    (ALL : ALL) ALL\n' "$4"
+  else
+    printf 'User %s is not allowed to run sudo on fixture.\n' "$4"
+  fi
+}
 access_password_terminal() { [[ ${fixture_terminal:-1} == 1 ]]; }
 access_safe_path() { [[ $1 == /home/* ]]; }
 useradd() {
