@@ -257,7 +257,9 @@ def check_pam(profiles):
         commented = line.startswith('#vhm# ')
         active_line = line[len('#vhm# '):].strip() if commented else line
         common = bool(re.fullmatch(r'@include\s+common-auth|auth\s+substack\s+common-auth', active_line))
-        auth_line = bool(re.match(r'-?auth\b', active_line)) or common
+        auth_line = bool(re.match(r'-?auth\b', active_line, flags=re.I))
+        if not line.startswith('#') and line.endswith('\\'):
+            refuse('SSH PAM 含不受支持的续行')
         if common or auth_line:
             if profiles:
                 refuse('SSH PAM 受管块外存在额外 auth 路径')
@@ -270,8 +272,14 @@ def check_pam(profiles):
             auth.append(original_line)
             if insertion is None:
                 insertion = len(retained)
-        elif line.startswith('@include') and not re.fullmatch(r'@include\s+common-(account|password|session(?:-noninteractive)?)', line):
-            refuse('SSH PAM 有不受支持的 include')
+        elif line.lower().startswith('@include'):
+            include = re.fullmatch(r'@include\s+(common-(account|password|session)(?:-noninteractive)?)', line)
+            if not include or (include[1].endswith('-noninteractive') and include[2] != 'session'):
+                refuse('SSH PAM 有不受支持的 include')
+            if profiles and operation == 'verify':
+                refuse('SSH PAM 受管块外存在未限制类型的 include')
+            # PAM 的 @include 会包含所有类型；只保留非 auth 文件原本的账户、密码或会话规则。
+            retained.append(f'{include[2]} include {include[1]}')
         else:
             retained.append(original_line)
     if not profiles and common_count != 1:
@@ -315,7 +323,7 @@ try:
         for name in sorted(set(profiles) | {user}):
             print(profile_path(name))
         sys.exit(0)
-    if operation not in ('check', 'apply') or not valid_user(user) or mode not in MODES:
+    if operation not in ('check', 'apply', 'verify') or not valid_user(user) or mode not in MODES:
         refuse('无效的用户 SSH profile 操作')
     profile_path(user)
     ssh_base = check_ssh(profiles)
@@ -329,12 +337,17 @@ try:
             read_secret(entry['secret'])
     if operation == 'check':
         sys.exit(0)
+    expected_profile = {'mode': mode, 'key': key if wants_key(mode) else '', 'secret': secret if wants_totp(mode) else ''}
+    if operation == 'verify':
+        if profiles.get(user) != expected_profile:
+            refuse('用户受管 SSH 登录方式、公钥或 TOTP 文件路径与预期不一致')
+        sys.exit(0)
     if wants_key(mode):
         checked(key, public=user != 'root')
     if wants_totp(mode):
         read_secret(secret)
     updated = dict(profiles)
-    updated[user] = {'mode': mode, 'key': key if wants_key(mode) else '', 'secret': secret if wants_totp(mode) else ''}
+    updated[user] = expected_profile
     if len(updated) > 64:
         refuse('最多支持 64 个独立登录用户')
     target = profile_path(user)
@@ -375,6 +388,7 @@ access_profile_track() {
   while IFS= read -r path; do change_track "$path" || return 1; done <<<"$paths"
 }
 access_profile_apply() { _access_profile_policy apply "$1" "$2" "${3:-}" "${4:-}"; }
+access_profile_verify() { _access_profile_policy verify "$1" "$2" "${3:-}" "${4:-}"; }
 
 access_profile_expect() { # 真实 sshd -T -C 验收，不允许退回全局显示结果
   local user=$1 mode=$2 key=${3:-} method password=no pubkey=no kbd=no addr eff actual setting expected

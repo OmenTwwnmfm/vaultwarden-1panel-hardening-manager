@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+from contextlib import contextmanager
 import hashlib
 import hmac
 import json
@@ -25,6 +26,17 @@ class IntegrationFailure(Exception):
 def require(condition, message):
     if not condition:
         raise IntegrationFailure(message)
+
+
+@contextmanager
+def report_step(label):
+    try:
+        yield
+    except IntegrationFailure:
+        raise
+    except Exception as error:
+        # Paramiko exceptions and PTY output need not be safe to print verbatim.
+        raise IntegrationFailure(f"{label}: {type(error).__name__}") from None
 
 
 def quiet_run(arguments, input_text=None):
@@ -121,31 +133,39 @@ def totp(credentials, username, token_mode="correct"):
     return f"{number:06d}"
 
 
-def connect(credentials):
-    transport = paramiko.Transport(
-        socket.create_connection(("127.0.0.1", credentials["port"]), timeout=10)
-    )
-    transport.banner_timeout = 10
-    transport.auth_timeout = 10
-    transport.start_client(timeout=10)
-    host_line = (Path(credentials["work"]) / "hostkey.pub").read_text().split()
-    expected_host = paramiko.Ed25519Key(data=base64.b64decode(host_line[1]))
-    require(transport.get_remote_server_key() == expected_host, "unexpected SSH host key")
-    return transport
+def connect(credentials, username, method):
+    with report_step(f"SSH TCP connection for {username} ({method})"):
+        transport = paramiko.Transport(
+            socket.create_connection(("127.0.0.1", credentials["port"]), timeout=10)
+        )
+    try:
+        with report_step(f"SSH handshake for {username} ({method})"):
+            transport.banner_timeout = 10
+            transport.auth_timeout = 10
+            transport.start_client(timeout=10)
+            host_line = (Path(credentials["work"]) / "hostkey.pub").read_text().split()
+            expected_host = paramiko.Ed25519Key(data=base64.b64decode(host_line[1]))
+            require(transport.get_remote_server_key() == expected_host, "unexpected SSH host key")
+        return transport
+    except BaseException:
+        transport.close()
+        raise
 
 
 def execute_id(transport):
-    channel = transport.open_session(timeout=10)
-    try:
-        channel.exec_command("/usr/bin/id -u")
-        require(channel.recv_exit_status() == 0, "authenticated command failed")
-        return channel.recv(1024).decode().strip()
-    finally:
-        channel.close()
+    with report_step("authenticated SSH session"):
+        channel = transport.open_session(timeout=10)
+        try:
+            channel.exec_command("/usr/bin/id -u")
+            require(channel.recv_exit_status() == 0, "authenticated command failed")
+            return channel.recv(1024).decode().strip()
+        finally:
+            channel.close()
 
 
 def legacy_login(credentials, username, expected, password=False):
-    transport = connect(credentials)
+    method = "publickey" if username == "root" and not password else "password"
+    transport = connect(credentials, username, method)
     success = False
     try:
         try:
@@ -160,7 +180,8 @@ def legacy_login(credentials, username, expected, password=False):
             success = transport.is_authenticated()
         except paramiko.AuthenticationException:
             success = False
-        method = "publickey" if username == "root" and not password else "password"
+        except Exception as error:
+            raise IntegrationFailure(f"SSH legacy authentication for {username} ({method}): {type(error).__name__}") from None
         require(success == expected, f"unexpected legacy SSH result for {username} using {method}")
         if success:
             result = execute_id(transport)
@@ -170,7 +191,7 @@ def legacy_login(credentials, username, expected, password=False):
 
 
 def profile_login(credentials, username, mode, key_mode=None, password_mode="correct", token_mode="correct"):
-    transport = connect(credentials)
+    transport = connect(credentials, username, mode)
     prompts_seen = {"password": 0, "token": 0}
     password = credentials["accounts"][username]["password"]
     password = password if password_mode == "correct" else "" if password_mode == "missing" else password + "!"
@@ -206,6 +227,12 @@ def profile_login(credentials, username, mode, key_mode=None, password_mode="cor
     except paramiko.AuthenticationException:
         transport.close()
         return None, prompts_seen
+    except IntegrationFailure:
+        transport.close()
+        raise
+    except Exception as error:
+        transport.close()
+        raise IntegrationFailure(f"SSH profile authentication for {username} ({mode}): {type(error).__name__}") from None
     except BaseException:
         transport.close()
         raise
@@ -399,10 +426,12 @@ def check(arguments):
         legacy_login(credentials, credentials["other"], True)
         transport = positive_login(credentials)
         try:
-            sudo_checks(credentials, transport)
+            with report_step("managed sudo conversation"):
+                sudo_checks(credentials, transport)
         finally:
             transport.close()
-        original_sudo_check(credentials, credentials["other"])
+        with report_step("unmanaged sudo conversation"):
+            original_sudo_check(credentials, credentials["other"])
     elif arguments.stage in ("profiles", "profiles-updated"):
         profiles_check(credentials, updated=arguments.stage == "profiles-updated")
     print(f"PASS access-auth {arguments.stage}")

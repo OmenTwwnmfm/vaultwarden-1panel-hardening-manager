@@ -13,7 +13,7 @@ trace="$test_dir/trace"
 title() { printf '%s\n' "$*"; }
 access_set_user() {
   [[ $1 == fixtureuser ]] || return 1
-  ACCESS_USER=$1 ACCESS_UID=12345 ACCESS_GID=12345 ACCESS_HOME="$test_dir/home"
+  ACCESS_USER=$1 ACCESS_UID=12345
   ACCESS_KEY_FILE="$test_dir/key" ACCESS_GA_FILE="$test_dir/totp"
 }
 

@@ -26,7 +26,7 @@ fixture() {
   PAM_COMMON_AUTH="$work/pam/common-auth" PAM_PROFILE_PREFIX="$work/pam/vhm-ssh-user-"
   ACCESS_PROFILES_STATE="$work/state/profiles.json" VH_STATE="$work/state"
   printf 'Include %s/*.conf\nUsePAM yes\nPermitRootLogin no\nSubsystem sftp internal-sftp\n' "$work/sshd_config.d" >"$SSHD_CONFIG"
-  printf '@include common-auth\naccount required pam_nologin.so\n@include common-account\n@include common-session\n' >"$PAM_SSHD"
+  printf '@include common-auth\naccount required pam_nologin.so\n@include common-account\n@include common-password\n@include common-session\n@include common-session-noninteractive\n' >"$PAM_SSHD"
   printf 'auth [success=1 default=ignore] pam_unix.so nullok\nauth requisite pam_deny.so\nauth required pam_permit.so\nauth optional pam_cap.so\n' >"$PAM_COMMON_AUTH"
   local user
   for user in root alice bob carol dave; do
@@ -65,7 +65,10 @@ done
 [[ $(grep -c '^Match User alice$' "$SSHD_CONFIG") == 1 ]] || fail 'ordinary-user Match duplicated on update'
 grep -Fxq 'Subsystem sftp internal-sftp' "$SSHD_CONFIG" || fail 'global-only directive changed'
 [[ $(grep -n '^Match ' "$SSHD_CONFIG" | head -n1 | cut -d: -f1) -gt $(grep -n '^Subsystem ' "$SSHD_CONFIG" | cut -d: -f1) ]] || fail 'Match precedes global configuration'
-grep -Fxq '@include common-session' "$PAM_SSHD" || fail 'PAM session removed'
+for include in 'account include common-account' 'password include common-password' 'session include common-session' 'session include common-session-noninteractive'; do
+  grep -Fxq "$include" "$PAM_SSHD" || fail "missing scoped PAM include: $include"
+done
+grep -Eq '^[[:space:]]*@include' "$PAM_SSHD" && fail 'PAM retained an unscoped include'
 [[ $(stat -c %a "$ACCESS_PROFILES_STATE") == 600 ]] || fail 'metadata is not private'
 
 fixture coexist
@@ -74,6 +77,10 @@ apply alice password_totp
 apply bob key
 apply carol key_password_totp
 [[ $(access_profile_list | wc -l) == 4 ]] || fail 'multi-user metadata lost entries'
+access_profile_verify carol key_password_totp "$work/keys/carol" "$work/secrets/carol/totp" || fail 'expected existing strong SSH profile was not verified'
+access_profile_verify carol key_totp "$work/keys/carol" "$work/secrets/carol/totp" >"$work/output" 2>&1 && fail 'wrong profile mode verified'
+access_profile_verify carol key_password_totp "$work/keys/alice" "$work/secrets/carol/totp" >"$work/output" 2>&1 && fail 'foreign key path verified'
+access_profile_verify carol key_password_totp "$work/keys/carol" "$work/secrets/alice/totp" >"$work/output" 2>&1 && fail 'foreign TOTP path verified'
 cp "$(access_profile_pam root)" "$work/root-helper-before"
 cp "$(access_profile_pam carol)" "$work/carol-helper-before"
 apply alice password
@@ -164,8 +171,13 @@ printf 'Match User bob\n  PasswordAuthentication yes\n' >"$work/nested.conf"
 access_profile_preflight alice key >"$work/output" 2>&1 && fail 'unmanaged recursive Match accepted'
 
 fixture unsafe-pam
-printf 'auth sufficient pam_permit.so\n' >>"$PAM_SSHD"
+printf 'Auth sufficient pam_permit.so\n' >>"$PAM_SSHD"
 access_profile_preflight alice key >"$work/output" 2>&1 && fail 'custom PAM bypass accepted'
+
+fixture unscoped-pam-drift
+apply alice password_totp
+printf '@include common-session\n' >>"$PAM_SSHD"
+access_profile_verify alice password_totp '' "$work/secrets/alice/totp" >"$work/output" 2>&1 && fail 'unexpected unscoped include verified'
 
 fixture custom-password
 printf 'auth sufficient pam_permit.so\n' >>"$PAM_COMMON_AUTH"

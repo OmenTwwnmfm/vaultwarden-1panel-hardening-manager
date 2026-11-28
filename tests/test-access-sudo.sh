@@ -11,7 +11,7 @@ export ACCESS_PASSWD_FILE="$T/passwd"
 # shellcheck source=scripts/lib/access-sudo.sh
 source scripts/lib/access-sudo.sh
 fail=0
-fixture_uid=$(id -u)
+fixture_uid=$(command id -u)
 log_err() { printf '%s\n' "$*" >&2; }
 _access_sudo_owner_uid() { printf '%s\n' "$fixture_uid"; }
 _access_sudo_modules() { return 0; }
@@ -23,7 +23,8 @@ id() {
 sudo() { printf "Sudoers path: %s\nAuthentication methods: '%s'\n" "$SUDOERS_MAIN" "${FIXTURE_AUTH_METHOD:-pam}"; }
 visudo() {
   printf '%s\n' "$*" >>"$T/visudo-calls"
-  [[ ${FIXTURE_VISUDO_FAIL:-0} == 0 && !( ${FIXTURE_VISUDO_FAIL_AFTER_WRITE:-0} == 1 && -f $SUDOERS_ACCESS ) ]]
+  [[ ${FIXTURE_VISUDO_FAIL:-0} == 0 ]] || return 1
+  [[ ${FIXTURE_VISUDO_FAIL_AFTER_WRITE:-0} != 1 || ! -f $SUDOERS_ACCESS ]]
 }
 change_track() { printf '%s\n' "$1" >>"$T/tracked"; }
 
@@ -56,7 +57,13 @@ session include sudo
 EOF
   printf 'Defaults env_reset\nDefaults mail_badpass\nDefaults secure_path="/usr/sbin:/usr/bin:/sbin:/bin"\nDefaults use_pty\nroot ALL=(ALL:ALL) ALL\n%%sudo ALL=(ALL:ALL) ALL\n@includedir %s\n' "$SUDOERS_DIR" >"$SUDOERS_MAIN"
   chmod 440 "$SUDOERS_MAIN"
-  printf 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567\n" TOTP_AUTH\n' >"$T/private/admin/totp"
+  python3 - <<'PY' >"$T/private/admin/totp"
+import base64
+import secrets
+
+print(base64.b32encode(secrets.token_bytes(20)).decode('ascii'))
+print('" TOTP_AUTH')
+PY
   chmod 600 "$T/private/admin/totp"
   unset FIXTURE_PASSWORD_STATUS FIXTURE_GROUPS FIXTURE_AUTH_METHOD FIXTURE_VISUDO_FAIL FIXTURE_VISUDO_FAIL_AFTER_WRITE
 }
@@ -115,7 +122,7 @@ for rule in 'admin ALL=(ALL) NOPASSWD: ALL' 'Defaults !authenticate' 'Defaults e
 done
 
 reset_fixture
-FIXTURE_GROUPS=admin
+FIXTURE_GROUPS='admin'
 expect_refused '自动给非管理员扩权'
 printf 'admin ALL=(ALL) PASSWD: ALL\n' >"$SUDOERS_DIR/20-admin"
 access_sudo_preflight admin >"$T/output" 2>&1 || { echo "FAIL 显式的用户 PASSWD:ALL 授权未通过"; cat "$T/output"; fail=1; }

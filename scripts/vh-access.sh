@@ -8,16 +8,16 @@ source "$VH_DIR/vh-ssh.sh"
 ACCESS_PASSWD_FILE=${ACCESS_PASSWD_FILE:-/etc/passwd}
 
 access_set_user() {
-  local user=$1 entry resolved name pw uid gid rest
+  local user=$1 entry resolved uid gid home shell
   [[ $user =~ ^[a-z_][a-z0-9_-]{0,31}$ && $user != root ]] || { log_err "请选择普通本地用户（不支持 root）"; return 1; }
   entry=$(awk -F: -v u="$user" '$1 == u { print }' "$ACCESS_PASSWD_FILE") || return 1
   resolved=$(getent passwd "$user") || return 1
   [[ -n $entry && $entry == "$resolved" && $entry != *$'\n'* ]] || { log_err "用户必须来自本地 passwd 数据库"; return 1; }
-  IFS=: read -r name pw uid gid rest ACCESS_HOME ACCESS_SHELL <<<"$entry"
-  [[ $uid =~ ^[0-9]+$ && $gid =~ ^[0-9]+$ && $uid -ge 1000 && $uid -lt 65534 && $ACCESS_HOME == /* ]] || { log_err "请选择 UID 1000–65533 的普通用户"; return 1; }
+  IFS=: read -r _ _ uid gid _ home shell <<<"$entry"
+  [[ $uid =~ ^[0-9]+$ && $gid =~ ^[0-9]+$ && $uid -ge 1000 && $uid -lt 65534 && $home == /* ]] || { log_err "请选择 UID 1000–65533 的普通用户"; return 1; }
   awk -F: -v uid="$uid" '$3 == uid { n++ } END { exit n != 1 }' "$ACCESS_PASSWD_FILE" || { log_err '该 UID 对应多个账户，请先人工整理'; return 1; }
-  grep -Fxq -- "$ACCESS_SHELL" /etc/shells && [[ $ACCESS_SHELL != */nologin && $ACCESS_SHELL != */false ]] || { log_err "该用户没有可用的交互 shell"; return 1; }
-  ACCESS_USER=$user ACCESS_UID=$uid ACCESS_GID=$gid
+  grep -Fxq -- "$shell" /etc/shells && [[ $shell != */nologin && $shell != */false ]] || { log_err "该用户没有可用的交互 shell"; return 1; }
+  ACCESS_USER=$user ACCESS_UID=$uid
   ACCESS_KEY_FILE="$ACCESS_KEYS_DIR/$user"
   ACCESS_GA_FILE="$ACCESS_SECRETS_DIR/$user/totp"
 }
@@ -59,28 +59,18 @@ access_expect_for() { # access_expect_for 用户 来源地址 配置项 期望�
   local eff actual
   eff=$(sshd_eff_for "$1" "$2") || { log_err "sshd 无法计算 $1 的生效配置"; return 1; }
   actual=$(awk -v key="$3" '$1 == key { $1=""; sub(/^ /, ""); print }' <<<"$eff")
+  if [[ $3 == permitrootlogin && $actual == without-password ]]; then actual=prohibit-password; fi
   [[ $actual == "$4" ]] || { log_err "$1 的 $3 为 ${actual:-空}，期望 $4"; return 1; }
 }
 
 access_ssh_expect() {
-  local user=$1 addr connection=${SSH_CONNECTION:-}
-  sshd_test >/dev/null || { log_err "普通用户 SSH 配置未通过 sshd -t"; return 1; }
-  for addr in "${connection%% *}" 203.0.113.1 2001:db8::1; do
-    [[ -n $addr ]] || continue
-    access_expect_for "$user" "$addr" authenticationmethods publickey,keyboard-interactive:pam &&
-      access_expect_for "$user" "$addr" usepam yes &&
-      access_expect_for "$user" "$addr" pubkeyauthentication yes &&
-      access_expect_for "$user" "$addr" passwordauthentication no &&
-      access_expect_for "$user" "$addr" kbdinteractiveauthentication yes &&
-      access_expect_for "$user" "$addr" permitemptypasswords no &&
-      access_expect_for "$user" "$addr" authorizedkeysfile "$ACCESS_KEY_FILE" || return 1
-  done
+  access_profile_expect "$1" key_password_totp "$ACCESS_KEY_FILE"
 }
 
 access_disable_root() {
-  local user=$1 addr connection=${SSH_CONNECTION:-}
+  local user=$1 addr connection_text=${SSH_CONNECTION:-}
   ensure_include && dropin_set PermitRootLogin no && access_ssh_expect "$user" || return 1
-  for addr in "${connection%% *}" 203.0.113.1 2001:db8::1; do
+  for addr in "${connection_text%% *}" 203.0.113.1 2001:db8::1; do
     [[ -n $addr ]] || continue
     access_expect_for root "$addr" permitrootlogin no || return 1
   done
@@ -97,7 +87,7 @@ access_track() {
 
 access_context() {
   if [[ $1 == root ]]; then
-    ACCESS_USER=root ACCESS_UID=0 ACCESS_GID=0 ACCESS_HOME=/root
+    ACCESS_USER=root ACCESS_UID=0
     ACCESS_KEY_FILE="$ACCESS_KEYS_DIR/root" ACCESS_GA_FILE="$ACCESS_SECRETS_DIR/root/totp"
   else
     access_set_user "$1"
@@ -119,6 +109,16 @@ access_choose_user() {
   esac
 }
 
+access_read_public_key() {
+  local line
+  echo "粘贴 $1 的一行 SSH 公钥（不读取私钥）："
+  read -r line || return 1
+  [[ $line =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-[^[:space:]]+|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)[[:space:]] ]] || {
+    log_err '公钥格式不支持'; return 1;
+  }
+  printf '%s\n' "$line" >"$2" && ssh-keygen -lf "$2" || { log_err '公钥校验失败'; return 1; }
+}
+
 access_profile_configure() (
   local user=$1 mode=$2 path eff temp_dir newga="" keytmp="" password_status permit
   access_context "$user" || return 1
@@ -138,20 +138,10 @@ access_profile_configure() (
   trap 'rm -rf -- "$temp_dir"' EXIT
   if [[ $mode == key* && ! -s $ACCESS_KEY_FILE ]]; then
     keytmp="$temp_dir/authorized_keys"
-    local existing="$ACCESS_HOME/.ssh/authorized_keys" keyline
-    if [[ -s $existing ]] && confirm_yes "复制 $user 现有的 authorized_keys 到 root 管理的授权列表？"; then
-      cat -- "$existing" >"$keytmp" || return 1
-    else
-      echo "粘贴 $user 的一行 SSH 公钥："
-      read -r keyline || return 0
-      [[ -n $keyline ]] || return 0
-      printf '%s\n' "$keyline" >"$keytmp"
-    fi
-    ssh-keygen -lf "$keytmp" || { log_err '公钥校验失败'; return 1; }
+    access_read_public_key "$user" "$keytmp" || return 1
   fi
   if [[ $mode == *_totp ]]; then
     time_synced || { log_err '先确认系统时间已同步，再启用 TOTP'; return 1; }
-    ga_install || return 1
     if [[ ! -f $ACCESS_GA_FILE ]]; then
       local GA_FILE="$temp_dir/totp" GA_ACCOUNT="$user"
       newga=$(ga_bind_new) || return 1
@@ -159,9 +149,10 @@ access_profile_configure() (
   fi
   for path in "$ACCESS_KEY_FILE" "$ACCESS_GA_FILE"; do access_safe_path "$path" || return 1; done
   echo "只更改 $user 的 SSH 登录方式为：$(auth_mode_label "$mode")。其他用户保留各自配置。"
+  [[ $user != root ]] || echo '此选项会允许 root 按所选方式通过 SSH 登录。'
   confirm_yes '已打开 VNC 应急控制台，继续？' || return 0
   change_begin "$user 的 SSH 登录方式：$(auth_mode_label "$mode")" sshd
-  if ! { access_profile_track "$user" && change_track "$SSHD_DROPIN" &&
+  if ! { access_profile_track "$user" && { [[ $user != root ]] || change_track "$SSHD_DROPIN"; } &&
     { [[ -z $keytmp ]] || change_track "$ACCESS_KEY_FILE"; } &&
     { [[ -z $newga ]] || change_track "$ACCESS_GA_FILE"; }; }; then
     change_status rolled_back
@@ -173,7 +164,6 @@ access_profile_configure() (
     install -d -o root -g root -m 700 "$ACCESS_SECRETS_DIR" "$ACCESS_SECRETS_DIR/$user" &&
     { [[ -z $keytmp ]] || install -o root -g root -m 644 "$keytmp" "$ACCESS_KEY_FILE"; } &&
     { [[ -z $newga ]] || install -o root -g root -m 600 "$newga" "$ACCESS_GA_FILE"; } &&
-    ensure_include && dropin_set UsePAM yes &&
     access_profile_apply "$user" "$mode" "$ACCESS_KEY_FILE" "$ACCESS_GA_FILE"; }; then
     guard_abort
     return 1
@@ -181,7 +171,7 @@ access_profile_configure() (
   if [[ $user == root ]]; then
     permit=yes
     [[ $mode != key ]] || permit=prohibit-password
-    dropin_set PermitRootLogin "$permit" || { guard_abort; return 1; }
+    ensure_include && dropin_set PermitRootLogin "$permit" || { guard_abort; return 1; }
     access_expect_for root 203.0.113.1 permitrootlogin "$permit" || { guard_abort; return 1; }
   fi
   access_profile_expect "$user" "$mode" "$ACCESS_KEY_FILE" &&
@@ -290,7 +280,8 @@ access_verify() {
   session=$(access_session "$user" "$ACCESS_UID") || { log_err "无法确认来自该用户的新 SSH 会话，请勿从 root shell 或复用连接执行"; return 1; }
   cutoff=$(cat "$dir/access-cutoff") || return 1
   [[ $cutoff =~ ^[0-9]+$ && ${session##*:} -gt $cutoff ]] || { log_err "请关闭连接复用，建立本阶段开始后的新 SSH 连接"; return 1; }
-  access_ssh_expect "$user" && access_sudo_verify "$user" "$ACCESS_GA_FILE" || return 1
+  access_profile_verify "$user" key_password_totp "$ACCESS_KEY_FILE" "$ACCESS_GA_FILE" &&
+    access_ssh_expect "$user" && access_sudo_verify "$user" "$ACCESS_GA_FILE" || return 1
   [[ $phase != final ]] || access_expect_for root 203.0.113.1 permitrootlogin no || return 1
   printf '%s\n' "$session" | access_write "$dir/access-verified-$phase" 600 || return 1
   log_ok "普通用户的新 SSH 会话和 sudo 调用已验证，请回到原窗口继续"
@@ -309,7 +300,7 @@ access_wait_verify() {
   echo "保持本窗口；另开一个新的 SSH 连接（禁用连接复用）："
   echo "  ssh -o ControlMaster=no -o ControlPath=none -p $port $user@$(server_ip)"
   echo "依次通过公钥、账户密码和动态验证码，然后直接执行："
-  echo "  sudo vhm access-verify $CHG_ID $phase"
+  echo "  sudo /usr/local/bin/vhm access-verify $CHG_ID $phase"
   echo "sudo 必须再次要求账户密码和动态验证码；验证码已用于登录时，请等下一组。"
   echo "不要进入 sudo -i / su；确认每项都被要求后回到这里。"
   echo "本次迁移的保护时间共 $GUARD_SECONDS 秒，当前剩余 $remaining 秒。"
@@ -322,7 +313,7 @@ access_wait_verify() {
 }
 
 access_setup() (
-  local user=${1:-} keytmp newga temp_dir original_root keyline fp
+  local user=${1:-} keytmp newga temp_dir original_root
   if access_active; then
     log_info "已启用普通用户模式：$(access_user)。绑定管理见 [07]；退出模式请在 [25] 回滚原迁移记录。"
     return 0
@@ -341,12 +332,7 @@ access_setup() (
   temp_dir=$(mktemp -d) || return 1
   trap 'rm -rf -- "$temp_dir"' EXIT
   keytmp="$temp_dir/authorized_keys"
-  echo "粘贴该用户的一行 SSH 公钥（不读取私钥）："
-  read -r keyline || return 0
-  [[ $keyline =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-[^[:space:]]+|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)[[:space:]] ]] || { log_err "公钥格式不支持"; return 1; }
-  printf '%s\n' "$keyline" >"$keytmp"
-  fp=$(ssh-keygen -lf "$keytmp" 2>/dev/null) || { log_err "不是有效的 SSH 公钥"; return 1; }
-  echo "公钥指纹：$fp"
+  access_read_public_key "$user" "$keytmp" || return 1
   local GA_FILE="$temp_dir/totp" GA_ACCOUNT="$user"
   newga=$(ga_bind_new) || return 1
   echo
@@ -396,7 +382,8 @@ access_tfa_manage() (
       ;;
     2)
       local temp_dir
-      access_safe_path "$ACCESS_GA_FILE" && time_synced && access_ssh_expect "$user" &&
+      access_safe_path "$ACCESS_GA_FILE" && time_synced &&
+        access_profile_verify "$user" key_password_totp "$ACCESS_KEY_FILE" "$ACCESS_GA_FILE" && access_ssh_expect "$user" &&
         access_sudo_verify "$user" "$ACCESS_GA_FILE" || { log_err '当前路径、时间同步或认证配置校验失败，未重新绑定'; return 1; }
       temp_dir=$(mktemp -d) || return 1
       trap 'rm -rf -- "$temp_dir"' EXIT

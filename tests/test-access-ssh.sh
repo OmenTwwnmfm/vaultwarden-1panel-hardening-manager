@@ -14,7 +14,7 @@ _access_profile_owner_uid() { id -u; }
 
 access_set_user() {
   [[ $1 == fixtureuser ]] || return 1
-  ACCESS_USER=$1 ACCESS_UID=12345 ACCESS_GID=12345 ACCESS_HOME="$work/home"
+  ACCESS_USER=$1 ACCESS_UID=12345
   ACCESS_KEY_FILE="$ACCESS_KEYS_DIR/$1" ACCESS_GA_FILE="$ACCESS_SECRETS_DIR/$1/totp"
 }
 
@@ -70,7 +70,8 @@ grep -Fq 'publickey,keyboard-interactive:pam' "$SSHD_CONFIG" || fail 'missing ma
 grep -Eq '^[[:space:]]*AuthenticationMethods[[:space:]]+publickey,keyboard-interactive:pam[[:space:]]*$' "$SSHD_CONFIG" || fail 'SSH authentication alternatives allowed'
 grep -Fq "$ACCESS_KEY_FILE" "$SSHD_CONFIG" || fail 'authorized key file does not belong to the selected user'
 grep -Fxq 'account required pam_nologin.so' "$PAM_SSHD" || fail 'PAM account rule removed'
-grep -Fxq '@include common-session' "$PAM_SSHD" || fail 'PAM session rules removed'
+grep -Fxq 'session include common-session' "$PAM_SSHD" || fail 'PAM session rules removed or not scoped'
+grep -Fxq 'account include common-account' "$PAM_SSHD" || fail 'PAM account rules removed or not scoped'
 grep -Eq '^auth[[:space:]]+substack[[:space:]]+common-auth' "$PAM_SELECTED" || fail 'selected user does not require account authentication'
 grep -Eq '^auth[[:space:]]+required[[:space:]]+pam_google_authenticator\.so' "$PAM_SELECTED" || fail 'selected user does not require TOTP'
 grep -Fq "secret=$ACCESS_GA_FILE" "$PAM_SELECTED" || fail 'TOTP does not use selected user secret path'
