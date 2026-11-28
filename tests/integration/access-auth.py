@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import codecs
 from contextlib import contextmanager
+from dataclasses import dataclass
 import hashlib
 import hmac
 import json
@@ -267,9 +269,51 @@ def wait_marker(channel, marker, timeout=15):
     raise IntegrationFailure("interactive shell did not become ready")
 
 
+@dataclass(frozen=True)
+class SudoResult:
+    status: int | None
+    passwords: int
+    tokens: int
+    ran_as_root: bool
+    hints: dict
+
+    @property
+    def both_factors(self):
+        return self.passwords > 0 and self.tokens > 0
+
+    def detail(self):
+        fields = {"exit": self.status, "password_prompts": self.passwords, "token_prompts": self.tokens, **self.hints}
+        return " ".join(f"{name}={value}" for name, value in fields.items())
+
+
+def sudo_result(status, prompts, output):
+    # Never return the transcript or an input value. Emit only counts and fixed diagnostic flags.
+    lower = output.casefold()
+    hints = {
+        "pam_auth_error": "pam authentication" in lower or "authentication failure" in lower,
+        "incorrect_password": "incorrect password" in lower or "sorry, try again" in lower,
+        "missing_tty": "a terminal is required" in lower or "no tty" in lower,
+        "no_new_privileges": "no new privileges" in lower or "no_new_privs" in lower,
+        "setuid_error": "setuid" in lower or "effective uid is not 0" in lower,
+        "account_error": "pam account management" in lower or "account validation" in lower,
+        "old_session": "请关闭连接复用，建立本阶段开始后的新 SSH 连接" in output,
+        "unknown_session": "无法确认来自该用户的新 SSH 会话" in output,
+        "wrong_sudo_context": "必须在新 SSH 会话中由" in output or "请直接执行向导给出的 sudo vhm access-verify" in output,
+    }
+    return SudoResult(status, prompts["password"], prompts["token"], bool(re.search(r"(?:^|[\r\n])0[\r\n]", output)), hints)
+
+
+SUDO_CHALLENGE = re.compile(
+    r"(?P<token>\b(?:verification|authentication|one[- ]time)[ \t]+code:)"
+    r"|(?P<password>\[sudo\][ \t]+password[ \t]+for[ \t]+[^:\r\n]+:"
+    r"|(?:^|[\r\n])[ \t]*(?:[^:\r\n]+'s[ \t]+)?Password:)",
+    re.IGNORECASE,
+)
+
+
 def sudo_command(channel, credentials, password_mode="correct", token_mode="correct", login=False, noninteractive=False, username=None, command="/usr/bin/id -u"):
     username = username or credentials["user"]
-    arguments = "-n" if noninteractive else "-p VHM_ACCOUNT_PASSWORD:"
+    arguments = "-n" if noninteractive else ""
     if login:
         arguments += " -i"
     channel.sendall(
@@ -277,30 +321,28 @@ def sudo_command(channel, credentials, password_mode="correct", token_mode="corr
     )
     pending = ""
     output = ""
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     prompts = {"password": 0, "token": 0}
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         if not channel.recv_ready():
-            require(not channel.closed, "sudo shell closed unexpectedly")
+            if channel.closed:
+                raise IntegrationFailure("sudo shell closed unexpectedly: " + sudo_result(None, prompts, output).detail())
             time.sleep(0.05)
             continue
-        received = channel.recv(4096).decode("utf-8", errors="replace")
+        received = decoder.decode(channel.recv(4096))
         pending += received
         output += received
-        result = re.search(r"VHM_SUDO_DONE:([0-9]+)", pending)
+        result = re.search(r"VHM_SUDO_DONE:([0-9]+)[\r\n]", pending)
         if result:
-            return int(result.group(1)), prompts, output
+            return sudo_result(int(result.group(1)), prompts, output)
         while True:
-            challenge = re.search(
-                r"VHM_ACCOUNT_PASSWORD:|Verification code:|Password:", pending,
-                flags=re.IGNORECASE,
-            )
+            challenge = SUDO_CHALLENGE.search(pending)
             if challenge is None:
                 break
-            label = challenge.group().lower()
             pending = pending[challenge.end() :]
             require(not noninteractive, "noninteractive sudo asked for a secret")
-            if "code" in label:
+            if challenge.lastgroup == "token":
                 prompts["token"] += 1
                 value = "" if token_mode == "missing" else totp(credentials, username, token_mode)
             else:
@@ -312,7 +354,7 @@ def sudo_command(channel, credentials, password_mode="correct", token_mode="corr
                 )
             require(sum(prompts.values()) <= 12, "sudo repeated too many challenges")
             channel.sendall(value + "\n")
-    raise IntegrationFailure("sudo conversation timed out")
+    raise IntegrationFailure("sudo conversation timed out: " + sudo_result(None, prompts, output).detail())
 
 
 @contextmanager
@@ -321,7 +363,7 @@ def sudo_shell(transport):
     try:
         channel.get_pty(term="dumb", width=120, height=25)
         channel.exec_command("exec /bin/bash --noprofile --norc")
-        channel.sendall("unset HISTFILE; PS1=''; stty -echo; printf '\\nVHM_SHELL_READY\\n'\n")
+        channel.sendall("unset HISTFILE; export LC_ALL=C; PS1=''; stty -echo; printf '\\nVHM_SHELL_READY\\n'\n")
         wait_marker(channel, "\r\nVHM_SHELL_READY\r\n")
         yield channel
     finally:
@@ -331,17 +373,17 @@ def sudo_shell(transport):
 def sudo_checks(credentials, transport):
     with sudo_shell(transport) as channel:
         for login in (False, False, True):
-            status, prompts, output = sudo_command(channel, credentials, login=login)
-            require(status == 0 and re.search(r"(?:^|[\r\n])0[\r\n]", output), "sudo did not run as root")
-            require(prompts["password"] > 0 and prompts["token"] > 0, "sudo skipped reauthentication")
-        status, _prompts, _output = sudo_command(channel, credentials, noninteractive=True)
-        require(status != 0, "sudo reused cached or passwordless authorization")
+            result = sudo_command(channel, credentials, login=login)
+            require(result.status == 0 and result.ran_as_root, "sudo did not run as root: " + result.detail())
+            require(result.both_factors, "sudo skipped reauthentication: " + result.detail())
+        result = sudo_command(channel, credentials, noninteractive=True)
+        require(result.status != 0, "sudo reused cached or passwordless authorization: " + result.detail())
         for password_mode, token_mode in (
             ("wrong", "correct"), ("correct", "wrong"),
             ("missing", "correct"), ("correct", "missing"),
         ):
-            status, _prompts, _output = sudo_command(channel, credentials, password_mode, token_mode)
-            require(status != 0, "sudo accepted an incomplete or incorrect factor")
+            result = sudo_command(channel, credentials, password_mode, token_mode)
+            require(result.status != 0, "sudo accepted an incomplete or incorrect factor: " + result.detail())
 
 
 def original_sudo_check(credentials, username):
@@ -351,9 +393,9 @@ def original_sudo_check(credentials, username):
         with sudo_shell(transport) as channel:
             channel.sendall("sudo -k; printf '\\nVHM_SUDO_RESET\\n'\n")
             wait_marker(channel, "\r\nVHM_SUDO_RESET\r\n")
-            status, prompts, output = sudo_command(channel, credentials, username=username)
-            require(status == 0 and re.search(r"(?:^|[\r\n])0[\r\n]", output), "unmanaged sudo did not run as root")
-            require(prompts["password"] > 0 and prompts["token"] == 0, "sudo altered another administrator's authentication")
+            result = sudo_command(channel, credentials, username=username)
+            require(result.status == 0 and result.ran_as_root, "unmanaged sudo did not run as root: " + result.detail())
+            require(result.passwords > 0 and result.tokens == 0, "sudo altered another administrator's authentication: " + result.detail())
     finally:
         transport.close()
 
@@ -377,9 +419,10 @@ def verify_checks(credentials, change, phase):
                 # The server session is already running when we set the cutoff.
                 cutoff = boot_ticks()
                 write_private(record / "access-cutoff", str(cutoff) + "\n")
-                status, prompts, _output = sudo_command(channel, credentials, command=command)
-                require(prompts["password"] > 0 and prompts["token"] > 0, "old session skipped sudo authentication")
-                require(status != 0 and not marker.exists(), "old SSH session was allowed to verify the change")
+                result = sudo_command(channel, credentials, command=command)
+                require(result.both_factors, "old session skipped sudo authentication: " + result.detail())
+                require(result.status != 0 and result.hints["old_session"] and not marker.exists(),
+                        "old SSH session was not rejected by the freshness check: " + result.detail())
         finally:
             old.close()
     else:
@@ -390,9 +433,9 @@ def verify_checks(credentials, change, phase):
     fresh = positive_login(credentials)
     try:
         with sudo_shell(fresh) as channel:
-            status, prompts, _output = sudo_command(channel, credentials, command=command)
-            require(prompts["password"] > 0 and prompts["token"] > 0, "verification skipped either sudo factor")
-            require(status == 0 and marker.is_file(), "fresh SSH session failed to verify the change")
+            result = sudo_command(channel, credentials, command=command)
+            require(result.both_factors, "verification skipped either sudo factor: " + result.detail())
+            require(result.status == 0 and marker.is_file(), "fresh SSH session failed to verify the change: " + result.detail())
     finally:
         fresh.close()
 
