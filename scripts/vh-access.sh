@@ -69,7 +69,7 @@ access_ssh_expect() {
 
 access_disable_root() {
   local user=$1 addr connection_text=${SSH_CONNECTION:-}
-  ensure_include && dropin_set PermitRootLogin no && access_ssh_expect "$user" || return 1
+  access_profile_disable_root "$user" && access_ssh_expect "$user" || return 1
   for addr in "${connection_text%% *}" 203.0.113.1 2001:db8::1; do
     [[ -n $addr ]] || continue
     access_expect_for root "$addr" permitrootlogin no || return 1
@@ -78,7 +78,7 @@ access_disable_root() {
 
 access_track() {
   local path
-  for path in "$SSHD_CONFIG" "$SSHD_DROPIN" "$PAM_SSHD" "$PAM_ACCESS_SSH" "$PAM_ACCESS_LEGACY" \
+  for path in "$SSHD_CONFIG" "$PAM_SSHD" "$PAM_ACCESS_SSH" "$PAM_ACCESS_LEGACY" \
     "$ACCESS_KEY_FILE" "$ACCESS_GA_FILE" "$ACCESS_STATE"; do
     change_track "$path" || return 1
   done
@@ -120,7 +120,7 @@ access_read_public_key() {
 }
 
 access_profile_configure() (
-  local user=$1 mode=$2 path eff temp_dir newga="" keytmp="" password_status permit
+  local user=$1 mode=$2 path eff temp_dir newga="" keytmp="" password_status permit=""
   access_context "$user" || return 1
   if access_active && { [[ $user == root ]] || [[ $user == "$(access_user)" ]]; }; then
     log_err '该账户属于已启用的普通管理员安全方案，请先在 [25] 回滚原迁移，再更换登录方式。'
@@ -149,10 +149,14 @@ access_profile_configure() (
   fi
   for path in "$ACCESS_KEY_FILE" "$ACCESS_GA_FILE"; do access_safe_path "$path" || return 1; done
   echo "只更改 $user 的 SSH 登录方式为：$(auth_mode_label "$mode")。其他用户保留各自配置。"
-  [[ $user != root ]] || echo '此选项会允许 root 按所选方式通过 SSH 登录。'
+  if [[ $user == root ]]; then
+    permit=yes
+    [[ $mode != key ]] || permit=prohibit-password
+    echo '此选项会允许 root 按所选方式通过 SSH 登录。'
+  fi
   confirm_yes '已打开 VNC 应急控制台，继续？' || return 0
   change_begin "$user 的 SSH 登录方式：$(auth_mode_label "$mode")" sshd
-  if ! { access_profile_track "$user" && { [[ $user != root ]] || change_track "$SSHD_DROPIN"; } &&
+  if ! { access_profile_track "$user" &&
     { [[ -z $keytmp ]] || change_track "$ACCESS_KEY_FILE"; } &&
     { [[ -z $newga ]] || change_track "$ACCESS_GA_FILE"; }; }; then
     change_status rolled_back
@@ -164,14 +168,11 @@ access_profile_configure() (
     install -d -o root -g root -m 700 "$ACCESS_SECRETS_DIR" "$ACCESS_SECRETS_DIR/$user" &&
     { [[ -z $keytmp ]] || install -o root -g root -m 644 "$keytmp" "$ACCESS_KEY_FILE"; } &&
     { [[ -z $newga ]] || install -o root -g root -m 600 "$newga" "$ACCESS_GA_FILE"; } &&
-    access_profile_apply "$user" "$mode" "$ACCESS_KEY_FILE" "$ACCESS_GA_FILE"; }; then
+    access_profile_apply "$user" "$mode" "$ACCESS_KEY_FILE" "$ACCESS_GA_FILE" "$permit"; }; then
     guard_abort
     return 1
   fi
   if [[ $user == root ]]; then
-    permit=yes
-    [[ $mode != key ]] || permit=prohibit-password
-    ensure_include && dropin_set PermitRootLogin "$permit" || { guard_abort; return 1; }
     access_expect_for root 203.0.113.1 permitrootlogin "$permit" || { guard_abort; return 1; }
   fi
   access_profile_expect "$user" "$mode" "$ACCESS_KEY_FILE" &&
@@ -326,7 +327,7 @@ access_setup() (
   access_set_user "$user" || return 1
   ga_install && access_sudo_preflight "$user" && access_ssh_preflight "$user" || return 1
   local path
-  for path in "$SSHD_CONFIG" "$SSHD_DROPIN" "$PAM_SSHD" "$PAM_ACCESS_SSH" "$PAM_ACCESS_LEGACY" \
+  for path in "$SSHD_CONFIG" "$PAM_SSHD" "$PAM_ACCESS_SSH" "$PAM_ACCESS_LEGACY" \
     "$ACCESS_KEY_FILE" "$ACCESS_GA_FILE" "$ACCESS_STATE"; do access_safe_path "$path" || return 1; done
   time_synced || { log_err "先启用并确认系统时间同步，再配置动态口令"; return 1; }
   temp_dir=$(mktemp -d) || return 1

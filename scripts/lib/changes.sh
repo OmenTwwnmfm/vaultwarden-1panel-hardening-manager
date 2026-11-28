@@ -142,7 +142,7 @@ run_hooks() { # run_hooks 记录目录 钩子...
 
 # 回滚一条变更；按记录加锁，重复调用无副作用（守护定时器与前台可能同时触发）
 change_rollback() {
-  local id=$1 d="$VH_CHANGES/$1" st hooks rc=0 acquired_vbm=0
+  local id=$1 d="$VH_CHANGES/$1" st hooks newer rc=0 acquired_vbm=0
   [[ $id =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ && -d $d ]] || { log_err "找不到变更记录：$id"; return 1; }
   exec 7>"$d/.lock" || return 1
   flock -w 60 7 || { log_err "变更 $id 正在被处理"; exec 7>&-; return 1; }
@@ -156,6 +156,11 @@ change_rollback() {
     log_info "变更 $id 状态为 $st（已确认保留），自动回滚取消"
     exec 7>&-
     return 0
+  fi
+  if [[ ${VH_ROLLBACK_PENDING_ONLY:-0} != 1 ]] && newer=$(change_newer_overlap "$id" ssh-auth); then
+    log_err "回滚 $id 会覆盖较新的 SSH/PAM 认证变更 $newer。请先按从新到旧的顺序回滚重叠的 SSH 变更；本次未恢复文件。"
+    exec 7>&-
+    return 1
   fi
   hooks=$(change_meta "$id" HOOKS)
   if [[ " $hooks " == *" vw "* ]]; then
@@ -209,18 +214,37 @@ change_claim_confirmed() {
   return "$rc"
 }
 
-# 是否有更新的变更改过同一批文件（自动回滚此时会覆盖新配置）
+# 只识别由本项目管理的 SSH、PAM 和提权认证文件，避免限制其他手动回滚。
+change_ssh_auth_path() {
+  case $1 in
+    "$SSHD_CONFIG"|"$SSHD_DROPIN"|"$SSH_SOCKET_DROPIN"|"$PAM_SSHD"|"$ROOT_KEYS"|"$GA_FILE"|\
+    "$ACCESS_STATE"|"${ACCESS_PROFILES_STATE:-$VH_STATE/ssh-profiles.json}"|"$PAM_ACCESS_SSH"|"$PAM_ACCESS_LEGACY"|\
+    "${PAM_PROFILE_PREFIX:-${PAM_ACCESS_SSH%/*}/vhm-ssh-user-}"*|"$ACCESS_KEYS_DIR/"*|"$ACCESS_SECRETS_DIR/"*|\
+    "$PAM_SUDO"|"$PAM_SUDO_I"|"$PAM_ACCESS_SUDO"|"$SUDOERS_ACCESS") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# 自动回滚检查全部路径；手动回滚只检查认证路径，并返回一个阻挡记录的编号。
 change_newer_overlap() {
-  local id=$1 other d p st
+  local id=$1 scope=${2:-all} other d p st
   while IFS= read -r p; do
     [[ -n $p ]] || continue
+    if [[ $scope == ssh-auth ]]; then change_ssh_auth_path "$p" || continue; fi
     for d in "$VH_CHANGES"/*; do
       [[ -d $d ]] || continue
       other=${d##*/}
       [[ $other =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ && $other > $id ]] || continue
       st=$(cat "$d/status" 2>/dev/null)
-      case $st in applied | confirmed | pending) ;; *) continue ;; esac
-      awk -F'\t' -v p="$p" '$5 == p { found = 1 } END { exit !found }' "$d/files.tsv" 2>/dev/null && return 0
+      case $st in
+        applied | confirmed | pending) ;;
+        rollback_failed) [[ $scope == ssh-auth ]] || continue ;;
+        *) continue ;;
+      esac
+      if awk -F'\t' -v p="$p" '$5 == p { found = 1 } END { exit !found }' "$d/files.tsv" 2>/dev/null; then
+        if [[ $scope == ssh-auth ]]; then printf '%s\n' "$other"; fi
+        return 0
+      fi
     done
   done < <(awk -F'\t' '{ print $5 }' "$VH_CHANGES/$id/files.tsv" 2>/dev/null)
   return 1

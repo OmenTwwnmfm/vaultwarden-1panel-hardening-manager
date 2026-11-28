@@ -52,5 +52,51 @@ if ((EUID != 0)); then
   [[ $(cat "$CHG_DIR/status") == rolled_back ]] || { echo "FAIL 重试后状态不是 rolled_back"; fail=1; }
 fi
 
+# Earlier SSH rollback cannot overwrite a later profile; the newest record can be rolled back first.
+SSHD_CONFIG="$T/sshd_config"
+PAM_SSHD="$T/pam-sshd"
+ACCESS_STATE="$T/access.conf"
+ssh_reload() { printf 'reload\n' >>"$T/ssh-reloads"; }
+printf 'original ssh\n' >"$SSHD_CONFIG"
+printf 'original pam\n' >"$PAM_SSHD"
+change_begin '旧 SSH 变更' sshd >/dev/null
+old_ssh_id=$CHG_ID
+change_track "$SSHD_CONFIG"
+change_track "$PAM_SSHD"
+printf 'older ssh\n' >"$SSHD_CONFIG"
+printf 'older pam\n' >"$PAM_SSHD"
+change_status confirmed
+change_begin '新普通管理员迁移' sshd >/dev/null
+new_ssh_id=$CHG_ID
+change_track "$SSHD_CONFIG"
+change_track "$PAM_SSHD"
+change_track "$ACCESS_STATE"
+printf 'newer ssh\n' >"$SSHD_CONFIG"
+printf 'newer pam\n' >"$PAM_SSHD"
+printf 'active\n' >"$ACCESS_STATE"
+change_status confirmed
+change_rollback "$old_ssh_id" >"$T/overlap-output" 2>&1 && { echo 'FAIL 旧 SSH 回滚覆盖较新认证配置'; fail=1; }
+grep -Fq "$new_ssh_id" "$T/overlap-output" || { echo 'FAIL 未提示阻挡回滚的变更编号'; fail=1; }
+[[ $(<"$SSHD_CONFIG") == 'newer ssh' && $(<"$PAM_SSHD") == 'newer pam' && $(<"$ACCESS_STATE") == active &&
+   $(<"$VH_CHANGES/$old_ssh_id/status") == confirmed && ! -e $T/ssh-reloads ]] || { echo 'FAIL 拒绝回滚时修改了文件、状态或服务'; fail=1; }
+change_status rollback_failed
+change_rollback "$old_ssh_id" >/dev/null 2>&1 && { echo 'FAIL 较新的认证变更回滚不完整时允许覆盖'; fail=1; }
+change_rollback "$new_ssh_id" >/dev/null && change_rollback "$old_ssh_id" >/dev/null || { echo 'FAIL 未允许按顺序回滚 SSH 变更'; fail=1; }
+[[ $(<"$SSHD_CONFIG") == 'original ssh' && $(<"$PAM_SSHD") == 'original pam' && ! -e $ACCESS_STATE ]] || { echo 'FAIL 按顺序回滚未恢复原认证配置'; fail=1; }
+
+# Non-SSH history retains the previous manual overlap behavior.
+printf 'original\n' >"$T/firewall.conf"
+change_begin '旧防火墙变更' >/dev/null
+old_firewall_id=$CHG_ID
+change_track "$T/firewall.conf"
+printf 'older\n' >"$T/firewall.conf"
+change_status applied
+change_begin '新防火墙变更' >/dev/null
+change_track "$T/firewall.conf"
+printf 'newer\n' >"$T/firewall.conf"
+change_status applied
+change_rollback "$old_firewall_id" >/dev/null || { echo 'FAIL 错误拦截了无关文件的手动回滚'; fail=1; }
+[[ $(<"$T/firewall.conf") == original ]] || { echo 'FAIL 无关文件未恢复'; fail=1; }
+
 ((fail == 0)) && echo "PASS change-rollback"
 exit $fail

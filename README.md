@@ -204,11 +204,11 @@ Vaultwarden 把整个家庭或团队的密码库放在一台 VPS 上，这台服
 
 **启用 2FA 后登录被拒怎么办？** 先确认系统时间已同步，再尝试用应急码登录。仍不行就在保护时间内什么都不做，等待自动回滚；或通过 VNC 登录，用 `vhm changes` 查看变更 ID 后执行 `vhm rollback <变更ID>`。
 
-**为什么启用 2FA 后 `PermitRootLogin` 是 `yes`？** 认证方式已强制「先通过密钥，再输入动态口令」，密码登录同时关闭，所以不会放开 root 密码登录。设为 `prohibit-password` 会让动态口令那一步被拒绝。关闭 2FA 时自动改回 `prohibit-password`。
+**为什么 root 选「密钥 + TOTP」后 `PermitRootLogin` 是 `yes`？** OpenSSH 的 `prohibit-password` 也会禁止 root 通过键盘交互输入动态口令。这个模式用 `AuthenticationMethods` 强制先过密钥、再过 TOTP，并关闭 SSH 密码认证。切回 root 的纯密钥模式会使用 `prohibit-password`；给普通用户设置 TOTP 不会改变 root 的登录规则。
 
-**1Panel「SSH 管理」显示的值和实际不一致？** vhm 的配置在 `sshd_config.d/00-vhm.conf`，优先于主配置。以 `[03]` 显示的生效值为准，SSH 建议只用 vhm 管理。
+**1Panel「SSH 管理」显示的值和实际不一致？** `[06]` 按用户设置 SSH 登录方式，面板显示的全局值不一定适用于某个用户。通过 `[03]` 查看已配置的账号和对应模式，修改后再用新连接验证。
 
-**1Panel 的网页「终端」用不了了？** 它通过 SSH 连接本机，启用 2FA 后无法使用。1Panel 的「容器终端」不走 SSH，不受影响。
+**1Panel 的网页「终端」用不了了？** 它通过 SSH 连接本机。所用账号启用 TOTP 后，网页终端也必须支持该认证组合。1Panel 的「容器终端」不走 SSH，不受影响。
 
 **改了 1Panel 应用参数却不生效？** `config.json` 中的同名设置优先。用 `[18]` 查看每项的来源，在 vhm 中修改即可。
 

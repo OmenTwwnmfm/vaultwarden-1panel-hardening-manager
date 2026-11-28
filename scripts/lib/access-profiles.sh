@@ -25,8 +25,8 @@ _access_profile_modules() {
 }
 
 _access_profile_policy() {
-  local operation=$1 user=${2:-} mode=${3:-} key=${4:-} secret=${5:-}
-  python3 - "$operation" "$user" "$mode" "$key" "$secret" "$(_access_profile_owner_uid)" \
+  local operation=$1 user=${2:-} mode=${3:-} key=${4:-} secret=${5:-} root_policy=${6:-}
+  python3 - "$operation" "$user" "$mode" "$key" "$secret" "$root_policy" "$(_access_profile_owner_uid)" \
     "$SSHD_CONFIG" "$PAM_SSHD" "$PAM_ACCESS_LEGACY" "$(access_profile_state)" \
     "${PAM_PROFILE_PREFIX:-$(dirname "$PAM_ACCESS_SSH")/vhm-ssh-user-}" \
     "${PAM_COMMON_AUTH:-$(dirname "$PAM_SSHD")/common-auth}" <<'PY'
@@ -40,10 +40,11 @@ import sys
 import tempfile
 from pathlib import Path
 
-(operation, user, mode, key, secret, owner, ssh_config, pam_service, pam_legacy,
+(operation, user, mode, key, secret, requested_root_policy, owner, ssh_config, pam_service, pam_legacy,
  state_file, profile_prefix, common_auth) = sys.argv[1:]
 owner = int(owner)
 MODES = {'password', 'key', 'password_totp', 'key_totp', 'key_password_totp'}
+ROOT_POLICIES = ('no', 'yes', 'prohibit-password')
 BEGIN_SSH = '# BEGIN vhm user profiles'
 END_SSH = '# END vhm user profiles'
 BEGIN_PAM = '# BEGIN vhm user authentication'
@@ -115,10 +116,14 @@ def profile_path(name):
 def read_state():
     path = checked(state_file, missing=True, private=True)
     if not path.exists():
-        return {}
+        return {}, ''
     data = json.loads(text(path))
-    if not isinstance(data, dict) or set(data) != {'version', 'profiles'} or data['version'] != 1:
+    fields = {'version', 'profiles'}
+    if not isinstance(data, dict) or set(data) not in (fields, fields | {'root_policy'}) or data['version'] != 1:
         refuse('SSH profile 元数据版本或结构不受支持')
+    root_policy = data.get('root_policy', '')
+    if root_policy not in ('', *ROOT_POLICIES):
+        refuse('受管 root 登录开关无效')
     profiles = data['profiles']
     if not isinstance(profiles, dict) or not profiles or len(profiles) > 64:
         refuse('SSH profile 用户数量无效（最多 64 个）')
@@ -132,7 +137,7 @@ def read_state():
             if required:
                 safe_path(entry[field])
         profile_path(name)
-    return profiles
+    return profiles, root_policy
 
 def read_secret(value):
     path = checked(value, private=True)
@@ -180,22 +185,27 @@ def render_dispatch(profiles):
     lines += ['auth substack ' + Path(pam_legacy).name, END_PAM]
     return '\n'.join(lines) + '\n'
 
-def render_ssh(profiles):
+def render_ssh(profiles, root_policy):
     lines = [BEGIN_SSH]
-    for name in sorted(profiles):
+    names = set(profiles) | ({'root'} if root_policy else set())
+    for name in sorted(names):
+        lines.append('Match User ' + name)
+        if name == 'root' and root_policy:
+            lines.append('    PermitRootLogin ' + root_policy)
+        if name not in profiles:
+            continue
         entry = profiles[name]
         mode = entry['mode']
         methods = {'password': 'password', 'key': 'publickey', 'password_totp': 'keyboard-interactive:pam',
                    'key_totp': 'publickey,keyboard-interactive:pam',
                    'key_password_totp': 'publickey,keyboard-interactive:pam'}[mode]
-        lines += ['Match User ' + name, '    AuthenticationMethods ' + methods,
+        lines += ['    AuthenticationMethods ' + methods,
                   '    PasswordAuthentication ' + ('yes' if mode == 'password' else 'no'),
                   '    PubkeyAuthentication ' + ('yes' if wants_key(mode) else 'no'),
                   '    KbdInteractiveAuthentication ' + ('yes' if wants_totp(mode) else 'no'),
                   '    PermitEmptyPasswords no']
         if wants_key(mode):
             lines.append('    AuthorizedKeysFile ' + entry['key'])
-        # PermitRootLogin 只由明确的 root 开关维护；配置其他用户不能重新开放 root。
     lines.append(END_SSH)
     return '\n'.join(lines) + '\n'
 
@@ -209,11 +219,11 @@ def split_managed(content, begin, end):
         refuse('受管认证块标记损坏或重复')
     return ''.join(lines[:first[0]]) + ''.join(lines[last[0] + 1:]), ''.join(lines[first[0]:last[0] + 1])
 
-def check_ssh(profiles):
+def check_ssh(profiles, root_policy):
     original = text(checked(ssh_config))
     base, block = split_managed(original, BEGIN_SSH, END_SSH)
     if profiles:
-        if block != render_ssh(profiles) or not original.rstrip().endswith(END_SSH):
+        if block != render_ssh(profiles, root_policy) or not original.rstrip().endswith(END_SSH):
             refuse('SSH 受管 Match 块被修改或不在主配置尾部')
     elif block:
         refuse('存在无元数据的 SSH 受管配置，请先回滚或人工审核')
@@ -280,7 +290,7 @@ def check_pam(profiles):
             include = re.fullmatch(r'@include\s+(common-(account|password|session)(?:-noninteractive)?)', line)
             if not include or (include[1].endswith('-noninteractive') and include[2] != 'session'):
                 refuse('SSH PAM 有不受支持的 include')
-            if profiles and operation == 'verify':
+            if profiles and operation in ('verify', 'disable-root'):
                 refuse('SSH PAM 受管块外存在未限制类型的 include')
             # PAM 的 @include 会包含所有类型；只保留非 auth 文件原本的账户、密码或会话规则。
             retained.append(f'{include[2]} include {include[1]}')
@@ -307,8 +317,15 @@ def atomic_write(value, content, permissions):
         if os.path.exists(temporary):
             os.unlink(temporary)
 
+def write_ssh_state(base, profiles, root_policy):
+    state = {'version': 1, 'profiles': profiles}
+    if root_policy:
+        state['root_policy'] = root_policy
+    atomic_write(ssh_config, base.rstrip('\n') + '\n\n' + render_ssh(profiles, root_policy), 0o600)
+    atomic_write(state_file, json.dumps(state, ensure_ascii=False, sort_keys=True, indent=2) + '\n', 0o600)
+
 try:
-    profiles = read_state()
+    profiles, root_policy = read_state()
     if operation == 'get':
         if user in profiles:
             print(profiles[user]['mode'])
@@ -327,10 +344,16 @@ try:
         for name in sorted(set(profiles) | {user}):
             print(profile_path(name))
         sys.exit(0)
-    if operation not in ('check', 'apply', 'verify') or not valid_user(user) or mode not in MODES:
+    if operation not in ('check', 'apply', 'verify', 'disable-root') or not valid_user(user) or mode not in MODES:
         refuse('无效的用户 SSH profile 操作')
+    if requested_root_policy:
+        if (operation != 'apply' or user != 'root' or
+                requested_root_policy != ('prohibit-password' if mode == 'key' else 'yes')):
+            refuse('仅能在明确配置 root 登录方式时设置对应的 root 登录开关')
+        if root_policy == 'no':
+            refuse('普通管理员方案已经关闭 root SSH；请先回滚原迁移')
     profile_path(user)
-    ssh_base = check_ssh(profiles)
+    ssh_base = check_ssh(profiles, root_policy)
     retained, insertion, old_auth = check_pam(profiles)
     if wants_password(mode) or any(wants_password(entry['mode']) for entry in profiles.values()):
         check_common()
@@ -340,6 +363,11 @@ try:
         if wants_totp(entry['mode']):
             read_secret(entry['secret'])
     if operation == 'check':
+        sys.exit(0)
+    if operation == 'disable-root':
+        if user == 'root' or profiles.get(user, {}).get('mode') != 'key_password_totp':
+            refuse('必须先配置替代 root SSH 的普通管理员')
+        write_ssh_state(ssh_base, profiles, 'no')
         sys.exit(0)
     expected_profile = {'mode': mode, 'key': key if wants_key(mode) else '', 'secret': secret if wants_totp(mode) else ''}
     if operation == 'verify':
@@ -370,8 +398,7 @@ try:
     atomic_write(target, render_helper(updated[user]), 0o644)
     pam_lines = retained[:insertion] + render_dispatch(updated).rstrip('\n').splitlines() + retained[insertion:]
     atomic_write(pam_service, '\n'.join(pam_lines) + '\n', 0o644)
-    atomic_write(ssh_config, ssh_base.rstrip('\n') + '\n\n' + render_ssh(updated), 0o600)
-    atomic_write(state_file, json.dumps({'version': 1, 'profiles': updated}, ensure_ascii=False, sort_keys=True, indent=2) + '\n', 0o600)
+    write_ssh_state(ssh_base, updated, requested_root_policy or root_policy)
 except (ValueError, OSError, UnicodeError, TypeError) as error:
     print('SSH profile 安全预检拒绝：' + str(error), file=sys.stderr)
     sys.exit(1)
@@ -391,7 +418,8 @@ access_profile_track() {
   paths=$(_access_profile_policy paths "$1") || return 1
   while IFS= read -r path; do change_track "$path" || return 1; done <<<"$paths"
 }
-access_profile_apply() { _access_profile_policy apply "$1" "$2" "${3:-}" "${4:-}"; }
+access_profile_apply() { _access_profile_policy apply "$1" "$2" "${3:-}" "${4:-}" "${5:-}"; }
+access_profile_disable_root() { _access_profile_policy disable-root "$1" key_password_totp; }
 access_profile_verify() { _access_profile_policy verify "$1" "$2" "${3:-}" "${4:-}"; }
 
 access_profile_expect() { # 真实 sshd -T -C 验收，不允许退回全局显示结果

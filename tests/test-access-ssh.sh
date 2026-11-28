@@ -150,17 +150,31 @@ access_ssh_preflight fixtureuser >"$work/output" 2>&1 && fail 'accepted custom s
 
 fixture root-disable-failure
 change_begin 'access migration test' sshd
-change_track "$SSHD_CONFIG" && change_track "$SSHD_DROPIN" || fail 'rollback snapshots'
-cp "$SSHD_DROPIN" "$work/original-dropin"
+access_profile_track fixtureuser || fail 'rollback snapshots'
+cp "$SSHD_CONFIG" "$work/original-sshd"
+cp "$PAM_SSHD" "$work/original-pam"
+access_ssh_apply fixtureuser || fail 'prepare strong administrator for rollback'
 access_disable_root fixtureuser >"$work/output" 2>&1 && fail 'accepted root SSH still enabled after disable'
 guard_abort >"$work/rollback" 2>&1 || { cat "$work/rollback"; fail 'root-disable failure rollback'; }
-cmp -s "$SSHD_DROPIN" "$work/original-dropin" || fail 'root-disable rollback did not restore original configuration'
+cmp -s "$SSHD_CONFIG" "$work/original-sshd" || fail 'root-disable rollback did not restore original SSH configuration'
+cmp -s "$PAM_SSHD" "$work/original-pam" || fail 'root-disable rollback did not restore original PAM configuration'
+[[ ! -e $ACCESS_PROFILES_STATE && ! -e $(access_profile_pam fixtureuser) ]] || fail 'root-disable rollback left profile metadata or PAM helper'
 [[ $(<"$CHG_DIR/status") == rolled_back ]] || fail 'root-disable rollback state'
 
 fixture root-disable-success
+printf 'UsePAM yes\nPermitRootLogin yes\nPort 2222\nSubsystem sftp internal-sftp\n' >"$SSHD_CONFIG"
+printf 'AllowUsers fixtureuser\nPort 4321\n' >"$SSHD_DROPIN"
+cp "$SSHD_DROPIN" "$work/inactive-dropin"
+access_disable_root fixtureuser >"$work/output" 2>&1 && fail 'disabled root before strong administrator profile was configured'
+access_ssh_apply fixtureuser || fail 'prepare strong administrator for root disable'
+cp "$PAM_SSHD" "$work/stage-one-pam"
 fake_root=no
 access_disable_root fixtureuser >"$work/output" 2>&1 || { cat "$work/output"; fail 'root SSH disable'; }
-grep -Eq '^[[:space:]]*PermitRootLogin[[:space:]]+no[[:space:]]*$' "$SSHD_DROPIN" || fail 'root SSH prohibition not persisted'
+grep -Fxq 'PermitRootLogin yes' "$SSHD_CONFIG" || fail 'root disable changed legacy global settings'
+awk '$1 == "Match" { user = $3 } $1 == "PermitRootLogin" && user == "root" && $2 == "no" { found = 1 } END { exit !found }' "$SSHD_CONFIG" || fail 'root SSH prohibition missing from root Match'
+grep -Eiq '^[[:space:]]*Include' "$SSHD_CONFIG" && fail 'root disable activated an inactive drop-in'
+cmp -s "$SSHD_DROPIN" "$work/inactive-dropin" || fail 'root disable changed an inactive drop-in'
+cmp -s "$PAM_SSHD" "$work/stage-one-pam" || fail 'root disable rewrote the authentication stack'
 grep -Fxq root "$work/contexts" || fail 'effective root SSH policy not verified'
 grep -Fxq fixtureuser "$work/contexts" || fail 'target user not rechecked after closing root SSH'
 

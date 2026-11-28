@@ -99,34 +99,41 @@ check_docker() {
 # ---------- SSH ----------
 check_ssh() {
   title "SSH"
-  local eff pa pk prl port mat lgt x11 pep
-  eff=$(sshd_view)
+  local eff root_eff user pa pk prl root_pa root_methods root_pam port mat lgt x11 pep
+  user=$(access_user) || user=root
+  eff=$(sshd_view) || eff=""
+  root_eff=$(sshd_eff_for root) || root_eff=""
   if [[ -z $eff ]]; then
     chk warn "SSH 配置" "无法读取 sshd -T" "检查 sshd 配置：sshd -t"
-    return 0
-  fi
-  [[ -n $(sshd_eff) ]] || chk warn "SSH 配置" "sshd -T 失败，以下根据配置文件推算" "运行 [26] 诊断查看原因"
-  pa=$(awk '$1 == "passwordauthentication" { print $2 }' <<<"$eff")
-  pk=$(awk '$1 == "pubkeyauthentication" { print $2 }' <<<"$eff")
-  prl=$(awk '$1 == "permitrootlogin" { print $2 }' <<<"$eff")
-  port=$(awk '$1 == "port" { print $2 }' <<<"$eff" | paste -sd' ')
-  if [[ $port == 22 ]]; then chk warn "SSH 端口" "22（默认端口，扫描最多）" "可在 [05] 修改"; else chk ok "SSH 端口" "$port"; fi
-  if [[ $pa == yes ]]; then chk bad "密码登录" "已开启" "可在 [06] 选择密钥登录或增加动态口令"; else chk ok "密码登录" "已关闭"; fi
-  if [[ $pk == yes ]]; then chk ok "密钥登录" "已开启"; else chk warn "密钥登录" "已关闭" "可在 [06] 选择密钥登录"; fi
-  if tfa_enabled; then
-    chk ok "SSH 2FA" "已启用，root 登录：$prl"
-  elif tfa_pam_nullok; then
-    chk bad "SSH 2FA" "PAM 带 nullok，未绑定动态口令也能登录" "在 [06] 重新选择登录方式"
-  elif tfa_pam_on; then
-    chk bad "SSH 2FA" "PAM 已配置但 sshd 未要求 keyboard-interactive" "检查 AuthenticationMethods"
   else
-    chk warn "SSH 2FA" "未启用，root 登录：$prl" "在 [06] 选择登录方式"
+    [[ -n $(sshd_eff) ]] || chk warn "SSH 配置" "sshd -T 失败，以下根据配置文件推算" "运行 [26] 诊断查看原因"
+    pa=$(awk '$1 == "passwordauthentication" { print $2 }' <<<"$eff")
+    pk=$(awk '$1 == "pubkeyauthentication" { print $2 }' <<<"$eff")
+    port=$(awk '$1 == "port" { print $2 }' <<<"$eff" | paste -sd' ')
+    if [[ $port == 22 ]]; then chk warn "SSH 端口" "22（默认端口，扫描最多）" "可在 [05] 修改"; else chk ok "SSH 端口" "$port"; fi
+    if [[ $pa == yes ]]; then chk bad "$user 的 SSH 密码认证" "已开启" "可在 [06] 选择密钥登录或增加动态口令"; else chk ok "$user 的 SSH 密码认证" "已关闭"; fi
+    if [[ $pk == yes ]]; then chk ok "$user 的 SSH 公钥认证" "已开启"; else chk warn "$user 的 SSH 公钥认证" "已关闭" "可在 [06] 选择密钥登录"; fi
+    if tfa_enabled; then
+      chk ok "$user 的 SSH 2FA" "已启用"
+    elif tfa_pam_nullok; then
+      chk bad "$user 的 SSH 2FA" "PAM 带 nullok，未绑定动态口令也能登录" "在 [06] 重新选择登录方式"
+    elif tfa_pam_on; then
+      chk bad "$user 的 SSH 2FA" "PAM 已配置但 sshd 未要求 keyboard-interactive" "检查 AuthenticationMethods"
+    else
+      chk warn "$user 的 SSH 2FA" "未启用" "在 [06] 选择登录方式"
+    fi
   fi
-  if [[ $prl == no ]]; then
+  prl=$(awk '$1 == "permitrootlogin" { print $2 }' <<<"$root_eff")
+  root_pa=$(awk '$1 == "passwordauthentication" { print $2 }' <<<"$root_eff")
+  root_methods=$(awk '$1 == "authenticationmethods" { $1=""; sub(/^ /, ""); print }' <<<"$root_eff")
+  root_pam=$(awk '$1 == "usepam" { print $2 }' <<<"$root_eff")
+  if [[ -z $prl ]]; then
+    chk warn "root 直接登录" "无法读取 root 的生效配置" "检查 sshd 配置：sshd -t"
+  elif [[ $prl == no ]]; then
     chk ok "root 直接登录" "已禁止"
-  elif tfa_enabled; then
+  elif [[ $prl == yes && $user == root && $root_pam == yes && $root_methods =~ ^(publickey,)?keyboard-interactive(:pam)?$ ]] && tfa_pam_on; then
     chk ok "root 直接登录" "允许（$prl），但必须通过动态口令"
-  elif [[ $prl == yes && $pa == yes ]]; then
+  elif [[ $prl == yes && $root_pa == yes && ( $root_methods == any || " $root_methods " == *' password '* ) ]]; then
     chk bad "root 直接登录" "允许 root 用密码登录" "在 [06] 改为密钥登录，或增加动态口令"
   else
     chk warn "root 直接登录" "允许（$prl）" "可在 [06] 启用密钥 + 动态口令；长期建议改用普通 sudo 用户登录并设置 PermitRootLogin no，见使用手册「改用普通用户登录」"
@@ -285,6 +292,7 @@ case ${1:-full} in
     ;;
   ports) check_ports ;;
   docker) check_docker ;;
+  ssh) check_ssh ;;
   *) die "未知参数：$1" ;;
 esac
 exit 0

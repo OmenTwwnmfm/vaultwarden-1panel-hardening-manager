@@ -74,6 +74,12 @@ PrintMotd no
 LogLevel VERBOSE
 EOF
 
+# This file is intentionally outside the main config's Includes.
+inert_dropin=/etc/ssh/sshd_config.d/77-vhm-unreferenced.conf
+install -d -m 755 "${inert_dropin%/*}"
+printf 'Port 23222\nAllowUsers vhmkey\n' >"$work/inert-dropin.conf"
+install -m 644 "$work/inert-dropin.conf" "$inert_dropin"
+
 # shellcheck source=scripts/vh-access.sh
 source scripts/vh-access.sh
 access_set_user vhmaccess
@@ -113,13 +119,23 @@ restart_sshd() {
   start_sshd
 }
 
+expect_inert_dropin() {
+  if ! cmp -s "$work/inert-dropin.conf" "$inert_dropin"; then
+    echo 'FAIL access-auth: unrelated SSH drop-in changed' >&2
+    return 1
+  fi
+  access_expect_for vhmlegacy 127.0.0.1 port 2222 &&
+    access_expect_for vhmlegacy 127.0.0.1 allowusers ''
+}
+
 stage=baseline
+expect_inert_dropin
+access_expect_for root 127.0.0.1 permitrootlogin yes
 start_sshd
 python3 tests/integration/access-auth.py baseline "$work"
 stage='stage-one'
 change_begin 'Integration access configuration'
 record=$CHG_DIR
-change_track "$SSHD_DROPIN"
 access_profile_track vhmaccess
 access_sudo_track
 
@@ -140,6 +156,8 @@ stage='stage-two'
 visudo --check >/dev/null 2>&1
 access_disable_root vhmaccess
 access_ssh_expect vhmaccess
+expect_inert_dropin
+access_expect_for vhmlegacy 127.0.0.1 permitrootlogin yes
 restart_sshd
 python3 tests/integration/access-auth.py "$stage" "$work"
 stage='verify-final'
@@ -158,8 +176,11 @@ stage=profiles
 change_begin 'Integration independent user profiles'
 profile_record=$CHG_DIR
 for user in root vhmaccess vhmkey; do access_profile_track "$user"; done
+# Keep the global root setting closed and prove the explicit root profile is scoped.
+sed -i 's/^PermitRootLogin yes$/PermitRootLogin no/' "$SSHD_CONFIG"
+access_expect_for root 127.0.0.1 permitrootlogin no
 access_profile_preflight root key_totp
-access_profile_apply root key_totp "$ACCESS_KEYS_DIR/root" "$ACCESS_SECRETS_DIR/root/totp"
+access_profile_apply root key_totp "$ACCESS_KEYS_DIR/root" "$ACCESS_SECRETS_DIR/root/totp" yes
 access_profile_preflight vhmaccess password_totp
 access_profile_apply vhmaccess password_totp '' "$ACCESS_SECRETS_DIR/vhmaccess/totp"
 access_profile_preflight vhmkey key
@@ -167,6 +188,9 @@ access_profile_apply vhmkey key "$ACCESS_KEYS_DIR/vhmkey" ''
 access_profile_expect root key_totp "$ACCESS_KEYS_DIR/root"
 access_profile_expect vhmaccess password_totp
 access_profile_expect vhmkey key "$ACCESS_KEYS_DIR/vhmkey"
+access_expect_for root 127.0.0.1 permitrootlogin yes
+access_expect_for vhmlegacy 127.0.0.1 permitrootlogin no
+expect_inert_dropin
 restart_sshd
 python3 tests/integration/access-auth.py "$stage" "$work"
 
@@ -177,6 +201,8 @@ access_profile_apply vhmaccess password '' ''
 access_profile_expect root key_totp "$ACCESS_KEYS_DIR/root"
 access_profile_expect vhmaccess password
 access_profile_expect vhmkey key "$ACCESS_KEYS_DIR/vhmkey"
+access_expect_for root 127.0.0.1 permitrootlogin yes
+expect_inert_dropin
 restart_sshd
 python3 tests/integration/access-auth.py "$stage" "$work"
 

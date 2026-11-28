@@ -53,7 +53,7 @@ apply() {
 }
 
 fixture modes
-# 同一项目可分别更新 root 和普通用户，每种更新都不得开放 root SSH。
+# 没有指定 root 策略参数时，独立 profile 不改变原有 root SSH 禁止设置。
 for mode in password key password_totp key_totp; do
   apply root "$mode"
   apply alice "$mode"
@@ -70,6 +70,21 @@ for include in 'account include common-account' 'password include common-passwor
 done
 grep -Eq '^[[:space:]]*@include' "$PAM_SSHD" && fail 'PAM retained an unscoped include'
 [[ $(stat -c %a "$ACCESS_PROFILES_STATE") == 600 ]] || fail 'metadata is not private'
+
+fixture inactive-dropins
+printf 'UsePAM yes\nPermitRootLogin no\nPort 2222\nSubsystem sftp internal-sftp\n' >"$SSHD_CONFIG"
+printf 'AllowUsers root\nPort 4321\n' >"$work/sshd_config.d/local.conf"
+cp "$work/sshd_config.d/local.conf" "$work/inactive-dropin"
+access_profile_apply root key "$work/keys/root" '' prohibit-password || fail 'root-only policy on legacy configuration'
+grep -Eiq '^[[:space:]]*Include' "$SSHD_CONFIG" && fail 'root profile activated an inactive drop-in'
+grep -Fxq 'PermitRootLogin no' "$SSHD_CONFIG" || fail 'root profile changed global settings'
+awk '$1 == "Match" { user = $3 } $1 == "PermitRootLogin" && user == "root" && $2 == "prohibit-password" { found = 1 } END { exit !found }' "$SSHD_CONFIG" || fail 'root profile failed to scope its policy to root'
+cmp -s "$work/sshd_config.d/local.conf" "$work/inactive-dropin" || fail 'root profile changed an inactive drop-in'
+apply alice key_password_totp
+access_profile_disable_root alice || fail 'disable root after setting an independent root profile'
+apply bob key
+awk '$1 == "Match" { user = $3 } $1 == "PermitRootLogin" && user == "root" && $2 == "no" { found = 1 } END { exit !found }' "$SSHD_CONFIG" || fail 'ordinary profile reopened disabled root SSH'
+access_profile_apply root key "$work/keys/root" '' prohibit-password >"$work/output" 2>&1 && fail 'root reopened without rolling back administrator migration'
 
 fixture coexist
 apply root key_totp

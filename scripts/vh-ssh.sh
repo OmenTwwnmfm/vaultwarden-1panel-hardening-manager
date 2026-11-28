@@ -262,8 +262,9 @@ keys_menu() {
 # ---------- 状态 ----------
 show_status() {
   title "SSH 状态"
-  local eff
-  eff=$(sshd_view)
+  local eff root_eff prl user
+  user=$(access_user) || user=root
+  eff=$(sshd_view) || eff=""
   if [[ -z $eff ]]; then
     log_err "无法读取 sshd 生效配置（$SSHD_BIN -T 失败）：$(sshd_eff_err)"
     return 1
@@ -271,11 +272,14 @@ show_status() {
   if [[ -z $(sshd_eff) ]]; then
     log_warn "$SSHD_BIN -T 失败（$(sshd_eff_err)），以下根据配置文件推算，可能与实际生效值有出入"
   fi
+  root_eff=$(sshd_eff_for root) || root_eff=""
+  prl=$(awk '$1 == "permitrootlogin" { print $2 }' <<<"$root_eff")
   get() { awk -v k="$1" '$1 == k { $1 = ""; sub(/^ /, ""); print }' <<<"$eff" | paste -sd' '; }
   printf '  %-22s %s\n' "监听端口" "$(get port)"
-  printf '  %-22s %s\n' "密码登录" "$(get passwordauthentication)"
-  printf '  %-22s %s\n' "密钥登录" "$(get pubkeyauthentication)"
-  printf '  %-22s %s\n' "root 登录" "$(get permitrootlogin)"
+  printf '  %-22s %s\n' "root 登录许可" "${prl:-未知（无法读取 root 的生效配置）}"
+  printf '  %-22s %s\n' "认证账号" "$user"
+  printf '  %-22s %s\n' "密码认证" "$(get passwordauthentication)"
+  printf '  %-22s %s\n' "公钥认证" "$(get pubkeyauthentication)"
   printf '  %-22s %s\n' "键盘交互认证" "$(get kbdinteractiveauthentication)"
   printf '  %-22s %s\n' "认证组合" "$(get authenticationmethods)"
   if tfa_enabled; then
@@ -287,15 +291,26 @@ show_status() {
   else
     printf '  %-22s %s\n' "2FA" "未启用"
   fi
-  if access_active; then
-    local user
-    user=$(access_user)
+  if [[ $user != root ]]; then
     printf '  %-22s %s\n' "普通管理员" "$user（密钥 + 账户密码 + TOTP）"
     printf '  %-22s %s\n' "动态口令绑定" "$([[ -f $ACCESS_SECRETS_DIR/$user/totp ]] && echo 已绑定 || echo 缺失)"
     printf '  %-22s %s\n' "sudo" "每次新调用验证密码 + TOTP，无认证缓存（配置需保持未被手动修改）"
   else
-    printf '  %-22s %s\n' "root 2FA 绑定" "$([[ -f $GA_FILE ]] && echo "已绑定（应急码剩余 $(grep -cE '^[0-9]{8}$' "$GA_FILE")）" || echo 未绑定)"
-    load_keys
+    local root_mode root_totp=$GA_FILE root_key_file=$ROOT_KEYS
+    if root_mode=$(access_profile_get root 2>/dev/null); then
+      root_totp="$ACCESS_SECRETS_DIR/root/totp"
+      root_key_file="$ACCESS_KEYS_DIR/root"
+    fi
+    if [[ -f $root_totp && ( -z $root_mode || $root_mode == *_totp ) ]]; then
+      printf '  %-22s %s\n' "root 2FA 绑定" "已绑定（应急码剩余 $(grep -cE '^[0-9]{8}$' "$root_totp")）"
+    else
+      printf '  %-22s %s\n' "root 2FA 绑定" "未启用绑定"
+    fi
+    if [[ -z $root_mode || $root_mode == key* ]]; then
+      ROOT_KEYS=$root_key_file load_keys
+    else
+      KEY_FP=()
+    fi
     printf '  %-22s %s\n' "root 授权密钥" "${#KEY_FP[@]} 个"
   fi
   printf '  %-22s %s\n' "时间同步" "$(time_synced && echo 已同步 || echo 未同步（动态口令会失败）)"
